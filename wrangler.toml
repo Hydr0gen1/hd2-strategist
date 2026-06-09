@@ -1,0 +1,10 @@
+# No secrets in this file. SUPER_CLIENT and SUPER_CONTACT are set via
+# `wrangler secret put` — see README.md.
+name = "hd2-strategist"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+[[kv_namespaces]]
+binding = "WAR_CACHE"
+# Replace with the id printed by: wrangler kv namespace create WAR_CACHE
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
