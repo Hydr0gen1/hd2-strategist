@@ -9,6 +9,7 @@ import {
   getCampaigns,
   getMajorOrder,
   getPlanet,
+  getSupplyLines,
   getWarStatus,
 } from "./tools";
 import type { Env } from "./types";
@@ -55,6 +56,12 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "get_supply_lines",
+    description:
+      "Whole-galaxy supply-line graph in one call: every planet (active or dormant) grouped by sector, each with position, connection_count, and neighbor-joined waypoints (index, name, owner, has_active_campaign, campaign_kind). Raw connectivity only — no routing or targeting interpretation.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
 ] as const;
 
 interface JsonRpcRequest {
@@ -95,6 +102,8 @@ async function dispatchTool(
       return toolText(await getCampaigns(env));
     case "get_major_order":
       return toolText(await getMajorOrder(env));
+    case "get_supply_lines":
+      return toolText(await getSupplyLines(env));
     case "get_planet":
       return toolText(
         await getPlanet(env, {

@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through four MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through five MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -30,6 +30,7 @@ The projection uses the magnitude (`abs`); the `direction` flag is the sole carr
 | `get_campaigns` | All active campaigns, invariant-normalized |
 | `get_major_order` | Current MO: objectives, progress, rewards, time remaining |
 | `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection |
+| `get_supply_lines` | Whole-galaxy supply-line graph, sector-grouped, with neighbor-joined waypoints — raw connectivity only, no routing/targeting judgment |
 
 ## Setup & deploy (under five minutes)
 
@@ -91,7 +92,7 @@ src/index.ts       Worker entry — routes POST / and /mcp
 src/mcp.ts         JSON-RPC 2.0: initialize, tools/list, tools/call
 src/client.ts      Upstream fetch + KV cache (raw responses) + rate sampling
 src/invariants.ts  Pure normalization — the five invariants, no I/O
-src/tools.ts       The four tool implementations
+src/tools.ts       The five tool implementations
 src/types.ts       Raw upstream + normalized types
 ```
 

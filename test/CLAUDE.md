@@ -1,8 +1,11 @@
 # test/ — unit tests
 
 Plain vitest, no Workers runtime: everything under test is pure
-(`src/invariants.ts`). If a test needs I/O or KV, the code under test is in
-the wrong module — move the logic, don't mock the world.
+(`src/invariants.ts`, `src/connectivity.ts`). If a test needs I/O or KV, the
+code under test is in the wrong module — move the logic, don't mock the world.
+One sanctioned exception: `connectivity.test.ts` mocks the `src/client`
+module (the I/O boundary, nothing deeper) to assert the tool-level output
+shapes of `get_planet` / `get_campaigns` / `get_supply_lines`.
 
 ## Coverage that must never regress
 
@@ -24,6 +27,13 @@ the project's definition of done:
   proves the sign doesn't flip across campaign kinds.
 - Data-quality gate: missing/NaN `raw_hp` → `data_quality: "degraded"`,
   excluded from projections, never substituted with 0.
+- Connectivity (`connectivity.test.ts`): missing `waypoints` → `[]` (never
+  null); missing `position` → `null` (never `{x:0,y:0}` — a real map origin);
+  dangling waypoint index → link preserved with `name: null`, not dropped;
+  `connection_count === waypoints.length` including dangling links; neighbor
+  join resolves `owner` / `has_active_campaign` / `campaign_kind` from the
+  planets list and active campaigns; `get_supply_lines` is sector-grouped,
+  one entry per planet, lean fields only.
 
 ## Conventions
 

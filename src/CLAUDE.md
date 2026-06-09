@@ -6,7 +6,8 @@ Module boundaries are strict; respect them when editing:
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
 | `client.ts` | Upstream fetch + KV cache + rate sampling | Owns the `hp_per_hour` sign convention (comment block) and all KV access. |
-| `tools.ts` | The four tool implementations | Orchestration only: fetch → assemble context → call pure normalization. |
+| `connectivity.ts` | Waypoint degree + deterministic neighbor join | **Pure. Zero I/O.** Enriches facts only — never routing/reachability/targeting conclusions. |
+| `tools.ts` | The five tool implementations | Orchestration only: fetch → assemble context → call pure normalization/enrichment. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
 | `index.ts` | Entry/routing | POST `/` or `/mcp` only. |

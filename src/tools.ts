@@ -1,7 +1,8 @@
 /**
- * The four MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The five MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
- * invariant normalization from invariants.ts.
+ * invariant normalization from invariants.ts and connectivity enrichment
+ * from connectivity.ts.
  */
 import {
   fetchUpstream,
@@ -13,7 +14,14 @@ import {
   campaignKind,
   normalizeCampaign,
 } from "./invariants";
+import {
+  type CampaignKindByPlanet,
+  campaignKindsByPlanet,
+  connectivityFor,
+  planetsByIndex,
+} from "./connectivity";
 import type {
+  ConnectivityFields,
   Env,
   NormalizedCampaign,
   RawAssignment,
@@ -145,18 +153,39 @@ export async function getWarStatus(env: Env): Promise<unknown> {
   };
 }
 
+/** Neighbor-join input from an already-normalized campaign bundle. */
+function kindsFromBundle(bundle: CampaignBundle): CampaignKindByPlanet {
+  return new Map(
+    bundle.campaigns.map((c) => [c.planet_index, c.campaign_kind] as const),
+  );
+}
+
 export async function getCampaigns(env: Env): Promise<unknown> {
-  const bundle = await loadNormalizedCampaigns(env);
+  const [bundle, planetsRes] = await Promise.all([
+    loadNormalizedCampaigns(env),
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+  ]);
+  const planetByIndex = planetsByIndex(planetsRes.data ?? []);
+  const kindByPlanet = kindsFromBundle(bundle);
+  const campaigns = bundle.campaigns.map((c) => {
+    const planet = planetByIndex.get(c.planet_index);
+    return {
+      ...c,
+      ...(planet
+        ? connectivityFor(planet, planetByIndex, kindByPlanet)
+        : { position: null, connection_count: 0, waypoints: [] }),
+    };
+  });
   return {
-    count: bundle.campaigns.length,
-    campaigns: bundle.campaigns,
+    count: campaigns.length,
+    campaigns,
     notes: {
       liberation_pct_display_only:
         "Cosmetic display value only. All quantitative logic must use raw_hp.",
       hp_per_hour:
         "Net signed rate sampled by this server: positive = progressing toward resolution, negative = losing ground. Null until two samples >60s apart exist.",
     },
-    ...(bundle.stale ? { stale: true } : {}),
+    ...(bundle.stale || planetsRes.stale ? { stale: true } : {}),
   };
 }
 
@@ -312,6 +341,7 @@ export async function getPlanet(
     ...(normalized.data_quality
       ? { data_quality: normalized.data_quality }
       : {}),
+    ...connectivityFor(planet, planetsByIndex(planets), kindsFromBundle(bundle)),
     defense_event: planet.event
       ? {
           event_type: planet.event.eventType,
@@ -322,5 +352,55 @@ export async function getPlanet(
       : null,
     player_count: planet.statistics?.playerCount ?? null,
     ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
+  };
+}
+
+/**
+ * Whole-galaxy supply-line graph in one call: every planet (active or
+ * dormant — dormant links still define the topology), grouped by sector,
+ * with neighbor-joined waypoints. Raw connectivity only; no rate sampling,
+ * no routing or targeting judgment. Lean fields to stay within the CPU and
+ * response-size budget.
+ */
+export async function getSupplyLines(env: Env): Promise<unknown> {
+  const [planetsRes, campaignsRes] = await Promise.all([
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+    fetchUpstream<RawCampaign[]>(env, "/api/v1/campaigns"),
+  ]);
+  const planets = planetsRes.data ?? [];
+  const planetByIndex = planetsByIndex(planets);
+  const kindByPlanet = campaignKindsByPlanet(campaignsRes.data ?? []);
+
+  const sectors: Record<
+    string,
+    Array<
+      {
+        index: number;
+        name: string;
+        sector: string;
+        owner: string | null;
+      } & ConnectivityFields
+    >
+  > = {};
+  for (const planet of planets) {
+    (sectors[planet.sector] ??= []).push({
+      index: planet.index,
+      name: planet.name,
+      sector: planet.sector,
+      owner: planet.currentOwner ?? null,
+      ...connectivityFor(planet, planetByIndex, kindByPlanet),
+    });
+  }
+
+  return {
+    planet_count: planets.length,
+    sectors,
+    notes: {
+      waypoints:
+        "Each planet's waypoints list the planets it links to via supply lines; a link is what makes a neighbor attackable.",
+      scope:
+        "Raw connectivity only — this server enriches facts (names, owners, active campaigns) but makes no routing or targeting decisions. Those are the consumer's.",
+    },
+    ...(planetsRes.stale || campaignsRes.stale ? { stale: true } : {}),
   };
 }

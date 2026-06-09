@@ -2,7 +2,7 @@
 
 Headless MCP server on a single Cloudflare Worker. It fronts the Helldivers 2
 community API (`api.helldivers2.dev`) as a **correctness layer**: it normalizes
-raw war data to strip known deceptive/cosmetic fields and exposes exactly four
+raw war data to strip known deceptive/cosmetic fields and exposes exactly five
 MCP tools. There is no frontend and no upstream app — the Worker IS the app.
 
 ## Commands
@@ -27,8 +27,14 @@ wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
 
 ## Hard rules (project-wide)
 
-- **Exactly four tools**: `get_war_status`, `get_campaigns`, `get_major_order`,
-  `get_planet`. Do not add tools or rename them.
+- **Exactly five tools**: `get_war_status`, `get_campaigns`, `get_major_order`,
+  `get_planet`, `get_supply_lines`. Do not add tools or rename them.
+- **Enrich, never conclude**: every output field must be directly verifiable
+  against the raw upstream API or a trivial deterministic derivation of it.
+  The ONLY permitted derivations are the waypoint degree count and the
+  neighbor join (name/owner/active-campaign). No routing, reachability,
+  recommended targets, threat scores, or any field that needs an assumption
+  about player intent — those are the consumer's calls.
 - **Secrets**: `SUPER_CLIENT` / `SUPER_CONTACT` come from `wrangler secret put`
   and are read from `env`. Never hardcode them, never commit them, never add
   them to `wrangler.toml`.

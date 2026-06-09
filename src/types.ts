@@ -35,7 +35,8 @@ export interface RawPlanet {
   regenPerSecond: number;
   event: RawEvent | null;
   attacking: number[];
-  waypoints: number[];
+  waypoints?: number[];
+  position?: { x: number; y: number };
   statistics?: RawStatistics;
 }
 
@@ -114,6 +115,29 @@ export interface NormalizedCampaign extends TrajectorySignal, Projection {
   /** Invariant 2: cosmetic only — never used in any math. */
   liberation_pct_display_only: number | null;
   data_quality?: "degraded";
+}
+
+/**
+ * One supply-line link, enriched by a deterministic join against the full
+ * planets list and the active-campaign set. Facts only — no routing,
+ * reachability, or targeting judgment.
+ */
+export interface WaypointLink {
+  index: number;
+  /** Null when the waypoint index has no matching planet — never guessed. */
+  name: string | null;
+  owner: string | null;
+  has_active_campaign: boolean;
+  campaign_kind: "liberation" | "defense" | null;
+}
+
+/** Additive connectivity fields shared by get_planet/get_campaigns/get_supply_lines. */
+export interface ConnectivityFields {
+  /** Galactic-map coordinates; null when absent — NEVER {x:0,y:0} (a real origin). */
+  position: { x: number; y: number } | null;
+  /** Degree: raw waypoint count, dangling indices included. Pure count. */
+  connection_count: number;
+  waypoints: WaypointLink[];
 }
 
 /** Context passed into pure normalization — assembled by the handler layer. */
