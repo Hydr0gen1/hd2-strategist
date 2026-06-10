@@ -65,9 +65,9 @@ Tiers are ordered by cost/risk, not necessarily by priority. Within the prime di
 
 ### Tier 2 — new upstream endpoints
 
-- [ ] **`/api/v1/dispatches`** — in-fiction news feed; narrative context for why an MO exists.
-- [ ] **Steam news / patch-notes endpoint (if exposed)** — the hook for “did a balance patch land,” which affects weapon-stat analysis.
-- [ ] **`get_planet_history`** *(highest-value single addition)* — expose the time-series our KV sampler is already collecting. Turns the sampler into a genuine trajectory source no other HD2 tool has: trend over time, not just current state. Decide retention window + sample cadence; keep within KV size limits.
+- [x] **`/api/v1/dispatches`** — in-fiction news feed; narrative context for why an MO exists. (`get_dispatches`, newest-first, capped limit.)
+- [x] **Steam news / patch-notes endpoint (if exposed)** — the hook for “did a balance patch land,” which affects weapon-stat analysis. (Upstream `/api/v1/steam` verified live; `get_patch_notes` returns verbatim BBCode `content` — no server-side summary.)
+- [x] **`get_planet_history`** *(highest-value single addition)* — expose the time-series our KV sampler is already collecting. Turns the sampler into a genuine trajectory source no other HD2 tool has: trend over time, not just current state. (Bounded ring buffer in `sampling.ts`: 96 points / 48h per planet, ~0.9MB worst case « 5MB KV limit; `hp_per_hour` preserved bit-identically — regression-tested; write budget unchanged.)
 
 ### Tier 3 — deterministic derivations (on the right side of the line)
 

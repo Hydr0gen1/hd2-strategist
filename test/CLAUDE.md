@@ -1,9 +1,9 @@
 # test/ — unit tests
 
 Plain vitest, no Workers runtime: everything under test is pure
-(`src/invariants.ts`, `src/enrichment.ts`). If a test needs I/O or KV, the
-code under test is in the wrong module — move the logic, don't mock the
-world.
+(`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`). If a test
+needs I/O or KV, the code under test is in the wrong module — move the
+logic, don't mock the world.
 
 ## Coverage that must never regress
 
@@ -30,6 +30,25 @@ the project's definition of done:
   past-end → `0` + `defense_expired: true` and missing `endTime` → `null`;
   missing statistics → `null`, never fabricated; missing biome → `null`;
   missing hazards → `[]`, never null.
+- Stage 2 (`stage2.test.ts`):
+  - **Rate-preservation regression**: `advancePlanetSeries` yields the EXACT
+    signed `hp_per_hour` (float-equal, `toBe`) that the pre-ring-buffer
+    single-sample store computed for the same two data points — both signs
+    plus the zero case. This is the proof the history refactor didn't touch
+    rate semantics.
+  - Legacy-store migration (`{h, t, lastRate}` → one-sample series) produces
+    the identical next-poll rate; hybrid/garbage entries coerce safely.
+  - Ring-buffer bounds: never more than `MAX_SAMPLES_PER_PLANET` points,
+    over-age points evicted on append, the newest sample never evicted,
+    the no-append path leaves the series untouched.
+  - Worst-case serialized store (full galaxy × max points) stays far under
+    the 5MB KV value limit.
+  - `buildHistoryPoints`: per-point `delta_health`/`delta_hours` are exact
+    consecutive differences, first point null — observed deltas, never a
+    projection.
+  - `shapeDispatches`/`shapePatchNotes`: newest-first (unparseable dates
+    sink), limit clamping at every edge, empty upstream → `[]`,
+    message/content passed through verbatim.
 
 ## Conventions
 
