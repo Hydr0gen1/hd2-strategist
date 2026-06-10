@@ -1,8 +1,10 @@
 /**
- * The seven MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The eight MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
- * enrichment shapers from enrichment.ts).
+ * enrichment shapers from enrichment.ts). The one non-war-state tool,
+ * get_planet_wiki, uses its own separate source pipeline (wiki.ts +
+ * wikiClient.ts) — lore never flows into a live war-state field.
  */
 import {
   fetchUpstream,
@@ -14,6 +16,7 @@ import {
   aggregateFrontRate,
   buildHistoryPoints,
   decayPerHour,
+  decodeEventModifier,
   defenseTiming,
   selectBiome,
   selectHazards,
@@ -21,6 +24,8 @@ import {
   shapeDispatches,
   shapePatchNotes,
 } from "./enrichment";
+import { planWikiQuery, shapeWikiResult } from "./wiki";
+import { fetchWikiQuery } from "./wikiClient";
 import {
   HPC_CAMPAIGN_TYPES,
   campaignKind,
@@ -125,6 +130,9 @@ async function loadNormalizedCampaigns(env: Env): Promise<CampaignBundle> {
       statistics: selectPlanetStatistics(c.planet.statistics),
       biome: selectBiome(c.planet.biome),
       hazards: selectHazards(c.planet.hazards),
+      // Stage 4: live event identity — raw enum + confirmed-map name only,
+      // decoded from the live API's own event data (never the wiki).
+      ...decodeEventModifier(c.planet.event),
       ...(c.planet.event ? defenseTiming(c.planet.event, nowMs) : {}),
     };
   });
@@ -206,6 +214,8 @@ export async function getCampaigns(env: Env): Promise<unknown> {
         "Defense campaigns only: (endTime − now) in hours, clamped at 0 with defense_expired: true once past. A deadline fact, not an urgency judgment.",
       decay_per_hour:
         "regen_per_second × 3600 — regen in the same units as hp_per_hour. Derived from the invariant-normalized regen, so it is always null on defense campaigns (cosmetic decay stays suppressed) and null when regen is unknown.",
+      modifier:
+        "Decoded special-faction name for event_type, only when the enum value is confirmed in EVENT_MODIFIER_NAMES. event_type non-null with modifier null = an active event whose enum value is not yet confirmed — visible, never named by guess. Both null = no event. Identity only, no difficulty judgment; lore/meaning lives in get_planet_wiki.",
     },
     ...(bundle.stale ? { stale: true } : {}),
   };
@@ -394,6 +404,9 @@ export async function getPlanet(
     ...(normalized.data_quality
       ? { data_quality: normalized.data_quality }
       : {}),
+    // Stage 4: live event identity — raw enum + confirmed-map name only,
+    // decoded from the live API's own event data (never the wiki).
+    ...decodeEventModifier(planet.event),
     defense_event: planet.event
       ? {
           event_type: planet.event.eventType,
@@ -408,6 +421,31 @@ export async function getPlanet(
     biome: selectBiome(planet.biome),
     hazards: selectHazards(planet.hazards),
     ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
+  };
+}
+
+/**
+ * Stage 4: the LORE tool — a standalone source (helldivers.wiki.gg), never a
+ * field on a live tool. Accepts a planet name (resolved to the wiki's title
+ * casing) or an explicit page title (enemy/subfaction/topic lookups). The
+ * payload carries mandatory attribution and the lore disclaimer on every
+ * outcome and contains no live war-state numbers.
+ */
+export async function getPlanetWiki(
+  env: Env,
+  args: { name?: string; title?: string },
+): Promise<unknown> {
+  const requested = (args.title ?? args.name)?.trim();
+  if (!requested) {
+    throw new ToolError(
+      "Provide either a planet `name` (string) or an explicit wiki page `title` (string), e.g. name: \"Gacrux\" or title: \"Jet Brigade\".",
+    );
+  }
+  const plan = planWikiQuery(args);
+  const res = await fetchWikiQuery(env, plan);
+  return {
+    ...shapeWikiResult(res.body, plan, Date.now()),
+    ...(res.stale ? { stale: true } : {}),
   };
 }
 

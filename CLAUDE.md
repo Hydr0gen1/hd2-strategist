@@ -2,7 +2,7 @@
 
 Headless MCP server on a single Cloudflare Worker. It fronts the Helldivers 2
 community API (`api.helldivers2.dev`) as a **correctness layer**: it normalizes
-raw war data to strip known deceptive/cosmetic fields and exposes exactly seven
+raw war data to strip known deceptive/cosmetic fields and exposes exactly eight
 MCP tools. There is no frontend and no upstream app — the Worker IS the app.
 
 ## Commands
@@ -27,9 +27,15 @@ wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
 
 ## Hard rules (project-wide)
 
-- **Exactly seven tools**: `get_war_status`, `get_campaigns`, `get_major_order`,
-  `get_planet`, `get_dispatches`, `get_patch_notes`, `get_planet_history`.
-  Do not add tools or rename them.
+- **Exactly eight tools**: `get_war_status`, `get_campaigns`, `get_major_order`,
+  `get_planet`, `get_dispatches`, `get_patch_notes`, `get_planet_history`,
+  `get_planet_wiki`. Do not add tools or rename them.
+- **Two sources, never mixed**: everything except `get_planet_wiki` is live
+  war state from `api.helldivers2.dev`; `get_planet_wiki` is community LORE
+  from `helldivers.wiki.gg` (own pipeline `src/wiki.ts` + `src/wikiClient.ts`,
+  own `wiki:` KV namespace, mandatory attribution on every payload). Wiki
+  prose must never appear in a live war-state field, live tools must never
+  call the wiki, and the wiki payload must never carry live war numbers.
 - **Secrets**: `SUPER_CLIENT` / `SUPER_CONTACT` come from `wrangler secret put`
   and are read from `env`. Never hardcode them, never commit them, never add
   them to `wrangler.toml`.

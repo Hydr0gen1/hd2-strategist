@@ -178,10 +178,26 @@ export interface DefenseTiming {
   defense_expired: boolean | null;
 }
 
+/** Stage 4: live special-faction event identity — presence + name only.
+ * Decoded EXCLUSIVELY from the live API's own `event.eventType`; the wiki
+ * lore source is never consulted for these fields. */
+export interface EventModifier {
+  /** Raw upstream `event.eventType`, passed through untouched (never
+   * dropped); null when the planet has no active event. */
+  event_type: number | null;
+  /** Decoded human-readable name (e.g. "Jet Brigade") ONLY when the enum
+   * value is confirmed in EVENT_MODIFIER_NAMES. Null when there is no event
+   * OR the value is unmapped — an unrecognized event stays visible via
+   * event_type as "something is here, name unknown"; a name is never
+   * fabricated. No difficulty/threat interpretation, ever. */
+  modifier: string | null;
+}
+
 /** NormalizedCampaign plus the additive Stage 1 fact pass-throughs. */
 export interface EnrichedCampaign
   extends NormalizedCampaign,
-    Partial<DefenseTiming> {
+    Partial<DefenseTiming>,
+    EventModifier {
   statistics: PlanetStatistics | null;
   biome: BiomeInfo | null;
   hazards: HazardInfo[];
@@ -231,6 +247,31 @@ export interface PlanetHistoryPoint {
   delta_health: number | null;
   /** hours since the previous point; null on the first point. */
   delta_hours: number | null;
+}
+
+/** Stage 4: get_planet_wiki payload — LORE source (helldivers.wiki.gg),
+ * physically separate from all live war-state output. Carries mandatory
+ * attribution on every outcome and never any live war number. */
+export interface WikiResult {
+  found: boolean;
+  /** What the caller asked for, verbatim (trimmed). */
+  requested: string;
+  /** The wiki page title served (or attempted, when found: false). */
+  title: string;
+  /** Plain-text lead extract, capped at WIKI_EXTRACT_MAX_CHARS. */
+  extract: string | null;
+  truncated: boolean;
+  /** Canonical page URL — part of the mandatory attribution. */
+  url: string | null;
+  /** Original title when a MediaWiki redirect was followed — never silent. */
+  redirected_from: string | null;
+  source: string;
+  license: string;
+  license_url: string;
+  retrieved_at: string;
+  /** Lore disclaimer: community-authored; live tools are authoritative. */
+  notes: string;
+  hint?: string;
 }
 
 /** Context passed into pure normalization — assembled by the handler layer. */

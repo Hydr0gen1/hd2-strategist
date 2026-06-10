@@ -50,6 +50,8 @@ Invariant ordering in normalization (`1 → 2 → rate/direction → 4 → 5 →
 - `get_planet` — single-planet deep dive incl. connectivity.
 - `get_supply_lines` — whole-galaxy connectivity graph, sector-grouped, neighbor-joined.
 - Cross-cutting: KV raw-cache + stale fallback, KV health-sampling for signed `hp_per_hour`, the five invariants, enriched waypoints (name/owner/campaign-joined).
+- Stage 4 — live event identity: `event_type` (raw upstream `event.eventType`, passed through) + `modifier` (decoded special-faction name, only for enum values confirmed in `EVENT_MODIFIER_NAMES`) on `get_planet` and every campaign in `get_campaigns`. Presence + name only — no difficulty/threat interpretation.
+- Stage 4 — `get_planet_wiki`: community lore from helldivers.wiki.gg (MediaWiki `prop=extracts`, root `/api.php`), a physically separate source with mandatory attribution (CC BY-NC-SA 4.0 per the wiki's own rightsinfo), long-TTL `wiki:` KV cache with stale fallback. Live tools say *what is happening*; the wiki says *what it means*; the two are joined only in the conversation layer.
 
 -----
 
@@ -87,6 +89,7 @@ Tiers are ordered by cost/risk, not necessarily by priority. Within the prime di
 ## Known open items / watch list
 
 - **`campaign_type` enum is unverified.** Live data shows every active campaign is `type: 0`; HPC detection currently rides entirely on the Major-Order link. The `HPC_CAMPAIGN_TYPES = {1,2,3}` seed has had zero live coverage. **Action:** log distinct `(type, hasEvent)` pairs over time and confirm what non-zero types actually mean before trusting the type half of HPC detection.
+- **`event.eventType` enum is unverified — `EVENT_MODIFIER_NAMES` ships EMPTY.** At Stage 4 implementation time the war had zero active events and upstream documents no enum (its spec says only "the type of event"), so no (value → name) pair could be confirmed. Unlike `HPC_CAMPAIGN_TYPES` (where over-inclusion is fail-safe), a wrong entry here fabricates a subfaction name, so nothing was seeded. **Action:** when a special-faction event (Jet Brigade, Predator Strain, Incineration Corps, The Great Host, …) goes live, capture its `eventType`, seed the map, and update the pinned stage4 test. Caution: eventType 1 has historically been the plain defense event — do not map it to a subfaction.
 - **Invariant 1 (defense-null) unexercised live.** No defense campaigns have appeared since launch; the path is unit-tested only. Re-verify against real data when a defense goes active.
 - **Defense timing (Stage 1) unexercised live.** Same gap: `defense_hours_remaining` / `defense_expired` are unit-tested against the documented `event` shape only. Verify against real data when a defense goes active.
 - **Upstream `war.now` is game-epoch time** (observed `1972-04-26T…`), NOT comparable to the real-world ISO timestamps in `event.startTime`/`endTime` or MO `expiration`. All deadline math (MO `expires_in`, defense timing) therefore uses the Worker clock against those real-world timestamps.

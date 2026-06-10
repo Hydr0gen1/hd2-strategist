@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through seven MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through eight MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -33,6 +33,13 @@ The projection uses the magnitude (`abs`); the `direction` flag is the sole carr
 | `get_dispatches` | In-fiction war news feed, newest first (`limit` optional, default 10 / cap 25) |
 | `get_patch_notes` | Steam news / patch notes, newest first, verbatim BBCode content (`limit` optional, default 5 / cap 10) |
 | `get_planet_history` | Observed health time-series for one planet by `index` or `name`: retained samples + per-point `delta_health`/`delta_hours` — observed deltas, never a forecast |
+| `get_planet_wiki` | **Lore source (separate from live war state):** community wiki entry from helldivers.wiki.gg for a planet (`name`) or any topic (`title`, e.g. "Jet Brigade") — plain-text lead extract, canonical URL, mandatory attribution (CC BY-NC-SA 4.0). Never authoritative for current war state |
+
+### Two sources, never mixed
+
+The live tools answer *what is happening* (verifiable against `api.helldivers2.dev`); `get_planet_wiki` answers *what it means* (community-authored lore from `helldivers.wiki.gg`). The pipelines are physically separate in the code (`wiki.ts`/`wikiClient.ts` vs everything else), wiki prose never appears in a live war-state field, and the wiki payload never carries live numbers. They are joined only by the consumer, in conversation.
+
+Live event identity rides the live side: `get_planet` and each campaign in `get_campaigns` carry `event_type` (the raw upstream `event.eventType`, passed through) and `modifier` (its decoded special-faction name — e.g. "Jet Brigade" — only for enum values confirmed in `EVENT_MODIFIER_NAMES`). No event → both `null`. Unconfirmed enum value → `event_type` set, `modifier: null`: visible, never named by guess.
 
 ## Setup & deploy (under five minutes)
 
@@ -97,8 +104,10 @@ src/mcp.ts         JSON-RPC 2.0: initialize, tools/list, tools/call
 src/client.ts      Upstream fetch + KV cache (raw responses) + rate sampling
 src/invariants.ts  Pure normalization — the five invariants, no I/O
 src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
-src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas)
-src/tools.ts       The seven tool implementations
+src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode)
+src/wiki.ts        Pure wiki lore logic (query plan, response shaping, attribution) — separate source
+src/wikiClient.ts  Wiki fetch + long-TTL KV cache (`wiki:` namespace) — separate from client.ts
+src/tools.ts       The eight tool implementations
 src/types.ts       Raw upstream + normalized types
 ```
 
