@@ -1,31 +1,42 @@
 /**
- * The four MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The seven MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
- * invariant normalization from invariants.ts.
+ * invariant normalization from invariants.ts (plus the pure Stage 1/2
+ * enrichment shapers from enrichment.ts).
  */
 import {
   fetchUpstream,
+  readPlanetSamples,
   samplePlanetRates,
   type SampleInput,
 } from "./client";
 import {
+  buildHistoryPoints,
   defenseTiming,
   selectBiome,
   selectHazards,
   selectPlanetStatistics,
+  shapeDispatches,
+  shapePatchNotes,
 } from "./enrichment";
 import {
   HPC_CAMPAIGN_TYPES,
   campaignKind,
   normalizeCampaign,
 } from "./invariants";
+import {
+  MAX_SAMPLE_AGE_MS,
+  MAX_SAMPLES_PER_PLANET,
+} from "./sampling";
 import type {
   EnrichedCampaign,
   Env,
   NormalizedCampaign,
   RawAssignment,
   RawCampaign,
+  RawDispatch,
   RawPlanet,
+  RawSteamNews,
   RawWar,
 } from "./types";
 
@@ -237,22 +248,24 @@ export async function getMajorOrder(env: Env): Promise<unknown> {
   };
 }
 
-export async function getPlanet(
-  env: Env,
-  args: { index?: number; name?: string },
-): Promise<unknown> {
+/**
+ * Shared index/name resolution for get_planet and get_planet_history:
+ * numeric index match, or trimmed case-insensitive name match. Not-found
+ * errors carry a hint listing up to 10 planets with active campaigns.
+ */
+function assertPlanetArgs(args: { index?: number; name?: string }): void {
   if (args.index == null && !args.name) {
     throw new ToolError(
       "Provide either a planet `index` (number) or `name` (string).",
     );
   }
+}
 
-  const [planetsRes, bundle] = await Promise.all([
-    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
-    loadNormalizedCampaigns(env),
-  ]);
-  const planets = planetsRes.data ?? [];
-
+function resolvePlanet(
+  planets: RawPlanet[],
+  args: { index?: number; name?: string },
+  activePlanets: { name: string; index: number }[],
+): RawPlanet {
   let planet: RawPlanet | undefined;
   if (args.index != null) {
     planet = planets.find((p) => p.index === args.index);
@@ -262,9 +275,9 @@ export async function getPlanet(
   }
 
   if (!planet) {
-    const activeHint = bundle.campaigns
+    const activeHint = activePlanets
       .slice(0, 10)
-      .map((c) => `${c.planet_name} (index ${c.planet_index})`)
+      .map((p) => `${p.name} (index ${p.index})`)
       .join(", ");
     throw new ToolError(
       `Planet not found for ${args.index != null ? `index ${args.index}` : `name "${args.name}"`}. ` +
@@ -272,6 +285,29 @@ export async function getPlanet(
         `Planets with active campaigns include: ${activeHint || "none currently"}.`,
     );
   }
+  return planet;
+}
+
+export async function getPlanet(
+  env: Env,
+  args: { index?: number; name?: string },
+): Promise<unknown> {
+  assertPlanetArgs(args);
+
+  const [planetsRes, bundle] = await Promise.all([
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+    loadNormalizedCampaigns(env),
+  ]);
+  const planets = planetsRes.data ?? [];
+
+  const planet = resolvePlanet(
+    planets,
+    args,
+    bundle.campaigns.map((c) => ({
+      name: c.planet_name,
+      index: c.planet_index,
+    })),
+  );
 
   const active = bundle.campaigns.find(
     (c) => c.planet_index === planet!.index,
@@ -294,6 +330,9 @@ export async function getPlanet(
         },
       ],
       nowMs,
+      // Single-planet probe: carry the rest of the store forward so one
+      // lookup doesn't wipe other planets' series / campaign ages.
+      { carryForward: true },
     );
     const sample = samples.get(planet.index);
     normalized = normalizeCampaign(
@@ -344,5 +383,101 @@ export async function getPlanet(
     biome: selectBiome(planet.biome),
     hazards: selectHazards(planet.hazards),
     ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
+  };
+}
+
+export async function getDispatches(
+  env: Env,
+  args: { limit?: number },
+): Promise<unknown> {
+  const res = await fetchUpstream<RawDispatch[]>(env, "/api/v1/dispatches");
+  const dispatches = shapeDispatches(res.data, args.limit);
+  return {
+    count: dispatches.length,
+    dispatches,
+    ...(dispatches.length === 0
+      ? { note: "No dispatches currently available from upstream." }
+      : {}),
+    ...(res.stale ? { stale: true } : {}),
+  };
+}
+
+export async function getPatchNotes(
+  env: Env,
+  args: { limit?: number },
+): Promise<unknown> {
+  const res = await fetchUpstream<RawSteamNews[]>(env, "/api/v1/steam");
+  const patchNotes = shapePatchNotes(res.data, args.limit);
+  return {
+    count: patchNotes.length,
+    patch_notes: patchNotes,
+    notes: {
+      content:
+        "Verbatim Steam BBCode exactly as published — the upstream has no summary field and this server derives none; rendering is the consumer's job.",
+    },
+    ...(patchNotes.length === 0
+      ? { note: "No Steam news currently available from upstream." }
+      : {}),
+    ...(res.stale ? { stale: true } : {}),
+  };
+}
+
+export async function getPlanetHistory(
+  env: Env,
+  args: { index?: number; name?: string },
+): Promise<unknown> {
+  assertPlanetArgs(args);
+
+  const [planetsRes, campaignsRes] = await Promise.all([
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+    fetchUpstream<RawCampaign[]>(env, "/api/v1/campaigns"),
+  ]);
+  const planets = planetsRes.data ?? [];
+
+  const planet = resolvePlanet(
+    planets,
+    args,
+    (campaignsRes.data ?? []).map((c) => ({
+      name: c.planet.name,
+      index: c.planet.index,
+    })),
+  );
+
+  // Read-only: history never writes to the sample store.
+  const samples = await readPlanetSamples(env, planet.index);
+  const points = buildHistoryPoints(samples);
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+
+  return {
+    planet_index: planet.index,
+    planet_name: planet.name,
+    points: points.length,
+    window_hours:
+      first && last && samples.length >= 2
+        ? (last.t - first.t) / 3_600_000
+        : null,
+    samples: points,
+    insufficient_history: points.length < 2,
+    ...(points.length < 2
+      ? {
+          note:
+            points.length === 0
+              ? "No samples retained for this planet yet. Samples accrue only when this server polls while the planet is in an active campaign (or is queried via get_planet) — a cold start or a dormant planet is expected to be empty, not an error."
+              : "Only one sample retained so far; deltas need at least two samples >60s apart.",
+        }
+      : {}),
+    retention: {
+      max_points: MAX_SAMPLES_PER_PLANET,
+      max_age_hours: MAX_SAMPLE_AGE_MS / 3_600_000,
+      note: "The retained window survives only while the server keeps being polled (sample store KV TTL is 24h, refreshed on every poll).",
+    },
+    notes: {
+      delta_health:
+        "Raw observed change per point: current − previous (negative = health depleting). hp_per_hour elsewhere uses the opposite orientation, (previous − current) / hours, positive = progressing toward resolution. Both are stated so the sign conventions are explicit.",
+      sampling:
+        "Observed data points and deterministic deltas only — no smoothing, no forecast, no trend verdict. Sample timestamps use the Worker clock (upstream war time is game-epoch and not comparable).",
+    },
+    ...(planetsRes.stale || campaignsRes.stale ? { stale: true } : {}),
   };
 }

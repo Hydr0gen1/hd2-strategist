@@ -5,9 +5,10 @@ Module boundaries are strict; respect them when editing:
 | File | Role | Boundary rule |
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
-| `enrichment.ts` | Stage 1 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `enrichment.ts` | Stage 1+2 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `sampling.ts` | Pure planet-sample series logic: the bounded ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
 | `client.ts` | Upstream fetch + KV cache + rate sampling | Owns the `hp_per_hour` sign convention (comment block) and all KV access. |
-| `tools.ts` | The four tool implementations | Orchestration only: fetch → assemble context → call pure normalization. |
+| `tools.ts` | The seven tool implementations | Orchestration only: fetch → assemble context → call pure normalization. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
 | `index.ts` | Entry/routing | POST `/` or `/mcp` only. |
@@ -54,3 +55,13 @@ Rate samples only update when ≥60s apart (`MIN_SAMPLE_INTERVAL_MS`) — closer
 reads reuse `lastRate` so cached health doesn't collapse the rate to a bogus 0.
 On upstream 429/5xx/timeout: serve the stale KV copy with `stale: true`, else
 throw `UpstreamError` (which `mcp.ts` turns into a structured tool error).
+
+The sample store (`samples:planets`) holds a bounded per-planet ring buffer
+(`sampling.ts`: max 96 points / 48h — worst case ~0.9MB, far under the 5MB KV
+value limit). The rate logic reads only the TAIL of the buffer, so
+`hp_per_hour` is bit-identical to the old single-sample store (regression
+test in `test/stage2.test.ts`). Write budget is unchanged: one read + one
+write per `samplePlanetRates` call; `get_planet_history` is read-only.
+Single-planet probes pass `carryForward: true` so they don't wipe other
+planets' series — the batch poll deliberately does NOT (planets leaving the
+campaign set must drop and reseed a null rate, as always).

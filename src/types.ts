@@ -88,6 +88,24 @@ export interface RawAssignment {
   flags: number;
 }
 
+/** In-fiction war news entry from /api/v1/dispatches. */
+export interface RawDispatch {
+  id: number;
+  published: string;
+  type: number;
+  message: string;
+}
+
+/** Steam community announcement / patch note from /api/v1/steam. */
+export interface RawSteamNews {
+  id: string;
+  title: string;
+  url: string;
+  author: string;
+  content: string;
+  publishedAt: string;
+}
+
 /** Normalized output types (what the MCP tools return). */
 
 export type Direction = "liberating" | "losing" | "stalemate" | "unknown";
@@ -167,6 +185,39 @@ export interface EnrichedCampaign
   statistics: PlanetStatistics | null;
   biome: BiomeInfo | null;
   hazards: HazardInfo[];
+}
+
+/** One dispatch as returned by get_dispatches — upstream facts, untouched. */
+export interface DispatchInfo {
+  id: number;
+  published: string;
+  type: number;
+  message: string;
+}
+
+/** One patch note as returned by get_patch_notes. `content` is raw Steam
+ * BBCode exactly as published — rendering is the consumer's job. */
+export interface PatchNoteInfo {
+  id: string;
+  title: string;
+  author: string;
+  published: string;
+  url: string;
+  content: string;
+}
+
+/** One observed point in a planet's health series. Deltas are raw observed
+ * differences from the prior point — never a projection or trend. */
+export interface PlanetHistoryPoint {
+  health: number;
+  /** Worker-clock ms epoch, exactly as sampled. */
+  t: number;
+  /** ISO rendering of `t` — a unit conversion, same instant. */
+  observed_at: string;
+  /** current − previous health; null on the first point. */
+  delta_health: number | null;
+  /** hours since the previous point; null on the first point. */
+  delta_hours: number | null;
 }
 
 /** Context passed into pure normalization — assembled by the handler layer. */

@@ -7,8 +7,11 @@ import { UpstreamError } from "./client";
 import {
   ToolError,
   getCampaigns,
+  getDispatches,
   getMajorOrder,
+  getPatchNotes,
   getPlanet,
+  getPlanetHistory,
   getWarStatus,
 } from "./tools";
 import type { Env } from "./types";
@@ -43,6 +46,52 @@ const TOOL_DEFINITIONS = [
     name: "get_planet",
     description:
       "Deep dive on one planet by index or name: raw HP, regen/decay (defense decay is always null — it is cosmetic), signed hp_per_hour, hours_to_resolution projection derived from raw HP (never from liberation %), direction flag, per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, environmental hazards, and defense timing (defense_ends_at / defense_hours_remaining) when a defense event is active.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        index: { type: "number", description: "Planet index (e.g. 175)" },
+        name: {
+          type: "string",
+          description: "Planet name, case-insensitive (e.g. \"Grand Errant\")",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_dispatches",
+    description:
+      "Recent in-fiction war news dispatches, newest first: id, published timestamp, type, and the message exactly as upstream sends it (may contain in-game markup).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Max dispatches to return (default 10, cap 25).",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_patch_notes",
+    description:
+      "Recent Helldivers 2 Steam news / patch notes, newest first: title, author, published timestamp, url, and the full announcement content as verbatim Steam BBCode (no server-side summary or formatting).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Max entries to return (default 5, cap 10).",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_planet_history",
+    description:
+      "Observed health time-series for one planet (by index or name), sampled by this server: retained data points with per-point delta_health / delta_hours between consecutive samples. Observed values and deterministic deltas only — no forecasts or trend labels. Sparse or empty series (insufficient_history: true) is expected on cold start or for planets without an active campaign.",
     inputSchema: {
       type: "object",
       properties: {
@@ -98,6 +147,25 @@ async function dispatchTool(
     case "get_planet":
       return toolText(
         await getPlanet(env, {
+          index: typeof args.index === "number" ? args.index : undefined,
+          name: typeof args.name === "string" ? args.name : undefined,
+        }),
+      );
+    case "get_dispatches":
+      return toolText(
+        await getDispatches(env, {
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+        }),
+      );
+    case "get_patch_notes":
+      return toolText(
+        await getPatchNotes(env, {
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+        }),
+      );
+    case "get_planet_history":
+      return toolText(
+        await getPlanetHistory(env, {
           index: typeof args.index === "number" ? args.index : undefined,
           name: typeof args.name === "string" ? args.name : undefined,
         }),

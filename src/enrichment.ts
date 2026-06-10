@@ -1,21 +1,34 @@
 /**
- * Stage 1 enrichment: lean fact pass-throughs from data already present in
- * fetched planet payloads. Pure — zero I/O; the handler layer (tools.ts)
- * feeds in raw objects and the clock. Every field is either raw upstream
- * data or a deterministic unit conversion — never a judgment.
+ * Stage 1 + Stage 2 enrichment: lean fact pass-throughs from fetched
+ * payloads. Pure — zero I/O; the handler layer (tools.ts) feeds in raw
+ * objects and the clock. Every field is either raw upstream data or a
+ * deterministic unit conversion — never a judgment.
  */
+import type { HealthSample } from "./sampling";
 import type {
   BiomeInfo,
   DefenseTiming,
+  DispatchInfo,
   HazardInfo,
+  PatchNoteInfo,
+  PlanetHistoryPoint,
   PlanetStatistics,
   RawBiome,
+  RawDispatch,
   RawEvent,
   RawHazard,
   RawStatistics,
+  RawSteamNews,
 } from "./types";
 
 const MS_PER_HOUR = 3_600_000;
+
+/** Dispatch feed limits: bound the payload, never the facts. */
+export const DISPATCHES_DEFAULT_LIMIT = 10;
+export const DISPATCHES_MAX_LIMIT = 25;
+/** Patch-note limits are tighter: entries are several KB of BBCode each. */
+export const PATCH_NOTES_DEFAULT_LIMIT = 5;
+export const PATCH_NOTES_MAX_LIMIT = 10;
 
 function finiteOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -102,6 +115,97 @@ export function selectBiome(
     description:
       typeof biome.description === "string" ? biome.description : null,
   };
+}
+
+/** Clamp a caller-supplied limit: junk/<1 → default, >cap → cap, floored. */
+function clampLimit(
+  limit: unknown,
+  defaultLimit: number,
+  maxLimit: number,
+): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 1) {
+    return defaultLimit;
+  }
+  return Math.min(Math.floor(limit), maxLimit);
+}
+
+/** Newest-first sort key: unparseable timestamps sink to the end. */
+function publishedMs(value: unknown): number {
+  const ms = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? ms : Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Dispatch pass-through: id/published/type/message exactly as upstream sends
+ * them (message keeps its in-game markup — rendering is the consumer's job).
+ * Defensively sorted newest-first by `published` even though upstream already
+ * sends that order; bounded by a clamped limit.
+ */
+export function shapeDispatches(
+  raw: RawDispatch[] | null | undefined,
+  limit?: unknown,
+): DispatchInfo[] {
+  const n = clampLimit(limit, DISPATCHES_DEFAULT_LIMIT, DISPATCHES_MAX_LIMIT);
+  return (Array.isArray(raw) ? [...raw] : [])
+    .sort(
+      (a, b) =>
+        publishedMs(b.published) - publishedMs(a.published) ||
+        (b.id ?? 0) - (a.id ?? 0),
+    )
+    .slice(0, n)
+    .map((d) => ({
+      id: d.id,
+      published: d.published,
+      type: d.type,
+      message: d.message,
+    }));
+}
+
+/**
+ * Steam patch-note pass-through, newest-first. `content` is the verbatim
+ * BBCode body — the upstream has no summary field and the server derives
+ * none (a summary would be an interpretive transformation).
+ */
+export function shapePatchNotes(
+  raw: RawSteamNews[] | null | undefined,
+  limit?: unknown,
+): PatchNoteInfo[] {
+  const n = clampLimit(limit, PATCH_NOTES_DEFAULT_LIMIT, PATCH_NOTES_MAX_LIMIT);
+  return (Array.isArray(raw) ? [...raw] : [])
+    .sort((a, b) => publishedMs(b.publishedAt) - publishedMs(a.publishedAt))
+    .slice(0, n)
+    .map((p) => ({
+      id: p.id,
+      title: p.title,
+      author: p.author,
+      published: p.publishedAt,
+      url: p.url,
+      content: p.content,
+    }));
+}
+
+/**
+ * Observed history points from a retained sample series (oldest → newest).
+ * Each point after the first carries the raw deltas from its predecessor:
+ * delta_health = current − previous (negative = health depleting) and
+ * delta_hours. Deterministic differences only — no smoothing, no forecast,
+ * no trend label. Note the orientation difference vs hp_per_hour, which is
+ * (previous − current) / hours with positive = progressing; both formulas
+ * are restated in the tool payload so neither convention is a surprise.
+ */
+export function buildHistoryPoints(
+  samples: HealthSample[],
+): PlanetHistoryPoint[] {
+  return samples.map((s, i) => {
+    const prev = i > 0 ? samples[i - 1] : undefined;
+    return {
+      health: s.h,
+      t: s.t,
+      observed_at: new Date(s.t).toISOString(),
+      delta_health: prev ? s.h - prev.h : null,
+      delta_hours: prev ? (s.t - prev.t) / MS_PER_HOUR : null,
+    };
+  });
 }
 
 /** Hazard pass-through: always an array — [] when upstream sends none. */

@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through four MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through seven MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -30,6 +30,9 @@ The projection uses the magnitude (`abs`); the `direction` flag is the sole carr
 | `get_campaigns` | All active campaigns, invariant-normalized |
 | `get_major_order` | Current MO: objectives, progress, rewards, time remaining |
 | `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection |
+| `get_dispatches` | In-fiction war news feed, newest first (`limit` optional, default 10 / cap 25) |
+| `get_patch_notes` | Steam news / patch notes, newest first, verbatim BBCode content (`limit` optional, default 5 / cap 10) |
+| `get_planet_history` | Observed health time-series for one planet by `index` or `name`: retained samples + per-point `delta_health`/`delta_hours` — observed deltas, never a forecast |
 
 ## Setup & deploy (under five minutes)
 
@@ -84,6 +87,8 @@ curl -s localhost:8787/mcp -H 'content-type: application/json' \
 
 The rate needs **two calls separated by more than 60 seconds of wall-clock time** (use ~70–90s to comfortably clear both the 45s raw-response cache TTL and the 60s minimum sample interval). The first call seeds the health sample; the second produces a fresh, distinct read and therefore a numeric `hp_per_hour`. **A `null` rate when polling faster than this is expected behavior, not a bug.** Until then, projections report `status: "insufficient_data"`.
 
+The same timing governs `get_planet_history`: it returns the samples accumulated by polling (`get_campaigns` / `get_war_status` / `get_planet` calls), so on a cold start it correctly reports an empty series with `insufficient_history: true` — populate it with two polls >60s apart.
+
 ## Architecture
 
 ```
@@ -91,7 +96,9 @@ src/index.ts       Worker entry — routes POST / and /mcp
 src/mcp.ts         JSON-RPC 2.0: initialize, tools/list, tools/call
 src/client.ts      Upstream fetch + KV cache (raw responses) + rate sampling
 src/invariants.ts  Pure normalization — the five invariants, no I/O
-src/tools.ts       The four tool implementations
+src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
+src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas)
+src/tools.ts       The seven tool implementations
 src/types.ts       Raw upstream + normalized types
 ```
 

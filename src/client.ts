@@ -4,6 +4,12 @@
  * hardcoded. Raw responses are cached; invariant normalization always runs
  * AFTER the cache read, so logic changes never require cache invalidation.
  */
+import {
+  advancePlanetSeries,
+  coerceStore,
+  type HealthSample,
+  type SampleStore,
+} from "./sampling";
 import type { Env } from "./types";
 
 const BASE_URL = "https://api.helldivers2.dev";
@@ -11,10 +17,10 @@ const BASE_URL = "https://api.helldivers2.dev";
 export const CACHE_TTL_SECONDS = 45;
 /** How long stale copies survive in KV to serve as 429/5xx fallback. */
 const STALE_KEEP_TTL_SECONDS = 600;
-/** Minimum spacing between two health samples for a rate to be computed. */
-export const MIN_SAMPLE_INTERVAL_MS = 60_000;
 const FETCH_TIMEOUT_MS = 8_000;
 const SAMPLES_KEY = "samples:planets";
+
+export { MIN_SAMPLE_INTERVAL_MS } from "./sampling";
 
 export class UpstreamError extends Error {
   constructor(
@@ -133,11 +139,6 @@ export async function fetchUpstream<T>(
  * direction flag must stay consistent with this convention.
  * ---------------------------------------------------------------------- */
 
-interface SampleStore {
-  planets: Record<string, { h: number; t: number; lastRate: number | null }>;
-  campaignsFirstSeen: Record<string, number>;
-}
-
 export interface SampleInput {
   planetIndex: number;
   /** Current trackable health: planet.health, or event.health for defense. */
@@ -151,63 +152,65 @@ export interface SampleOutput {
   campaignAgeMs: number | null;
 }
 
+async function readSampleStore(env: Env): Promise<SampleStore> {
+  if (!env.WAR_CACHE) return { planets: {}, campaignsFirstSeen: {} };
+  try {
+    const existing = await env.WAR_CACHE.get(SAMPLES_KEY, "json");
+    // Accepts both the current ring-buffer shape and the pre-history
+    // single-sample shape (migrated in place); unreadable state is empty.
+    return coerceStore(existing);
+  } catch {
+    return { planets: {}, campaignsFirstSeen: {} };
+  }
+}
+
 /**
  * One KV read + one KV write for the whole batch (O(n) over the campaign
  * list, no nested loops). Rates only update once samples are at least
  * MIN_SAMPLE_INTERVAL_MS apart; between updates the last computed rate is
  * reused so cached health reads don't collapse the rate to a bogus 0.
+ * Per planet a bounded ring buffer of samples is retained (sampling.ts) —
+ * the rate logic still reads only the tail, so hp_per_hour is unchanged.
+ *
+ * carryForward: by default the next store is rebuilt from the inputs alone,
+ * so planets that leave the campaign set drop out (and re-entry reseeds a
+ * null rate — long-standing semantics the rate logic depends on). Single
+ * planet probes (get_planet on a non-campaign planet) MUST pass true so one
+ * lookup doesn't wipe every other planet's series and the campaign
+ * first-seen ages.
  */
 export async function samplePlanetRates(
   env: Env,
   inputs: SampleInput[],
   nowMs: number = Date.now(),
+  opts: { carryForward?: boolean } = {},
 ): Promise<Map<number, SampleOutput>> {
   const results = new Map<number, SampleOutput>();
-  let store: SampleStore = { planets: {}, campaignsFirstSeen: {} };
-  if (env.WAR_CACHE) {
-    try {
-      const existing = await env.WAR_CACHE.get<SampleStore>(
-        SAMPLES_KEY,
-        "json",
-      );
-      if (existing) {
-        store = {
-          planets: existing.planets ?? {},
-          campaignsFirstSeen: existing.campaignsFirstSeen ?? {},
-        };
-      }
-    } catch {
-      // Treat unreadable state as empty; rates will rebuild.
-    }
-  }
+  const store = await readSampleStore(env);
 
-  const nextStore: SampleStore = { planets: {}, campaignsFirstSeen: {} };
+  const nextStore: SampleStore = opts.carryForward
+    ? {
+        planets: { ...store.planets },
+        campaignsFirstSeen: { ...store.campaignsFirstSeen },
+      }
+    : { planets: {}, campaignsFirstSeen: {} };
 
   for (const input of inputs) {
     const idxKey = String(input.planetIndex);
-    let hpPerHour: number | null = null;
 
-    if (input.health != null && Number.isFinite(input.health)) {
-      const prev = store.planets[idxKey];
-      if (prev && nowMs - prev.t >= MIN_SAMPLE_INTERVAL_MS) {
-        const hoursElapsed = (nowMs - prev.t) / 3_600_000;
-        // See sign convention block above: positive = progressing.
-        hpPerHour = (prev.h - input.health) / hoursElapsed;
-        nextStore.planets[idxKey] = {
-          h: input.health,
-          t: nowMs,
-          lastRate: hpPerHour,
-        };
-      } else if (prev) {
-        hpPerHour = prev.lastRate;
-        nextStore.planets[idxKey] = prev;
-      } else {
-        nextStore.planets[idxKey] = {
-          h: input.health,
-          t: nowMs,
-          lastRate: null,
-        };
-      }
+    const advanced = advancePlanetSeries(
+      store.planets[idxKey],
+      input.health != null && Number.isFinite(input.health)
+        ? input.health
+        : null,
+      nowMs,
+    );
+    const hpPerHour = advanced.hpPerHour;
+    if (advanced.series) {
+      nextStore.planets[idxKey] = advanced.series;
+    } else if (opts.carryForward) {
+      // Legacy parity: a null-health observation drops the entry.
+      delete nextStore.planets[idxKey];
     }
 
     let campaignAgeMs: number | null = null;
@@ -233,4 +236,17 @@ export async function samplePlanetRates(
   }
 
   return results;
+}
+
+/**
+ * Read-only view of one planet's retained sample series for
+ * get_planet_history: one KV read, zero writes — history lookups never touch
+ * the sampling write budget.
+ */
+export async function readPlanetSamples(
+  env: Env,
+  planetIndex: number,
+): Promise<HealthSample[]> {
+  const store = await readSampleStore(env);
+  return store.planets[String(planetIndex)]?.samples ?? [];
 }
