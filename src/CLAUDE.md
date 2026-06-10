@@ -5,12 +5,12 @@ Module boundaries are strict; respect them when editing:
 | File | Role | Boundary rule |
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
-| `enrichment.ts` | Stage 1+2+4 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `enrichment.ts` | Stage 1+2+4+5 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
 | `wiki.ts` | Stage 4 LORE source, pure half: wiki query plan (title candidates, one multi-title request), response shaping, extract cap, mandatory attribution | **Pure. Zero I/O. SEPARATE source** — never imports from or feeds into the live war-state pipeline; no live war number in any output. |
 | `wikiClient.ts` | Stage 4 LORE source, I/O half: helldivers.wiki.gg fetch (descriptive User-Agent) + long-TTL KV cache in the `wiki:` namespace with stale fallback | Deliberately separate from `client.ts`. Injectable fetch for tests. Never touches `raw:`/`samples:` keys. |
-| `sampling.ts` | Pure planet-sample series logic: the bounded ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
+| `sampling.ts` | Pure sample-store logic: the bounded planet ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants, and the Stage 5 accumulation layers (`foldSignatures`, `advanceGlobalSeries`) | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
 | `client.ts` | Upstream fetch + KV cache + rate sampling | Owns the `hp_per_hour` sign convention (comment block) and all KV access. |
-| `tools.ts` | The eight tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. |
+| `tools.ts` | The ten tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
 | `index.ts` | Entry/routing | POST `/` or `/mcp` only. |
@@ -81,3 +81,16 @@ write per `samplePlanetRates` call; `get_planet_history` is read-only.
 Single-planet probes pass `carryForward: true` so they don't wipe other
 planets' series — the batch poll deliberately does NOT (planets leaving the
 campaign set must drop and reseed a null rate, as always).
+
+Stage 5 adds two ACCUMULATION layers inside the same store/key — observed
+campaign signatures (`signatures`, capped at 500 tuples) and the global
+statistics series (`global`, 96 points / 48h, sampled only when the
+get_war_status path supplies `war.statistics`). Both fold into the SAME
+single per-cycle write (never a second put), and both ALWAYS carry forward —
+`carryForward` semantics apply to planet series/campaign ages only. The
+sections stay absent until they first accrue data, so pre-Stage-5 stores
+round-trip unchanged. Worst case they add ~75KB to the store. The store key
+carries a 30-day KV TTL refreshed on every write (planet samples still age
+out in code at 48h): long enough for accumulated signatures to survive gaps
+in usage, while a truly abandoned store still evaporates.
+`get_observed_signatures` and `get_global_history` are read-only.

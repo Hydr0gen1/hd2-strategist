@@ -1,5 +1,5 @@
 /**
- * The eight MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The ten MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
@@ -8,21 +8,32 @@
  */
 import {
   fetchUpstream,
+  readGlobalSamples,
+  readObservedSignatures,
   readPlanetSamples,
   samplePlanetRates,
+  SAMPLES_KEY_TTL_SECONDS,
   type SampleInput,
 } from "./client";
 import {
   aggregateFrontRate,
+  buildFactionRollup,
+  buildGlobalHistoryPoints,
   buildHistoryPoints,
+  buildNeighbors,
+  buildSectorRollup,
   decayPerHour,
   decodeEventModifier,
   defenseTiming,
+  historyRateAggregates,
+  moPlanetAssignmentMap,
   selectBiome,
   selectHazards,
   selectPlanetStatistics,
   shapeDispatches,
+  shapeObservedSignatures,
   shapePatchNotes,
+  TASK_VALUE_TYPE_PLANET,
 } from "./enrichment";
 import { planWikiQuery, shapeWikiResult } from "./wiki";
 import { fetchWikiQuery } from "./wikiClient";
@@ -32,8 +43,11 @@ import {
   normalizeCampaign,
 } from "./invariants";
 import {
+  MAX_GLOBAL_SAMPLES,
   MAX_SAMPLE_AGE_MS,
   MAX_SAMPLES_PER_PLANET,
+  MAX_SIGNATURES,
+  type SignatureObservation,
 } from "./sampling";
 import type {
   EnrichedCampaign,
@@ -48,27 +62,34 @@ import type {
   RawWar,
 } from "./types";
 
-/** Upstream assignment task valueType that denotes a planet index. */
-const TASK_VALUE_TYPE_PLANET = 12;
-
 export class ToolError extends Error {}
 
-function moPlanetIndicesFrom(
-  assignments: RawAssignment[],
-): ReadonlySet<number> {
-  const indices = new Set<number>();
-  for (const assignment of assignments) {
-    for (const task of assignment.tasks ?? []) {
-      const types = task.valueTypes ?? [];
-      const values = task.values ?? [];
-      for (let i = 0; i < types.length; i++) {
-        if (types[i] === TASK_VALUE_TYPE_PLANET && values[i] != null) {
-          indices.add(values[i]!);
-        }
-      }
-    }
-  }
-  return indices;
+/**
+ * Stage 5, Part A: the observed signature tuple for each campaign. Every
+ * field is straight upstream data; `faction` uses the SAME derivation as
+ * normalizeCampaign (event attacker on a defense, planet owner otherwise)
+ * so tuples stay verifiable against get_campaigns output. Missing field →
+ * null inside the tuple, never fabricated.
+ */
+function signatureObservationsFrom(
+  raw: RawCampaign[],
+): SignatureObservation[] {
+  return raw.map((c) => {
+    const event = c.planet.event;
+    const faction =
+      campaignKind(c) === "defense"
+        ? (typeof event?.faction === "string" ? event.faction : null)
+        : typeof c.planet.currentOwner === "string"
+          ? c.planet.currentOwner
+          : null;
+    return {
+      campaign_type: typeof c.type === "number" ? c.type : null,
+      event_type:
+        typeof event?.eventType === "number" ? event.eventType : null,
+      has_event: Boolean(event),
+      faction,
+    };
+  });
 }
 
 function trackableHealth(planet: RawPlanet): number | null {
@@ -85,15 +106,28 @@ function defenseAgeMs(planet: RawPlanet, nowMs: number): number | null {
 interface CampaignBundle {
   campaigns: EnrichedCampaign[];
   stale: boolean;
+  /** Present iff requested via { withWar: true } — the war fetch joins the
+   * existing parallel fetch so its global statistics reach the single
+   * sample-store write without a second round-trip. */
+  war?: { data: RawWar; stale: boolean };
 }
 
-async function loadNormalizedCampaigns(env: Env): Promise<CampaignBundle> {
-  const [campaignsRes, assignmentsRes] = await Promise.all([
+async function loadNormalizedCampaigns(
+  env: Env,
+  opts: { withWar?: boolean } = {},
+): Promise<CampaignBundle> {
+  const [campaignsRes, assignmentsRes, warRes] = await Promise.all([
     fetchUpstream<RawCampaign[]>(env, "/api/v1/campaigns"),
     fetchUpstream<RawAssignment[]>(env, "/api/v1/assignments"),
+    opts.withWar
+      ? fetchUpstream<RawWar>(env, "/api/v1/war")
+      : Promise.resolve(null),
   ]);
   const raw = campaignsRes.data ?? [];
-  const moPlanetIndices = moPlanetIndicesFrom(assignmentsRes.data ?? []);
+  // Stage 5: one shared planet→assignment map; the invariant-5 MO planet
+  // set is derived from its keys, so HPC membership is unchanged.
+  const moMap = moPlanetAssignmentMap(assignmentsRes.data ?? []);
+  const moPlanetIndices = new Set(moMap.keys());
   const nowMs = Date.now();
 
   const samples = await samplePlanetRates(
@@ -106,6 +140,13 @@ async function loadNormalizedCampaigns(env: Env): Promise<CampaignBundle> {
       }),
     ),
     nowMs,
+    {
+      // Stage 5 accumulation layers — folded into the SAME single write.
+      // Global statistics are present only on the get_war_status path (the
+      // one place the war is fetched); signatures fold on every poll.
+      signatures: signatureObservationsFrom(raw),
+      globalStatistics: warRes?.data?.statistics ?? null,
+    },
   );
 
   const campaigns = raw.map((c): EnrichedCampaign => {
@@ -134,18 +175,30 @@ async function loadNormalizedCampaigns(env: Env): Promise<CampaignBundle> {
       // decoded from the live API's own event data (never the wiki).
       ...decodeEventModifier(c.planet.event),
       ...(c.planet.event ? defenseTiming(c.planet.event, nowMs) : {}),
+      // Stage 5: pure join against the MO task planet set — the same map
+      // invariant 5 consumes; membership fact, not a priority score.
+      is_major_order_target: moMap.has(c.planet.index),
+      major_order_id: moMap.get(c.planet.index) ?? null,
     };
   });
 
-  return { campaigns, stale: campaignsRes.stale || assignmentsRes.stale };
+  return {
+    campaigns,
+    stale: campaignsRes.stale || assignmentsRes.stale,
+    ...(warRes ? { war: { data: warRes.data, stale: warRes.stale } } : {}),
+  };
 }
 
 export async function getWarStatus(env: Env): Promise<unknown> {
-  const [warRes, bundle] = await Promise.all([
-    fetchUpstream<RawWar>(env, "/api/v1/war"),
-    loadNormalizedCampaigns(env),
+  // Stage 5: the war fetch rides inside loadNormalizedCampaigns (withWar) so
+  // its global statistics reach the single sample-store write; the planets
+  // list (already KV-cached, used by get_planet) feeds the rollups.
+  const [planetsRes, bundle] = await Promise.all([
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+    loadNormalizedCampaigns(env, { withWar: true }),
   ]);
-  const war = warRes.data;
+  const war = bundle.war!.data;
+  const planets = planetsRes.data ?? [];
 
   const byFaction = new Map<string, EnrichedCampaign[]>();
   for (const c of bundle.campaigns) {
@@ -172,6 +225,12 @@ export async function getWarStatus(env: Env): Promise<unknown> {
     };
   }
 
+  // Stage 5: rollups reuse the front aggregates verbatim — one signed
+  // source of truth, never a recompute.
+  const netRateByFaction = new Map<string, number | null>(
+    Object.entries(fronts).map(([f, v]) => [f, v.net_hp_per_hour]),
+  );
+
   return {
     war_started: war.started,
     war_ends: war.ended,
@@ -180,6 +239,12 @@ export async function getWarStatus(env: Env): Promise<unknown> {
     impact_multiplier: war.impactMultiplier,
     total_planets_in_play: bundle.campaigns.length,
     active_fronts: fronts,
+    faction_rollup: buildFactionRollup(
+      planets,
+      bundle.campaigns,
+      netRateByFaction,
+    ),
+    sector_rollup: buildSectorRollup(planets, bundle.campaigns),
     global_statistics: {
       player_count: war.statistics.playerCount,
       missions_won: war.statistics.missionsWon,
@@ -193,8 +258,14 @@ export async function getWarStatus(env: Env): Promise<unknown> {
     notes: {
       net_hp_per_hour:
         "Per-front sum of the same signed per-campaign hp_per_hour values (positive = progressing toward resolution). Only planets with a known rate are summed — planets_with_rate vs planets_total states the coverage. Null means no planet on the front has a rate yet (e.g. cold start), not zero.",
+      faction_rollup:
+        "Deterministic counts/sums per faction over data already fetched: planets owned (by currentOwner over the full planets list), active campaigns on that faction's front, the SAME Stage-3 net_hp_per_hour front aggregate echoed verbatim (null when the faction has no active front — e.g. Humans), and the sum of known per-campaign player counts (null when none known; campaigns_with_players vs campaigns_total states the coverage). Facts only — no ranking, no verdict.",
+      sector_rollup:
+        "Per-sector planet count, owner tallies (verbatim upstream owner strings), and number of active campaigns in the sector. Counts only.",
     },
-    ...(warRes.stale || bundle.stale ? { stale: true } : {}),
+    ...(planetsRes.stale || bundle.war!.stale || bundle.stale
+      ? { stale: true }
+      : {}),
   };
 }
 
@@ -216,6 +287,8 @@ export async function getCampaigns(env: Env): Promise<unknown> {
         "regen_per_second × 3600 — regen in the same units as hp_per_hour. Derived from the invariant-normalized regen, so it is always null on defense campaigns (cosmetic decay stays suppressed) and null when regen is unknown.",
       modifier:
         "Decoded special-faction name for event_type, only when the enum value is confirmed in EVENT_MODIFIER_NAMES. event_type non-null with modifier null = an active event whose enum value is not yet confirmed — visible, never named by guess. Both null = no event. Identity only, no difficulty judgment; lore/meaning lives in get_planet_wiki.",
+      is_major_order_target:
+        "Pure membership join against the current Major Order task planet set (the same set HPC detection consumes). major_order_id is the id of the first assignment naming the planet (upstream array order) when it appears in several; null when the planet is in no MO task. A fact, not a priority score.",
     },
     ...(bundle.stale ? { stale: true } : {}),
   };
@@ -420,6 +493,22 @@ export async function getPlanet(
     statistics: selectPlanetStatistics(planet.statistics),
     biome: selectBiome(planet.biome),
     hazards: selectHazards(planet.hazards),
+    // Stage 5: waypoint neighbors joined against data already in hand — the
+    // full planets list and the active campaign set. Adds neighbors,
+    // neighbor_summary, frontline.
+    ...buildNeighbors(
+      planet,
+      new Map(planets.map((p) => [p.index, p])),
+      new Map(
+        bundle.campaigns.map((c) => [c.planet_index, c.campaign_kind]),
+      ),
+    ),
+    notes: {
+      neighbors:
+        "Upstream's own waypoints array for this planet, in upstream order — joined by index against the full planets list and the active campaign set, never symmetrized or rerouted (direction semantics are upstream's). A dangling index still counts in neighbor_summary.total with name/owner null, tallied under by_owner.unknown.",
+      frontline:
+        "Deterministic adjacency fact: true iff at least one neighbor has a known owner different from this planet's current_owner — 'borders territory of a different owner', nothing more. Not a strategic judgment; neighbors with unknown owners never set it.",
+    },
     ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
   };
 }
@@ -521,6 +610,10 @@ export async function getPlanetHistory(
         ? (last.t - first.t) / 3_600_000
         : null,
     samples: points,
+    // Stage 5: observed-only aggregates over the same retained series —
+    // rate_min/rate_max/rate_mean/latest_rate + samples_span_hours, all
+    // null when fewer than two usable points exist.
+    ...historyRateAggregates(samples),
     insufficient_history: points.length < 2,
     ...(points.length < 2
       ? {
@@ -540,7 +633,83 @@ export async function getPlanetHistory(
         "Raw observed change per point: current − previous (negative = health depleting). hp_per_hour elsewhere uses the opposite orientation, (previous − current) / hours, positive = progressing toward resolution. Both are stated so the sign conventions are explicit.",
       sampling:
         "Observed data points and deterministic deltas only — no smoothing, no forecast, no trend verdict. Sample timestamps use the Worker clock (upstream war time is game-epoch and not comparable).",
+      rate_aggregates:
+        "rate_min/rate_max/rate_mean/latest_rate are plain stats over the per-interval observed rates, using the hp_per_hour sign convention ((previous − current) / hours, positive = progressing). rate_mean is the unweighted mean of per-interval rates — NOT total change ÷ total time. Observed values only: no trend direction, no smoothing, no projection from history (projection lives in get_planet and is current-rate based).",
     },
     ...(planetsRes.stale || campaignsRes.stale ? { stale: true } : {}),
+  };
+}
+
+/**
+ * Stage 5, Part A: the accumulated campaign-signature record — every
+ * distinct {campaign_type, event_type, has_event, faction} tuple this
+ * server has observed, with first/last seen timestamps. Read-only (zero KV
+ * writes); accumulation happens passively on every poll cycle inside the
+ * existing single sample-store write. This is the instrumentation for the
+ * ROADMAP watch-list items: it captures a special-faction event_type or a
+ * non-zero (e.g. defense) campaign_type the moment one appears.
+ */
+export async function getObservedSignatures(env: Env): Promise<unknown> {
+  const signatures = shapeObservedSignatures(
+    await readObservedSignatures(env),
+  );
+  return {
+    count: signatures.length,
+    max_signatures: MAX_SIGNATURES,
+    signatures,
+    ...(signatures.length === 0
+      ? {
+          note: "No signatures accumulated yet. Tuples accrue passively whenever this server polls campaigns (get_war_status, get_campaigns, get_planet) — a cold start is expected to be empty, not an error.",
+        }
+      : {}),
+    notes: {
+      purpose:
+        "Passive observation record of every distinct {campaign_type, event_type, has_event, faction} tuple seen upstream, so rare states (special-faction events, defense campaign types) are captured with timestamps instead of requiring someone to be watching live. Raw observed values only — no interpretation; a missing upstream field is recorded as null within the tuple.",
+      faction:
+        "Same derivation as the campaign payloads: the event's attacker on a defense, the planet's current owner otherwise — so tuples are verifiable against get_campaigns.",
+      sample_count:
+        "Number of distinct observations at least 60s apart (the sampler's minimum interval) — rapid re-polls of the 45s response cache do not inflate it.",
+      persistence: `Stored alongside the planet sample series under one KV key with a ${SAMPLES_KEY_TTL_SECONDS / 86_400}-day TTL refreshed on every poll; a record older than that without any polling evaporates.`,
+    },
+  };
+}
+
+/**
+ * Stage 5, Part E: the retained global war-statistics series with raw
+ * observed deltas — playerbase/tempo history sampled by this server.
+ * Read-only (zero KV writes); samples accrue inside the existing single
+ * sample-store write, and only on get_war_status polls (the one path that
+ * fetches /api/v1/war).
+ */
+export async function getGlobalHistory(env: Env): Promise<unknown> {
+  const samples = await readGlobalSamples(env);
+  const points = buildGlobalHistoryPoints(samples);
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  return {
+    points: points.length,
+    window_hours:
+      first && last && samples.length >= 2
+        ? (last.t - first.t) / 3_600_000
+        : null,
+    samples: points,
+    insufficient_history: points.length < 2,
+    ...(points.length < 2
+      ? {
+          note:
+            points.length === 0
+              ? "No global samples retained yet. Samples accrue only when get_war_status is polled (the one tool that fetches the war state) — a cold start is expected to be empty, not an error."
+              : "Only one global sample retained so far; deltas need at least two samples >60s apart.",
+        }
+      : {}),
+    retention: {
+      max_points: MAX_GLOBAL_SAMPLES,
+      max_age_hours: MAX_SAMPLE_AGE_MS / 3_600_000,
+      note: `Bounded like the planet series (oldest evicted first); the combined store key carries a ${SAMPLES_KEY_TTL_SECONDS / 86_400}-day KV TTL refreshed on every poll.`,
+    },
+    notes: {
+      sampling:
+        "A lean named subset of upstream war.statistics sampled over time on the Worker clock. A field missing upstream is null at that point, never 0; deltas are null when either end is null. Observed values and raw consecutive differences only — no smoothing, no forecast, no trend verdict.",
+    },
   };
 }

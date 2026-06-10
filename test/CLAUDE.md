@@ -3,9 +3,12 @@
 Plain vitest, no Workers runtime: everything under test is pure
 (`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`, `src/wiki.ts`).
 If a test needs I/O or KV, the code under test is in the wrong module — move
-the logic, don't mock the world. The one sanctioned exception is
-`src/wikiClient.ts` (stage4.test.ts): its fetch is INJECTED per call and KV
-is a ~10-line in-memory stub — no network, no global mocking.
+the logic, don't mock the world. Two sanctioned exceptions:
+`src/wikiClient.ts` (stage4.test.ts), whose fetch is INJECTED per call, and
+`samplePlanetRates` in `src/client.ts` (stage5.test.ts), which does no
+network I/O — both use the same ~10-line in-memory KV stub; no network, no
+global mocking. The stub's `puts` log is what proves the one-write-per-cycle
+budget.
 
 ## Coverage that must never regress
 
@@ -70,6 +73,36 @@ the project's definition of done:
     never fetches; success caches under `wiki:` with the long TTL; failure →
     stale fallback when a copy exists, typed `WikiError` when not; descriptive
     User-Agent built from SUPER_CLIENT/SUPER_CONTACT with safe fallbacks.
+
+- Stage 5 (`stage5.test.ts`):
+  - `foldSignatures`: new tuple appended with `first_seen`; repeat tuple bumps
+    `last_seen`/`sample_count` only past the 60s guard (cache replays never
+    inflate counts); per-cycle dedupe; a missing upstream field is null INSIDE
+    the tuple and null is a distinct identity; cap evicts oldest `last_seen`;
+    empty observation set leaves the record untouched.
+  - `advanceGlobalSeries`: null stats (a poll that never fetched the war) →
+    series untouched, never an all-null row; missing fields → null, never 0;
+    bounded by count + age with the newest sample surviving.
+  - **Folded write**: `samplePlanetRates` performs exactly ONE put per call on
+    `samples:planets` (30-day TTL) containing the folded signatures + global
+    series; the batch poll preserves both accumulation layers while rebuilding
+    planet series; a `carryForward` probe preserves them byte-identically;
+    pre-Stage-5 stores coerce without gaining empty sections.
+  - `moPlanetAssignmentMap`: parity with the legacy MO planet-set derivation
+    (invariant-5 membership unchanged); first assignment wins on collision.
+  - `buildNeighbors`: dangling waypoint counts in `total` + `unknown` bucket;
+    `frontline` true iff a KNOWN owner differs (unknown owners never set it);
+    no-waypoint case zeroed.
+  - `historyRateAggregates`: exact min/max/mean/latest on a known series using
+    the hp_per_hour sign convention; <2 points → all null; Δt ≤ 0 pairs
+    skipped, never divided; no trend/forecast key emitted.
+  - `buildGlobalHistoryPoints`: exact consecutive deltas, null-propagating
+    (missing is never 0), negative deltas passed through as observed.
+  - `buildFactionRollup`: `net_hp_per_hour` is ECHOED from the supplied front
+    aggregates (sentinel-pinned — never recomputed); player sums follow the
+    Stage 3 null-honesty pattern with coverage counts.
+  - Combined worst-case store (full galaxy × max points + max signatures +
+    max global samples) stays far under the 5MB KV value limit.
 
 ## Conventions
 
