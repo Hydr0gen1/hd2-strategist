@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through eight MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through ten MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -26,14 +26,16 @@ The projection uses the magnitude (`abs`); the `direction` flag is the sole carr
 
 | Tool | Purpose |
 |------|---------|
-| `get_war_status` | War state, active fronts by faction, global stats |
-| `get_campaigns` | All active campaigns, invariant-normalized |
+| `get_war_status` | War state, active fronts by faction, global stats, faction/sector rollups (counts and sums over fetched data) |
+| `get_campaigns` | All active campaigns, invariant-normalized, with Major Order membership (`is_major_order_target` / `major_order_id`) |
 | `get_major_order` | Current MO: objectives, progress, rewards, time remaining |
-| `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection |
+| `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection and waypoint neighbor context (`neighbors` / `neighbor_summary` / `frontline` adjacency fact) |
 | `get_dispatches` | In-fiction war news feed, newest first (`limit` optional, default 10 / cap 25) |
 | `get_patch_notes` | Steam news / patch notes, newest first, verbatim BBCode content (`limit` optional, default 5 / cap 10) |
-| `get_planet_history` | Observed health time-series for one planet by `index` or `name`: retained samples + per-point `delta_health`/`delta_hours` — observed deltas, never a forecast |
+| `get_planet_history` | Observed health time-series for one planet by `index` or `name`: retained samples + per-point `delta_health`/`delta_hours` and observed-only aggregates (`rate_min`/`rate_max`/`rate_mean`/`latest_rate`, `samples_span_hours`) — observed values, never a forecast |
 | `get_planet_wiki` | **Lore source (separate from live war state):** community wiki entry from helldivers.wiki.gg for a planet (`name`) or any topic (`title`, e.g. "Jet Brigade") — plain-text lead extract, canonical URL, mandatory attribution (CC BY-NC-SA 4.0). Never authoritative for current war state |
+| `get_observed_signatures` | Accumulated record of every distinct campaign signature tuple `{campaign_type, event_type, has_event, faction}` this server has observed, newest `last_seen` first — passive raw observation that captures rare states (special-faction events, defense campaign types) with timestamps |
+| `get_global_history` | Global war statistics time-series sampled by this server (player count, missions, deaths, kills): retained points + raw observed deltas — observed values, never a forecast. Accrues on `get_war_status` polls |
 
 ### Two sources, never mixed
 
@@ -96,6 +98,16 @@ The rate needs **two calls separated by more than 60 seconds of wall-clock time*
 
 The same timing governs `get_planet_history`: it returns the samples accumulated by polling (`get_campaigns` / `get_war_status` / `get_planet` calls), so on a cold start it correctly reports an empty series with `insufficient_history: true` — populate it with two polls >60s apart.
 
+`get_global_history` follows the same rule, with one narrowing: global statistics are sampled only on `get_war_status` polls (the one path that fetches `/api/v1/war`), so populate it with two `get_war_status` calls >60s apart. `get_observed_signatures` accumulates on every campaign poll and is expected to be empty on a cold start. Both tools are read-only:
+
+```bash
+curl -s localhost:8787/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_observed_signatures","arguments":{}}}'
+
+curl -s localhost:8787/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_global_history","arguments":{}}}'
+```
+
 ## Architecture
 
 ```
@@ -107,7 +119,7 @@ src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
 src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode)
 src/wiki.ts        Pure wiki lore logic (query plan, response shaping, attribution) — separate source
 src/wikiClient.ts  Wiki fetch + long-TTL KV cache (`wiki:` namespace) — separate from client.ts
-src/tools.ts       The eight tool implementations
+src/tools.ts       The ten tool implementations
 src/types.ts       Raw upstream + normalized types
 ```
 

@@ -5,12 +5,17 @@
  * AFTER the cache read, so logic changes never require cache invalidation.
  */
 import {
+  advanceGlobalSeries,
   advancePlanetSeries,
   coerceStore,
+  foldSignatures,
+  type GlobalSample,
   type HealthSample,
+  type ObservedSignature,
   type SampleStore,
+  type SignatureObservation,
 } from "./sampling";
-import type { Env } from "./types";
+import type { Env, RawStatistics } from "./types";
 
 const BASE_URL = "https://api.helldivers2.dev";
 /** Freshness window for raw upstream responses. */
@@ -178,12 +183,23 @@ async function readSampleStore(env: Env): Promise<SampleStore> {
  * planet probes (get_planet on a non-campaign planet) MUST pass true so one
  * lookup doesn't wipe every other planet's series and the campaign
  * first-seen ages.
+ *
+ * Stage 5: the accumulation layers (observed campaign signatures and the
+ * global statistics series) ride this SAME single write — never a second
+ * per-cycle KV put. Unlike planet series they ALWAYS carry forward,
+ * regardless of carryForward: that flag's rebuild semantics apply to planet
+ * series and campaign first-seen ages only. A call without `signatures` /
+ * `globalStatistics` passes both layers through untouched.
  */
 export async function samplePlanetRates(
   env: Env,
   inputs: SampleInput[],
   nowMs: number = Date.now(),
-  opts: { carryForward?: boolean } = {},
+  opts: {
+    carryForward?: boolean;
+    signatures?: SignatureObservation[];
+    globalStatistics?: RawStatistics | null;
+  } = {},
 ): Promise<Map<number, SampleOutput>> {
   const results = new Map<number, SampleOutput>();
   const store = await readSampleStore(env);
@@ -194,6 +210,22 @@ export async function samplePlanetRates(
         campaignsFirstSeen: { ...store.campaignsFirstSeen },
       }
     : { planets: {}, campaignsFirstSeen: {} };
+
+  // Stage 5 accumulation layers: always carried forward, then folded.
+  // Sections stay absent (not empty arrays) until they first accrue data,
+  // so pre-Stage-5 stores round-trip unchanged.
+  const signatures = foldSignatures(
+    store.signatures,
+    opts.signatures ?? [],
+    nowMs,
+  );
+  if (signatures.length > 0) nextStore.signatures = signatures;
+  const global = advanceGlobalSeries(
+    store.global,
+    opts.globalStatistics ?? null,
+    nowMs,
+  );
+  if (global.length > 0) nextStore.global = global;
 
   for (const input of inputs) {
     const idxKey = String(input.planetIndex);
@@ -227,8 +259,11 @@ export async function samplePlanetRates(
   if (env.WAR_CACHE) {
     try {
       await env.WAR_CACHE.put(SAMPLES_KEY, JSON.stringify(nextStore), {
-        // Samples for campaigns that ended simply age out.
-        expirationTtl: 86_400,
+        // 30 days, refreshed on every write: planet samples still age out
+        // in code at 48h (sampling.ts), but the Stage 5 accumulation layers
+        // must survive gaps in usage — a truly abandoned store still
+        // evaporates after a month.
+        expirationTtl: SAMPLES_KEY_TTL_SECONDS,
       });
     } catch {
       // Best-effort persistence; next request reseeds.
@@ -237,6 +272,9 @@ export async function samplePlanetRates(
 
   return results;
 }
+
+/** KV TTL for the combined sample/accumulation store key. */
+export const SAMPLES_KEY_TTL_SECONDS = 30 * 86_400;
 
 /**
  * Read-only view of one planet's retained sample series for
@@ -249,4 +287,20 @@ export async function readPlanetSamples(
 ): Promise<HealthSample[]> {
   const store = await readSampleStore(env);
   return store.planets[String(planetIndex)]?.samples ?? [];
+}
+
+/** Stage 5: read-only view of the accumulated signature record for
+ * get_observed_signatures — one KV read, zero writes. */
+export async function readObservedSignatures(
+  env: Env,
+): Promise<ObservedSignature[]> {
+  const store = await readSampleStore(env);
+  return store.signatures ?? [];
+}
+
+/** Stage 5: read-only view of the retained global statistics series for
+ * get_global_history — one KV read, zero writes. */
+export async function readGlobalSamples(env: Env): Promise<GlobalSample[]> {
+  const store = await readSampleStore(env);
+  return store.global ?? [];
 }

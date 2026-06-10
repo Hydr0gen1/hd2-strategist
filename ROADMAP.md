@@ -33,7 +33,7 @@ Invariant ordering in normalization (`1 → 2 → rate/direction → 4 → 5 →
 ## Architecture principles
 
 - **Stay headless.** No frontend, no UI. The conversation layer (Claude) is the only frontend.
-- **Pure normalization/enrichment.** All domain logic lives in pure, I/O-free functions (`invariants.ts`, `connectivity.ts`) that receive everything via context. Handlers (`tools.ts`) do the fetching and assembly. This keeps logic unit-testable without a Workers runtime.
+- **Pure normalization/enrichment.** All domain logic lives in pure, I/O-free functions (`invariants.ts`, `enrichment.ts`, `sampling.ts`) that receive everything via context. Handlers (`tools.ts`) do the fetching and assembly. This keeps logic unit-testable without a Workers runtime.
 - **Cache raw, normalize after.** KV stores raw upstream responses; normalization always runs post-cache so logic changes never require cache invalidation.
 - **Fail safe, never crash.** Upstream errors become structured MCP tool errors with stale-cache fallback — never a thrown exception out of the Worker.
 - **Free-tier discipline.** Single Worker + KV. Keep payloads lean and CPU work to plain object transforms (10ms budget). No D1, no Docker, no Durable Objects unless a feature genuinely demands it (and then it gets its own design review).
@@ -44,14 +44,21 @@ Invariant ordering in normalization (`1 → 2 → rate/direction → 4 → 5 →
 
 ## Current capabilities (shipped)
 
-- `get_war_status` — fronts by faction, planet counts, global stats.
-- `get_campaigns` — invariant-normalized campaigns with trajectory flags + enriched connectivity.
+- `get_war_status` — fronts by faction, planet counts, global stats, and (Stage 5) deterministic faction/sector rollups.
+- `get_campaigns` — invariant-normalized campaigns with trajectory flags and (Stage 5) Major Order membership joins (`is_major_order_target` / `major_order_id`).
 - `get_major_order` — objectives, progress, rewards, time remaining.
-- `get_planet` — single-planet deep dive incl. connectivity.
-- `get_supply_lines` — whole-galaxy connectivity graph, sector-grouped, neighbor-joined.
-- Cross-cutting: KV raw-cache + stale fallback, KV health-sampling for signed `hp_per_hour`, the five invariants, enriched waypoints (name/owner/campaign-joined).
+- `get_planet` — single-planet deep dive incl. (Stage 5) waypoint neighbor context: enriched `neighbors` (name/owner/campaign-joined), `neighbor_summary` counts, and the `frontline` adjacency fact. (This supersedes the earlier `get_supply_lines` whole-galaxy graph idea — the scoped-down neighbor join ships the verifiable part without graph construction; no separate supply-lines tool exists.)
+- Cross-cutting: KV raw-cache + stale fallback, KV health-sampling for signed `hp_per_hour`, the five invariants.
 - Stage 4 — live event identity: `event_type` (raw upstream `event.eventType`, passed through) + `modifier` (decoded special-faction name, only for enum values confirmed in `EVENT_MODIFIER_NAMES`) on `get_planet` and every campaign in `get_campaigns`. Presence + name only — no difficulty/threat interpretation.
 - Stage 4 — `get_planet_wiki`: community lore from helldivers.wiki.gg (MediaWiki `prop=extracts`, root `/api.php`), a physically separate source with mandatory attribution (CC BY-NC-SA 4.0 per the wiki's own rightsinfo), long-TTL `wiki:` KV cache with stale fallback. Live tools say *what is happening*; the wiki says *what it means*; the two are joined only in the conversation layer.
+- Stage 5 — accumulation layer, joins, and rollups (Parts A–F):
+  - **A. Passive signature accumulation** — every distinct `{campaign_type, event_type, has_event, faction}` tuple observed while polling is folded into the existing sample-store write (never a second per-cycle KV put; capped at 500 tuples; `sample_count` deduplicated at the 60s sampler interval). Inspectable via the read-only `get_observed_signatures` tool, newest `last_seen` first. This is the instrumentation for the `campaign_type`/`eventType` watch-list items below.
+  - **B. Neighbor context on `get_planet`** — `neighbors` (upstream waypoints joined by index against the full planets list + campaign set), `neighbor_summary` counts (incl. an `unknown` bucket for dangling indices), and `frontline`: a factual adjacency flag ("borders territory of a different owner"), nothing more.
+  - **C. History aggregates** — `get_planet_history` adds `rate_min`/`rate_max`/`rate_mean`/`latest_rate` (plain stats over per-interval observed rates, hp_per_hour sign convention) + `samples_span_hours`. No trend labels, no smoothing, no projection from history.
+  - **D. Major Order joins** — `is_major_order_target` + `major_order_id` on each campaign: a pure membership join against the same MO planet map invariant 5 consumes (first assignment wins on collision). No priority scoring.
+  - **E. Global statistics history** — a lean subset of `war.statistics` sampled into a bounded ring buffer (96 points / 48h) inside the same single store write, accruing on `get_war_status` polls; served with raw observed deltas by the read-only `get_global_history` tool.
+  - **F. Faction & sector rollups on `get_war_status`** — per-faction `{planets_owned, active_campaigns, net_hp_per_hour (the Stage 3 aggregate echoed verbatim — never recomputed), total_players_on_front (+ coverage counts)}` and per-sector `{planet_count, owners, active_campaigns}`. Deterministic counts/sums only; null-coverage honesty as in Stage 3.
+  - Cross-cutting: KV write budget unchanged (one read + one write per poll cycle — A and E fold into the existing write); the combined store key worst case is ~1.0 MB (planets ~0.9 MB + signatures ~60 KB + global ~15 KB), far under the 5 MB KV value limit (size-tested); the store key TTL was raised 24h → 30 days so accumulated observations survive gaps in usage (planet-sample eviction is age-based in code and unchanged). Tool count is now ten — remember the connector tool-list refresh after deploy (see watch list).
 
 -----
 
@@ -88,8 +95,8 @@ Tiers are ordered by cost/risk, not necessarily by priority. Within the prime di
 
 ## Known open items / watch list
 
-- **`campaign_type` enum is unverified.** Live data shows every active campaign is `type: 0`; HPC detection currently rides entirely on the Major-Order link. The `HPC_CAMPAIGN_TYPES = {1,2,3}` seed has had zero live coverage. **Action:** log distinct `(type, hasEvent)` pairs over time and confirm what non-zero types actually mean before trusting the type half of HPC detection.
-- **`event.eventType` enum is unverified — `EVENT_MODIFIER_NAMES` ships EMPTY.** At Stage 4 implementation time the war had zero active events and upstream documents no enum (its spec says only "the type of event"), so no (value → name) pair could be confirmed. Unlike `HPC_CAMPAIGN_TYPES` (where over-inclusion is fail-safe), a wrong entry here fabricates a subfaction name, so nothing was seeded. **Action:** when a special-faction event (Jet Brigade, Predator Strain, Incineration Corps, The Great Host, …) goes live, capture its `eventType`, seed the map, and update the pinned stage4 test. Caution: eventType 1 has historically been the plain defense event — do not map it to a subfaction.
+- **`campaign_type` enum is unverified.** Live data shows every active campaign is `type: 0`; HPC detection currently rides entirely on the Major-Order link. The `HPC_CAMPAIGN_TYPES = {1,2,3}` seed has had zero live coverage. **Instrumented (Stage 5):** the passive signature layer now logs every distinct `(campaign_type, event_type, has_event, faction)` tuple with timestamps — check `get_observed_signatures` for non-zero types before trusting the type half of HPC detection.
+- **`event.eventType` enum is unverified — `EVENT_MODIFIER_NAMES` ships EMPTY.** At Stage 4 implementation time the war had zero active events and upstream documents no enum (its spec says only "the type of event"), so no (value → name) pair could be confirmed. Unlike `HPC_CAMPAIGN_TYPES` (where over-inclusion is fail-safe), a wrong entry here fabricates a subfaction name, so nothing was seeded. **Instrumented (Stage 5):** `get_observed_signatures` captures any new `event_type` the moment it appears, with first/last seen timestamps. **Action:** when a special-faction event (Jet Brigade, Predator Strain, Incineration Corps, The Great Host, …) goes live, read its `eventType` from the signature record, confirm against the live event, seed the map, and update the pinned stage4 test. Caution: eventType 1 has historically been the plain defense event — do not map it to a subfaction.
 - **Invariant 1 (defense-null) unexercised live.** No defense campaigns have appeared since launch; the path is unit-tested only. Re-verify against real data when a defense goes active.
 - **Defense timing (Stage 1) unexercised live.** Same gap: `defense_hours_remaining` / `defense_expired` are unit-tested against the documented `event` shape only. Verify against real data when a defense goes active.
 - **Upstream `war.now` is game-epoch time** (observed `1972-04-26T…`), NOT comparable to the real-world ISO timestamps in `event.startTime`/`endTime` or MO `expiration`. All deadline math (MO `expires_in`, defense timing) therefore uses the Worker clock against those real-world timestamps.

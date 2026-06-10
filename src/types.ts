@@ -204,6 +204,13 @@ export interface EnrichedCampaign
   /** Stage 3: regen_per_second × 3600 — derived from the invariant-1
    * normalized regen, so it is always null for defense campaigns. */
   decay_per_hour: number | null;
+  /** Stage 5: pure join against the current Major Order task planet set —
+   * the same set invariant 5 already consumes. A membership fact, not a
+   * priority/importance score. */
+  is_major_order_target: boolean;
+  /** Stage 5: id of the first assignment whose task list names this planet
+   * (upstream array order), null when the planet is in no MO task. */
+  major_order_id: number | null;
 }
 
 /** Stage 3: per-front sum of the signed per-campaign hp_per_hour values —
@@ -280,6 +287,104 @@ export interface NormalizeContext {
   campaignAgeMs: number | null;
   hpcTypes: ReadonlySet<number>;
   moPlanetIndices: ReadonlySet<number>;
+}
+
+/* --------------------------- Stage 5 outputs --------------------------- */
+
+/** Stage 5: one waypoint neighbor of a planet, joined against the full
+ * planets list and the active campaign set. Upstream's own `waypoints`
+ * array, in upstream order — never symmetrized or rerouted. A dangling
+ * index (no matching planet) keeps name/owner null rather than being
+ * dropped. */
+export interface NeighborInfo {
+  index: number;
+  name: string | null;
+  owner: string | null;
+  has_active_campaign: boolean;
+  campaign_kind: "liberation" | "defense" | null;
+}
+
+/** Stage 5: deterministic counts over a planet's neighbors. `by_owner` keys
+ * are the verbatim upstream owner strings (no case-conversion) plus an
+ * always-present `unknown` bucket for dangling neighbors. */
+export interface NeighborSummary {
+  total: number;
+  by_owner: Record<string, number>;
+  with_active_campaign: number;
+}
+
+/** Stage 5: observed-only aggregates over a planet's retained sample series.
+ * Per-interval rates use the hp_per_hour sign convention from client.ts:
+ * (previous.health − current.health) / hoursElapsed, positive = progressing.
+ * All null when fewer than two usable points exist — never fabricated. */
+export interface HistoryRateAggregates {
+  rate_min: number | null;
+  rate_max: number | null;
+  /** Unweighted arithmetic mean of the per-interval rates — NOT total
+   * change ÷ total time. */
+  rate_mean: number | null;
+  latest_rate: number | null;
+  samples_span_hours: number | null;
+}
+
+/** Stage 5: one observed point in the global war-statistics series, plus raw
+ * deltas from the prior point. Values missing upstream are null, never 0;
+ * deltas are null on the first point or when either end is null. */
+export interface GlobalHistoryPoint {
+  t: number;
+  observed_at: string;
+  player_count: number | null;
+  missions_won: number | null;
+  missions_lost: number | null;
+  deaths: number | null;
+  terminid_kills: number | null;
+  automaton_kills: number | null;
+  illuminate_kills: number | null;
+  delta_hours: number | null;
+  delta_player_count: number | null;
+  delta_missions_won: number | null;
+  delta_missions_lost: number | null;
+  delta_deaths: number | null;
+  delta_terminid_kills: number | null;
+  delta_automaton_kills: number | null;
+  delta_illuminate_kills: number | null;
+}
+
+/** Stage 5: one accumulated campaign-signature tuple as returned by
+ * get_observed_signatures — the stored record plus ISO renderings. */
+export interface ObservedSignatureInfo {
+  campaign_type: number | null;
+  event_type: number | null;
+  has_event: boolean;
+  faction: string | null;
+  first_seen: number;
+  last_seen: number;
+  sample_count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+/** Stage 5: per-faction deterministic rollup on get_war_status. Counts and
+ * sums over data already fetched — never a verdict. `net_hp_per_hour` is the
+ * SAME Stage-3 front aggregate echoed verbatim (never recomputed); a faction
+ * with no active front reports null. `total_players_on_front` sums known
+ * per-campaign player counts; null when none are known, with coverage
+ * counts stating the gap. */
+export interface FactionRollup {
+  planets_owned: number;
+  active_campaigns: number;
+  net_hp_per_hour: number | null;
+  total_players_on_front: number | null;
+  campaigns_with_players: number;
+  campaigns_total: number;
+}
+
+/** Stage 5: per-sector deterministic rollup on get_war_status. `owners` keys
+ * are verbatim upstream owner strings. */
+export interface SectorRollup {
+  planet_count: number;
+  owners: Record<string, number>;
+  active_campaigns: number;
 }
 
 /** Worker environment bindings. */

@@ -8,7 +8,9 @@ import {
   ToolError,
   getCampaigns,
   getDispatches,
+  getGlobalHistory,
   getMajorOrder,
+  getObservedSignatures,
   getPatchNotes,
   getPlanet,
   getPlanetHistory,
@@ -29,13 +31,13 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_war_status",
     description:
-      "Overall Galactic War state: active fronts grouped by enemy faction, total planets in play, war timing, and global statistics.",
+      "Overall Galactic War state: active fronts grouped by enemy faction, total planets in play, war timing, global statistics, plus deterministic faction and sector rollups (planets owned, active campaigns, the same per-front net hp_per_hour aggregate, known player-count sums, per-sector owner tallies) — counts and sums over fetched data, never a verdict.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "get_campaigns",
     description:
-      "All active campaigns with strategy-ready, invariant-normalized data: raw_hp (primary field), max_hp, signed hp_per_hour, cosmetic liberation_pct_display_only, faction, planet, campaign type/kind, and trajectory flags (direction, stabilizing, hpc). Each campaign also carries per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, hazards, and — on defense campaigns — defense_started_at / defense_ends_at / defense_hours_remaining.",
+      "All active campaigns with strategy-ready, invariant-normalized data: raw_hp (primary field), max_hp, signed hp_per_hour, cosmetic liberation_pct_display_only, faction, planet, campaign type/kind, and trajectory flags (direction, stabilizing, hpc). Each campaign also carries per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, hazards, Major Order membership (is_major_order_target / major_order_id — a pure join, not a priority score), and — on defense campaigns — defense_started_at / defense_ends_at / defense_hours_remaining.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -47,7 +49,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_planet",
     description:
-      "Deep dive on one planet by index or name: raw HP, regen/decay (defense decay is always null — it is cosmetic), signed hp_per_hour, hours_to_resolution projection derived from raw HP (never from liberation %), direction flag, per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, environmental hazards, and defense timing (defense_ends_at / defense_hours_remaining) when a defense event is active.",
+      "Deep dive on one planet by index or name: raw HP, regen/decay (defense decay is always null — it is cosmetic), signed hp_per_hour, hours_to_resolution projection derived from raw HP (never from liberation %), direction flag, per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, environmental hazards, defense timing (defense_ends_at / defense_hours_remaining) when a defense event is active, and waypoint neighbor context: neighbors (joined name/owner/campaign per upstream waypoint), neighbor_summary counts, and the frontline adjacency fact (borders territory of a different owner).",
     inputSchema: {
       type: "object",
       properties: {
@@ -93,7 +95,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_planet_history",
     description:
-      "Observed health time-series for one planet (by index or name), sampled by this server: retained data points with per-point delta_health / delta_hours between consecutive samples. Observed values and deterministic deltas only — no forecasts or trend labels. Sparse or empty series (insufficient_history: true) is expected on cold start or for planets without an active campaign.",
+      "Observed health time-series for one planet (by index or name), sampled by this server: retained data points with per-point delta_health / delta_hours between consecutive samples, plus observed-only aggregates (rate_min / rate_max / rate_mean / latest_rate over per-interval rates, samples_span_hours). Observed values and deterministic deltas only — no forecasts or trend labels. Sparse or empty series (insufficient_history: true) is expected on cold start or for planets without an active campaign.",
     inputSchema: {
       type: "object",
       properties: {
@@ -126,6 +128,18 @@ const TOOL_DEFINITIONS = [
       },
       additionalProperties: false,
     },
+  },
+  {
+    name: "get_observed_signatures",
+    description:
+      "Accumulated record of every distinct campaign signature tuple {campaign_type, event_type, has_event, faction} this server has observed while polling, newest last_seen first, with first/last seen timestamps and a 60s-deduplicated sample_count. Passive raw observation only — it captures rare states (special-faction event types, defense campaign types) with timestamps; no interpretation. Empty on cold start.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_global_history",
+    description:
+      "Global war statistics time-series sampled by this server (player count, missions won/lost, deaths, per-faction kills): retained points with raw observed deltas between consecutive samples. Observed values and deterministic differences only — never a forecast or trend verdict. Samples accrue on get_war_status polls; empty series (insufficient_history: true) is expected on cold start.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ] as const;
 
@@ -200,6 +214,10 @@ async function dispatchTool(
           title: typeof args.title === "string" ? args.title : undefined,
         }),
       );
+    case "get_observed_signatures":
+      return toolText(await getObservedSignatures(env));
+    case "get_global_history":
+      return toolText(await getGlobalHistory(env));
     default:
       return null;
   }
