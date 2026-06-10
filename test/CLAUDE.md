@@ -1,8 +1,9 @@
 # test/ — unit tests
 
 Plain vitest, no Workers runtime: everything under test is pure
-(`src/invariants.ts`). If a test needs I/O or KV, the code under test is in
-the wrong module — move the logic, don't mock the world.
+(`src/invariants.ts`, `src/enrichment.ts`). If a test needs I/O or KV, the
+code under test is in the wrong module — move the logic, don't mock the
+world.
 
 ## Coverage that must never regress
 
@@ -24,6 +25,11 @@ the project's definition of done:
   proves the sign doesn't flip across campaign kinds.
 - Data-quality gate: missing/NaN `raw_hp` → `data_quality: "degraded"`,
   excluded from projections, never substituted with 0.
+- Stage 1 (`stage1.test.ts`): `mission_success_rate` zero-missions → `null`
+  (never 0, no divide-by-zero); defense timing from the SUPPLIED clock with
+  past-end → `0` + `defense_expired: true` and missing `endTime` → `null`;
+  missing statistics → `null`, never fabricated; missing biome → `null`;
+  missing hazards → `[]`, never null.
 
 ## Conventions
 
