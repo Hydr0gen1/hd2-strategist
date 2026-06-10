@@ -12,8 +12,10 @@ import {
   getPatchNotes,
   getPlanet,
   getPlanetHistory,
+  getPlanetWiki,
   getWarStatus,
 } from "./tools";
+import { WikiError } from "./wikiClient";
 import type { Env } from "./types";
 
 const PROTOCOL_VERSION = "2025-06-18";
@@ -104,6 +106,27 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "get_planet_wiki",
+    description:
+      "Community wiki LORE entry (helldivers.wiki.gg) for a planet or topic — what something means, not what is happening. Returns the plain-text lead extract, canonical page URL, and mandatory attribution (CC BY-NC-SA 4.0). A separate, non-authoritative source: community-authored background only; the live tools (get_planet, get_campaigns, get_war_status) remain authoritative for current war state. Also serves enemy/subfaction lookups like \"Jet Brigade\", \"Predator Strain\", or \"Hive Lord\" via the title argument.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Planet name as the live tools return it (case-insensitive; resolved to the wiki's title casing).",
+        },
+        title: {
+          type: "string",
+          description:
+            'Explicit wiki page title, tried verbatim (e.g. "Jet Brigade", "Hive Lord"). Takes precedence over name.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 interface JsonRpcRequest {
@@ -170,6 +193,13 @@ async function dispatchTool(
           name: typeof args.name === "string" ? args.name : undefined,
         }),
       );
+    case "get_planet_wiki":
+      return toolText(
+        await getPlanetWiki(env, {
+          name: typeof args.name === "string" ? args.name : undefined,
+          title: typeof args.title === "string" ? args.title : undefined,
+        }),
+      );
     default:
       return null;
   }
@@ -229,7 +259,11 @@ export async function handleMcpRequest(
         }
         return rpcResult(id, result);
       } catch (err) {
-        if (err instanceof ToolError || err instanceof UpstreamError) {
+        if (
+          err instanceof ToolError ||
+          err instanceof UpstreamError ||
+          err instanceof WikiError
+        ) {
           return rpcResult(id, toolText({ error: err.message }, true));
         }
         return rpcResult(

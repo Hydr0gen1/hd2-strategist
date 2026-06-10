@@ -9,6 +9,7 @@ import type {
   BiomeInfo,
   DefenseTiming,
   DispatchInfo,
+  EventModifier,
   FrontRateAggregate,
   HazardInfo,
   PatchNoteInfo,
@@ -259,6 +260,47 @@ export function aggregateFrontRate(
     net_hp_per_hour: withRate > 0 ? sum : null,
     planets_with_rate: withRate,
     planets_total: rates.length,
+  };
+}
+
+/**
+ * Stage 4: confirmed `event.eventType` → special-faction/modifier name map.
+ *
+ * Tunable like HPC_CAMPAIGN_TYPES, but with the OPPOSITE fail-safe: there,
+ * over-inclusion was safe; here a wrong entry FABRICATES a name, so nothing
+ * is seeded until a live event confirms its enum value. Upstream documents
+ * no enum (the community OpenAPI spec describes eventType only as "the type
+ * of event"), and the war state at implementation time had zero active
+ * events, so no value could be verified live.
+ *
+ * Candidates awaiting a live (eventType → name) confirmation: "Jet Brigade",
+ * "Predator Strain", "Incineration Corps", "The Great Host". Caution when
+ * confirming: eventType 1 has historically been the PLAIN defense event —
+ * do not map it to a subfaction name.
+ */
+export const EVENT_MODIFIER_NAMES: ReadonlyMap<number, string> = new Map<
+  number,
+  string
+>([]);
+
+/**
+ * Stage 4: live special-faction event decode — presence + name, nothing
+ * else. `event_type` is the raw upstream enum passed through untouched
+ * (never dropped); `modifier` is its decoded name ONLY when the value is in
+ * the supplied map. No event → both null (not an error). Unmapped value →
+ * event_type set, modifier null — visible as "something is here, name
+ * unknown", never hidden, never guessed. Strictly factual: no difficulty,
+ * no advice — that belongs to the wiki/conversation layer, and this decode
+ * reads ONLY the live API's own event data, never the wiki.
+ */
+export function decodeEventModifier(
+  event: RawEvent | null | undefined,
+  names: ReadonlyMap<number, string> = EVENT_MODIFIER_NAMES,
+): EventModifier {
+  const eventType = event ? finiteOrNull(event.eventType) : null;
+  return {
+    event_type: eventType,
+    modifier: eventType != null ? (names.get(eventType) ?? null) : null,
   };
 }
 

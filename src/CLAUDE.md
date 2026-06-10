@@ -5,10 +5,12 @@ Module boundaries are strict; respect them when editing:
 | File | Role | Boundary rule |
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
-| `enrichment.ts` | Stage 1+2 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `enrichment.ts` | Stage 1+2+4 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `wiki.ts` | Stage 4 LORE source, pure half: wiki query plan (title candidates, one multi-title request), response shaping, extract cap, mandatory attribution | **Pure. Zero I/O. SEPARATE source** — never imports from or feeds into the live war-state pipeline; no live war number in any output. |
+| `wikiClient.ts` | Stage 4 LORE source, I/O half: helldivers.wiki.gg fetch (descriptive User-Agent) + long-TTL KV cache in the `wiki:` namespace with stale fallback | Deliberately separate from `client.ts`. Injectable fetch for tests. Never touches `raw:`/`samples:` keys. |
 | `sampling.ts` | Pure planet-sample series logic: the bounded ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
 | `client.ts` | Upstream fetch + KV cache + rate sampling | Owns the `hp_per_hour` sign convention (comment block) and all KV access. |
-| `tools.ts` | The seven tool implementations | Orchestration only: fetch → assemble context → call pure normalization. |
+| `tools.ts` | The eight tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
 | `index.ts` | Entry/routing | POST `/` or `/mcp` only. |
@@ -46,6 +48,20 @@ takes its **sign** — `direction` is the SOLE carrier of liberating-vs-losing.
 Never derive direction from a second, independently computed quantity, and
 never let the convention drift between liberation and defense campaigns
 (defense samples `event.health`, same formula).
+
+## Stage 4 source-separation rule (live vs lore)
+
+Live tools answer WHAT IS HAPPENING (verifiable against the upstream war
+API); `get_planet_wiki` answers WHAT IT MEANS (community lore from
+helldivers.wiki.gg, CC BY-NC-SA 4.0, attribution mandatory on every payload
+including not-found). The pipelines never touch: live tools must not call
+the wiki or embed wiki prose; the wiki payload must not carry HP, rates, or
+ownership. The event/modifier decode (`decodeEventModifier`) is LIVE-side
+only: raw `event.eventType` passed through + a name ONLY when confirmed in
+`EVENT_MODIFIER_NAMES` (ships EMPTY — upstream documents no enum and no
+live event existed to verify against; a wrong entry would fabricate a name,
+so unlike HPC_CAMPAIGN_TYPES the fail-safe here is to seed NOTHING).
+Unknown value → `event_type` set, `modifier: null` — visible, never named.
 
 ## Caching rule
 

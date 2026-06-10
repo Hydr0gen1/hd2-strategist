@@ -1,9 +1,11 @@
 # test/ — unit tests
 
 Plain vitest, no Workers runtime: everything under test is pure
-(`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`). If a test
-needs I/O or KV, the code under test is in the wrong module — move the
-logic, don't mock the world.
+(`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`, `src/wiki.ts`).
+If a test needs I/O or KV, the code under test is in the wrong module — move
+the logic, don't mock the world. The one sanctioned exception is
+`src/wikiClient.ts` (stage4.test.ts): its fetch is INJECTED per call and KV
+is a ~10-line in-memory stub — no network, no global mocking.
 
 ## Coverage that must never regress
 
@@ -49,6 +51,25 @@ the project's definition of done:
   - `shapeDispatches`/`shapePatchNotes`: newest-first (unparseable dates
     sink), limit clamping at every edge, empty upstream → `[]`,
     message/content passed through verbatim.
+- Stage 4 (`stage4.test.ts`):
+  - `decodeEventModifier`: no event → both null; mapped enum (injected map)
+    → name; unmapped enum → `event_type` raw + `modifier: null` (never
+    fabricated); the MAP is consulted, not an inline table; NaN eventType →
+    both null; additive over `normalizeCampaign` (invariant 1 untouched).
+  - `EVENT_MODIFIER_NAMES` ships EMPTY — pinned by test. When a live event
+    confirms an enum value, seed the map AND update that test together.
+  - Wiki pure (`wiki.ts`): candidate planning (as-sent + title-cased, deduped,
+    one multi-title URL, `wiki:` cache key); success carries title/extract/
+    canonical URL; redirect followed and reported via `redirected_from`;
+    missing page and empty extract → `found: false` + hint, no throw;
+    malformed body → `found: false`, no throw; long extract capped at
+    `WIKI_EXTRACT_MAX_CHARS` with `truncated: true`.
+  - **Attribution always present** (source/license/license_url/retrieved_at/
+    notes/url) on every wiki outcome, found or not.
+  - Wiki I/O (`wikiClient.ts`, injected fetch + in-memory KV): fresh cache hit
+    never fetches; success caches under `wiki:` with the long TTL; failure →
+    stale fallback when a copy exists, typed `WikiError` when not; descriptive
+    User-Agent built from SUPER_CLIENT/SUPER_CONTACT with safe fallbacks.
 
 ## Conventions
 
