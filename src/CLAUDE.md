@@ -5,12 +5,12 @@ Module boundaries are strict; respect them when editing:
 | File | Role | Boundary rule |
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
-| `enrichment.ts` | Stage 1+2+4+5 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `enrichment.ts` | Stage 1+2+4+5+6 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups), Stage 6 consumption helpers (MO shaping, freshness metadata, planet-name resolution, campaign filters, brief target/event assembly) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
 | `wiki.ts` | Stage 4 LORE source, pure half: wiki query plan (title candidates, one multi-title request), response shaping, extract cap, mandatory attribution | **Pure. Zero I/O. SEPARATE source** — never imports from or feeds into the live war-state pipeline; no live war number in any output. |
 | `wikiClient.ts` | Stage 4 LORE source, I/O half: helldivers.wiki.gg fetch (descriptive User-Agent) + long-TTL KV cache in the `wiki:` namespace with stale fallback | Deliberately separate from `client.ts`. Injectable fetch for tests. Never touches `raw:`/`samples:` keys. |
 | `sampling.ts` | Pure sample-store logic: the bounded planet ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants, and the Stage 5 accumulation layers (`foldSignatures`, `advanceGlobalSeries`) | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
 | `client.ts` | Upstream fetch + KV cache + rate sampling | Owns the `hp_per_hour` sign convention (comment block) and all KV access. |
-| `tools.ts` | The ten tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. |
+| `tools.ts` | The twelve tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. Stage 6: `get_war_brief` is pure assembly of facts the other tools return (never a recommendation/ranking); `resolve_planet` and the shared name resolution never silently substitute a planet — near-misses surface ranked candidates. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
 | `index.ts` | Entry/routing | POST `/` or `/mcp` only. |
@@ -94,3 +94,23 @@ carries a 30-day KV TTL refreshed on every write (planet samples still age
 out in code at 48h): long enough for accumulated signatures to survive gaps
 in usage, while a truly abandoned store still evaporates.
 `get_observed_signatures` and `get_global_history` are read-only.
+
+## Stage 6 consumption rules
+
+- **Freshness metadata** (`as_of` / `fetched_at` / `cache_age_seconds`) rides
+  every upstream-derived response, computed from the cache record's stored
+  `fetchedAt` (oldest contributing endpoint when several are joined). The two
+  timestamps coincide by construction — upstream serves live state at fetch
+  time and its own war `now` is game-epoch (unusable) — but stay separate
+  fields with documented, different meanings. Pure metadata, never a verdict.
+- **`get_war_brief` is assembly, not conclusion**: it reuses the SAME
+  normalized campaigns, MO shaping, Stage-3 rate aggregate, and Stage-5
+  faction rollup the individual tools return. Its fetch set (planets,
+  campaigns, assignments, war — shared 45s cache) and its single sample-store
+  write are exactly a `get_war_status` poll's; never more.
+- **Campaign filters** run AFTER normalization and only narrow the returned
+  array — invariants always run over the full list; `filtered_count` vs
+  `total_count` keeps coverage legible. No args = unfiltered (compat).
+- **Name resolution** (`resolvePlanetName`): exact / normalized-exact matches
+  resolve; fuzzy near-misses and ties return ranked candidates and NEVER
+  auto-substitute. Output names keep verbatim upstream casing.

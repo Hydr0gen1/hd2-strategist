@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through ten MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through twelve MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -26,8 +26,9 @@ The projection uses the magnitude (`abs`); the `direction` flag is the sole carr
 
 | Tool | Purpose |
 |------|---------|
+| `get_war_brief` | Single-call digest: current Major Order joined with the live trajectory of exactly its target planets, per-faction front rollups, active events, and totals — a pre-joined assembly of the same facts the tools below return; no recommendation, ranking, or verdict |
 | `get_war_status` | War state, active fronts by faction, global stats, faction/sector rollups (counts and sums over fetched data) |
-| `get_campaigns` | All active campaigns, invariant-normalized, with Major Order membership (`is_major_order_target` / `major_order_id`) |
+| `get_campaigns` | All active campaigns, invariant-normalized, with Major Order membership (`is_major_order_target` / `major_order_id`). Optional AND-combined filters: `faction`, `major_order_only`, `has_rate`, `hpc_only` (`filtered_count` vs `total_count` states coverage; no args → all) |
 | `get_major_order` | Current MO: objectives, progress, rewards, time remaining |
 | `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection and waypoint neighbor context (`neighbors` / `neighbor_summary` / `frontline` adjacency fact) |
 | `get_dispatches` | In-fiction war news feed, newest first (`limit` optional, default 10 / cap 25) |
@@ -36,6 +37,11 @@ The projection uses the magnitude (`abs`); the `direction` flag is the sole carr
 | `get_planet_wiki` | **Lore source (separate from live war state):** community wiki entry from helldivers.wiki.gg for a planet (`name`) or any topic (`title`, e.g. "Jet Brigade") — plain-text lead extract, canonical URL, mandatory attribution (CC BY-NC-SA 4.0). Never authoritative for current war state |
 | `get_observed_signatures` | Accumulated record of every distinct campaign signature tuple `{campaign_type, event_type, has_event, faction}` this server has observed, newest `last_seen` first — passive raw observation that captures rare states (special-faction events, defense campaign types) with timestamps |
 | `get_global_history` | Global war statistics time-series sampled by this server (player count, missions, deaths, kills): retained points + raw observed deltas — observed values, never a forecast. Accrues on `get_war_status` polls |
+| `resolve_planet` | Resolve a loose planet name (`query`) to the canonical planet: exact → punctuation/space-normalized → fuzzy. Near-misses and ties return ranked candidates (`score` = edit distance) with `matched: false` — never a silent substitution |
+
+### Freshness metadata (Stage 6)
+
+Every response derived from an upstream fetch carries `as_of`, `fetched_at`, and `cache_age_seconds`, computed from the cache record's stored retrieval timestamp (the oldest contributing endpoint when several are joined). `as_of` is the moment the snapshot is *from*; `fetched_at` is when this server *retrieved* it — the two coincide by construction here because the upstream serves live state at request time and its own war `now` field is game-epoch time (not a usable real-world timestamp). `stale: true` still marks an expired-cache fallback after an upstream failure. Pure metadata — it lets the consumer say "as of N seconds ago" honestly.
 
 ### Two sources, never mixed
 
@@ -119,7 +125,7 @@ src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
 src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode)
 src/wiki.ts        Pure wiki lore logic (query plan, response shaping, attribution) — separate source
 src/wikiClient.ts  Wiki fetch + long-TTL KV cache (`wiki:` namespace) — separate from client.ts
-src/tools.ts       The ten tool implementations
+src/tools.ts       The twelve tool implementations
 src/types.ts       Raw upstream + normalized types
 ```
 

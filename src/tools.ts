@@ -1,5 +1,5 @@
 /**
- * The ten MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The twelve MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
@@ -17,23 +17,29 @@ import {
 } from "./client";
 import {
   aggregateFrontRate,
+  buildActiveEvents,
   buildFactionRollup,
   buildGlobalHistoryPoints,
   buildHistoryPoints,
+  buildMajorOrderTargets,
   buildNeighbors,
   buildSectorRollup,
   decayPerHour,
   decodeEventModifier,
   defenseTiming,
+  filterCampaigns,
+  freshnessFrom,
+  FRESHNESS_NOTE,
   historyRateAggregates,
   moPlanetAssignmentMap,
+  resolvePlanetName,
   selectBiome,
   selectHazards,
   selectPlanetStatistics,
   shapeDispatches,
+  shapeMajorOrders,
   shapeObservedSignatures,
   shapePatchNotes,
-  TASK_VALUE_TYPE_PLANET,
 } from "./enrichment";
 import { planWikiQuery, shapeWikiResult } from "./wiki";
 import { fetchWikiQuery } from "./wikiClient";
@@ -50,6 +56,7 @@ import {
   type SignatureObservation,
 } from "./sampling";
 import type {
+  CampaignFilters,
   EnrichedCampaign,
   Env,
   FrontRateAggregate,
@@ -106,6 +113,12 @@ function defenseAgeMs(planet: RawPlanet, nowMs: number): number | null {
 interface CampaignBundle {
   campaigns: EnrichedCampaign[];
   stale: boolean;
+  /** Raw assignments from the same fetch the MO planet map used — exposed so
+   * the war brief can reuse the MO shaping without a second fetch. */
+  assignments: RawAssignment[];
+  /** Stage 6: retrieval timestamps of every contributing upstream fetch,
+   * for the freshness metadata (oldest governs). */
+  fetchedAts: number[];
   /** Present iff requested via { withWar: true } — the war fetch joins the
    * existing parallel fetch so its global statistics reach the single
    * sample-store write without a second round-trip. */
@@ -185,6 +198,12 @@ async function loadNormalizedCampaigns(
   return {
     campaigns,
     stale: campaignsRes.stale || assignmentsRes.stale,
+    assignments: assignmentsRes.data ?? [],
+    fetchedAts: [
+      campaignsRes.fetchedAt,
+      assignmentsRes.fetchedAt,
+      ...(warRes ? [warRes.fetchedAt] : []),
+    ],
     ...(warRes ? { war: { data: warRes.data, stale: warRes.stale } } : {}),
   };
 }
@@ -262,18 +281,38 @@ export async function getWarStatus(env: Env): Promise<unknown> {
         "Deterministic counts/sums per faction over data already fetched: planets owned (by currentOwner over the full planets list), active campaigns on that faction's front, the SAME Stage-3 net_hp_per_hour front aggregate echoed verbatim (null when the faction has no active front — e.g. Humans), and the sum of known per-campaign player counts (null when none known; campaigns_with_players vs campaigns_total states the coverage). Facts only — no ranking, no verdict.",
       sector_rollup:
         "Per-sector planet count, owner tallies (verbatim upstream owner strings), and number of active campaigns in the sector. Counts only.",
+      freshness: FRESHNESS_NOTE,
     },
+    ...freshnessFrom(
+      [planetsRes.fetchedAt, ...bundle.fetchedAts],
+      Date.now(),
+    ),
     ...(planetsRes.stale || bundle.war!.stale || bundle.stale
       ? { stale: true }
       : {}),
   };
 }
 
-export async function getCampaigns(env: Env): Promise<unknown> {
+export async function getCampaigns(
+  env: Env,
+  filters: CampaignFilters = {},
+): Promise<unknown> {
   const bundle = await loadNormalizedCampaigns(env);
+  // Stage 6, Part B: filtering runs AFTER normalization — every invariant
+  // already ran over the full list; filters only narrow what is returned.
+  const filtered = filterCampaigns(bundle.campaigns, filters);
+  const isFiltered =
+    filtered.length !== bundle.campaigns.length ||
+    filters.faction != null ||
+    filters.major_order_only ||
+    filters.has_rate ||
+    filters.hpc_only;
   return {
-    count: bundle.campaigns.length,
-    campaigns: bundle.campaigns,
+    count: filtered.length,
+    total_count: bundle.campaigns.length,
+    filtered_count: filtered.length,
+    ...(isFiltered ? { filters_applied: { ...filters } } : {}),
+    campaigns: filtered,
     notes: {
       liberation_pct_display_only:
         "Cosmetic display value only. All quantitative logic must use raw_hp.",
@@ -289,66 +328,35 @@ export async function getCampaigns(env: Env): Promise<unknown> {
         "Decoded special-faction name for event_type, only when the enum value is confirmed in EVENT_MODIFIER_NAMES. event_type non-null with modifier null = an active event whose enum value is not yet confirmed — visible, never named by guess. Both null = no event. Identity only, no difficulty judgment; lore/meaning lives in get_planet_wiki.",
       is_major_order_target:
         "Pure membership join against the current Major Order task planet set (the same set HPC detection consumes). major_order_id is the id of the first assignment naming the planet (upstream array order) when it appears in several; null when the planet is in no MO task. A fact, not a priority score.",
+      filters:
+        "Optional args (faction, major_order_only, has_rate, hpc_only) AND-combine and only narrow the returned array — normalization always runs over the full campaign list first. filtered_count vs total_count states the coverage; no args returns every campaign.",
+      units:
+        "Unit conventions: *_per_hour fields are per hour; regen_per_second is per second (decay_per_hour is its ×3600 conversion); *_seconds fields are whole seconds; *_hours fields are fractional hours; humanized strings (expires_in, defense_time_remaining) are renderings of an adjacent raw-seconds field, never the only carrier.",
+      freshness: FRESHNESS_NOTE,
     },
+    ...freshnessFrom(bundle.fetchedAts, Date.now()),
     ...(bundle.stale ? { stale: true } : {}),
   };
-}
-
-function humanizeSeconds(totalSeconds: number): string {
-  const s = Math.max(0, Math.floor(totalSeconds));
-  const days = Math.floor(s / 86_400);
-  const hours = Math.floor((s % 86_400) / 3_600);
-  const minutes = Math.floor((s % 3_600) / 60);
-  const parts: string[] = [];
-  if (days) parts.push(`${days}d`);
-  if (hours) parts.push(`${hours}h`);
-  parts.push(`${minutes}m`);
-  return parts.join(" ");
 }
 
 export async function getMajorOrder(env: Env): Promise<unknown> {
   const res = await fetchUpstream<RawAssignment[]>(env, "/api/v1/assignments");
   const assignments = res.data ?? [];
+  const freshness = freshnessFrom([res.fetchedAt], Date.now());
   if (assignments.length === 0) {
     return {
       active: false,
       message: "No active Major Order at this time.",
+      ...freshness,
       ...(res.stale ? { stale: true } : {}),
     };
   }
 
-  const orders = assignments.map((a) => {
-    const expiresInSeconds = Math.max(
-      0,
-      Math.floor((Date.parse(a.expiration) - Date.now()) / 1000),
-    );
-    return {
-      id: a.id,
-      title: a.title,
-      briefing: a.briefing,
-      description: a.description,
-      objectives: (a.tasks ?? []).map((task, i) => ({
-        index: i,
-        task_type: task.type,
-        progress: a.progress?.[i] ?? null,
-        values: task.values,
-        value_types: task.valueTypes,
-        planet_indices: (task.valueTypes ?? []).flatMap((vt, j) =>
-          vt === TASK_VALUE_TYPE_PLANET && task.values?.[j] != null
-            ? [task.values[j]!]
-            : [],
-        ),
-      })),
-      rewards: a.rewards?.length ? a.rewards : a.reward ? [a.reward] : [],
-      expires_in_seconds: expiresInSeconds,
-      expires_in: humanizeSeconds(expiresInSeconds),
-      expiration: a.expiration,
-    };
-  });
-
   return {
     active: true,
-    major_orders: orders,
+    major_orders: shapeMajorOrders(assignments, Date.now()),
+    notes: { freshness: FRESHNESS_NOTE },
+    ...freshness,
     ...(res.stale ? { stale: true } : {}),
   };
 }
@@ -375,8 +383,22 @@ function resolvePlanet(
   if (args.index != null) {
     planet = planets.find((p) => p.index === args.index);
   } else {
-    const needle = args.name!.trim().toLowerCase();
-    planet = planets.find((p) => p.name.toLowerCase() === needle);
+    // Stage 6, Part C: shared resolution. An exact or normalized-exact match
+    // resolves (the same name modulo case/punctuation — never a different
+    // planet); a fuzzy near-miss surfaces ranked candidates in the error
+    // instead of a bare not-found. The server never silently substitutes.
+    const resolution = resolvePlanetName(args.name!, planets);
+    if (resolution.matched) {
+      planet = planets.find((p) => p.index === resolution.planet!.index);
+    } else if (resolution.candidates.length > 0) {
+      const list = resolution.candidates
+        .map((c) => `${c.name} (index ${c.index})`)
+        .join(", ");
+      throw new ToolError(
+        `Planet not found for name "${args.name}". Did you mean: ${list}? ` +
+          `No planet is ever substituted automatically — retry with one of these names or an index, or call resolve_planet to disambiguate.`,
+      );
+    }
   }
 
   if (!planet) {
@@ -508,7 +530,12 @@ export async function getPlanet(
         "Upstream's own waypoints array for this planet, in upstream order — joined by index against the full planets list and the active campaign set, never symmetrized or rerouted (direction semantics are upstream's). A dangling index still counts in neighbor_summary.total with name/owner null, tallied under by_owner.unknown.",
       frontline:
         "Deterministic adjacency fact: true iff at least one neighbor has a known owner different from this planet's current_owner — 'borders territory of a different owner', nothing more. Not a strategic judgment; neighbors with unknown owners never set it.",
+      freshness: FRESHNESS_NOTE,
     },
+    ...freshnessFrom(
+      [planetsRes.fetchedAt, ...bundle.fetchedAts],
+      Date.now(),
+    ),
     ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
   };
 }
@@ -550,6 +577,7 @@ export async function getDispatches(
     ...(dispatches.length === 0
       ? { note: "No dispatches currently available from upstream." }
       : {}),
+    ...freshnessFrom([res.fetchedAt], Date.now()),
     ...(res.stale ? { stale: true } : {}),
   };
 }
@@ -570,6 +598,7 @@ export async function getPatchNotes(
     ...(patchNotes.length === 0
       ? { note: "No Steam news currently available from upstream." }
       : {}),
+    ...freshnessFrom([res.fetchedAt], Date.now()),
     ...(res.stale ? { stale: true } : {}),
   };
 }
@@ -635,7 +664,12 @@ export async function getPlanetHistory(
         "Observed data points and deterministic deltas only — no smoothing, no forecast, no trend verdict. Sample timestamps use the Worker clock (upstream war time is game-epoch and not comparable).",
       rate_aggregates:
         "rate_min/rate_max/rate_mean/latest_rate are plain stats over the per-interval observed rates, using the hp_per_hour sign convention ((previous − current) / hours, positive = progressing). rate_mean is the unweighted mean of per-interval rates — NOT total change ÷ total time. Observed values only: no trend direction, no smoothing, no projection from history (projection lives in get_planet and is current-rate based).",
+      freshness: FRESHNESS_NOTE,
     },
+    ...freshnessFrom(
+      [planetsRes.fetchedAt, campaignsRes.fetchedAt],
+      Date.now(),
+    ),
     ...(planetsRes.stale || campaignsRes.stale ? { stale: true } : {}),
   };
 }
@@ -711,5 +745,110 @@ export async function getGlobalHistory(env: Env): Promise<unknown> {
       sampling:
         "A lean named subset of upstream war.statistics sampled over time on the Worker clock. A field missing upstream is null at that point, never 0; deltas are null when either end is null. Observed values and raw consecutive differences only — no smoothing, no forecast, no trend verdict.",
     },
+  };
+}
+
+/**
+ * Stage 6, Part A: the single-call war digest. Pure ASSEMBLY of the same
+ * normalized facts get_war_status / get_campaigns / get_major_order return —
+ * the MO ↔ live-trajectory join, per-faction rollups, active events, and
+ * totals — pre-joined so the common opening question is one call instead of
+ * three. NO recommendation, ranking, or verdict anywhere: the digest
+ * enriches and assembles; judgment lives in the conversation layer.
+ *
+ * Fetch budget: planets + campaigns + assignments + war — exactly the union
+ * the three tools already fetch (shared 45s raw cache), and the same single
+ * sample-store write a get_war_status poll performs. Never more.
+ */
+export async function getWarBrief(env: Env): Promise<unknown> {
+  const [planetsRes, bundle] = await Promise.all([
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+    loadNormalizedCampaigns(env, { withWar: true }),
+  ]);
+  const war = bundle.war!.data;
+  const planets = planetsRes.data ?? [];
+  const nowMs = Date.now();
+
+  const orders = shapeMajorOrders(bundle.assignments, nowMs);
+  const moMap = moPlanetAssignmentMap(bundle.assignments);
+
+  // Fronts: the same Stage 3 aggregate + Stage 5 faction rollup the war
+  // status returns — echoed via the same pure functions, never recomputed.
+  const byFaction = new Map<string, EnrichedCampaign[]>();
+  for (const c of bundle.campaigns) {
+    const list = byFaction.get(c.faction) ?? [];
+    list.push(c);
+    byFaction.set(c.faction, list);
+  }
+  const netRateByFaction = new Map<string, number | null>(
+    [...byFaction].map(([faction, list]) => [
+      faction,
+      aggregateFrontRate(list.map((c) => c.hp_per_hour)).net_hp_per_hour,
+    ]),
+  );
+
+  const planetsInPlay = new Set(bundle.campaigns.map((c) => c.planet_index));
+
+  return {
+    major_order: orders[0] ?? null,
+    major_order_count: orders.length,
+    ...(orders.length > 1 ? { additional_major_orders: orders.slice(1) } : {}),
+    major_order_targets: buildMajorOrderTargets(
+      moMap.keys(),
+      bundle.campaigns,
+      new Map(planets.map((p) => [p.index, p])),
+    ),
+    fronts: buildFactionRollup(planets, bundle.campaigns, netRateByFaction),
+    active_events: buildActiveEvents(bundle.campaigns),
+    totals: {
+      player_count: war.statistics?.playerCount ?? null,
+      active_campaigns: bundle.campaigns.length,
+      planets_in_play: planetsInPlay.size,
+    },
+    notes: {
+      digest:
+        "Pre-joined assembly of the SAME normalized facts get_war_status, get_campaigns, and get_major_order return — every field is verifiable against those tools. No recommendation, priority ranking, or war-is-going-well/badly verdict is present by design; that reasoning belongs to the consumer.",
+      major_order_targets:
+        "The live trajectory of exactly the planets the current Major Order(s) name, in upstream assignment order. A target with no active campaign is included with its static planet state and has_active_campaign: false — campaign-derived fields are null there, never fabricated.",
+      fronts:
+        "Per-faction deterministic rollup (same as get_war_status faction_rollup): planets owned, active campaigns, the Stage-3 net_hp_per_hour aggregate echoed verbatim with coverage counts, and known player sums.",
+      active_events:
+        "Campaigns with a live event (non-null event_type), presence + identity only. Empty array = no special events live right now.",
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshnessFrom([planetsRes.fetchedAt, ...bundle.fetchedAts], nowMs),
+    ...(planetsRes.stale || bundle.war!.stale || bundle.stale
+      ? { stale: true }
+      : {}),
+  };
+}
+
+/**
+ * Stage 6, Part C: resolve a loose planet query to the canonical upstream
+ * planet — exact, then punctuation/space-normalized, then fuzzy. Ambiguity
+ * or a near-miss returns ranked candidates with matched: false; the server
+ * never guesses. Read-only: one planets fetch (shared cache), no sampling,
+ * no KV write.
+ */
+export async function resolvePlanetTool(
+  env: Env,
+  args: { query?: string },
+): Promise<unknown> {
+  const query = args.query?.trim();
+  if (!query) {
+    throw new ToolError('Provide `query` (string), e.g. query: "Gacrux".');
+  }
+  const planetsRes = await fetchUpstream<RawPlanet[]>(env, "/api/v1/planets");
+  const resolution = resolvePlanetName(query, planetsRes.data ?? []);
+  return {
+    query,
+    ...resolution,
+    notes: {
+      resolution:
+        "matched: true only for an exact or punctuation/space-normalized exact match (the same name — never a substitution). Fuzzy near-misses and ties return ranked candidates (score = edit distance on normalized names, lower is closer) with matched: false — the consumer chooses. Names are verbatim upstream casing.",
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshnessFrom([planetsRes.fetchedAt], Date.now()),
+    ...(planetsRes.stale ? { stale: true } : {}),
   };
 }

@@ -11,10 +11,14 @@ import type {
 } from "./sampling";
 import type {
   BiomeInfo,
+  CampaignFilters,
   DefenseTiming,
+  Direction,
   DispatchInfo,
+  EnrichedCampaign,
   EventModifier,
   FactionRollup,
+  FreshnessMeta,
   FrontRateAggregate,
   GlobalHistoryPoint,
   HazardInfo,
@@ -23,7 +27,9 @@ import type {
   NeighborSummary,
   ObservedSignatureInfo,
   PatchNoteInfo,
+  PlanetCandidate,
   PlanetHistoryPoint,
+  PlanetResolution,
   PlanetStatistics,
   RawAssignment,
   RawBiome,
@@ -34,6 +40,8 @@ import type {
   RawStatistics,
   RawSteamNews,
   SectorRollup,
+  WarBriefEvent,
+  WarBriefTarget,
 } from "./types";
 
 const MS_PER_HOUR = 3_600_000;
@@ -109,16 +117,38 @@ export function defenseTiming(event: RawEvent, nowMs: number): DefenseTiming {
       defense_started_at: startedAt,
       defense_ends_at: endsAt,
       defense_hours_remaining: null,
+      defense_seconds_remaining: null,
+      defense_time_remaining: null,
       defense_expired: null,
     };
   }
   const hoursRemaining = (endMs - nowMs) / MS_PER_HOUR;
+  // Stage 6, Part F: the SAME clamped remaining span in three unit
+  // renderings (hours / whole seconds / humanized) — additive aliases, the
+  // hours value is untouched.
+  const secondsRemaining = Math.max(0, Math.floor((endMs - nowMs) / 1000));
   return {
     defense_started_at: startedAt,
     defense_ends_at: endsAt,
     defense_hours_remaining: Math.max(0, hoursRemaining),
+    defense_seconds_remaining: secondsRemaining,
+    defense_time_remaining: humanizeSeconds(secondsRemaining),
     defense_expired: hoursRemaining <= 0,
   };
+}
+
+/** Humanized rendering of a second count ("1d 4h 12m") — a display alias
+ * always paired with the raw seconds field, never a replacement for it. */
+export function humanizeSeconds(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const days = Math.floor(s / 86_400);
+  const hours = Math.floor((s % 86_400) / 3_600);
+  const minutes = Math.floor((s % 3_600) / 60);
+  const parts: string[] = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  parts.push(`${minutes}m`);
+  return parts.join(" ");
 }
 
 /** Biome pass-through: name/description exactly as upstream sends them. */
@@ -616,6 +646,292 @@ export function buildSectorRollup(
     };
   }
   return rollup;
+}
+
+/* ----------------------------- Stage 6 -------------------------------- */
+
+/**
+ * Stage 6, Part A: shaped Major Order list — the exact field set
+ * get_major_order has always returned, extracted pure so the war brief can
+ * reuse it instead of reimplementing MO logic. Time remaining is stated in
+ * both raw seconds and humanized form (Part F convention).
+ */
+export function shapeMajorOrders(assignments: RawAssignment[], nowMs: number) {
+  return assignments.map((a) => {
+    const expiresInSeconds = Math.max(
+      0,
+      Math.floor((Date.parse(a.expiration) - nowMs) / 1000),
+    );
+    return {
+      id: a.id,
+      title: a.title,
+      briefing: a.briefing,
+      description: a.description,
+      objectives: (a.tasks ?? []).map((task, i) => ({
+        index: i,
+        task_type: task.type,
+        progress: a.progress?.[i] ?? null,
+        values: task.values,
+        value_types: task.valueTypes,
+        planet_indices: (task.valueTypes ?? []).flatMap((vt, j) =>
+          vt === TASK_VALUE_TYPE_PLANET && task.values?.[j] != null
+            ? [task.values[j]!]
+            : [],
+        ),
+      })),
+      rewards: a.rewards?.length ? a.rewards : a.reward ? [a.reward] : [],
+      expires_in_seconds: expiresInSeconds,
+      expires_in: humanizeSeconds(expiresInSeconds),
+      expiration: a.expiration,
+    };
+  });
+}
+
+/**
+ * Stage 6, Parts D+E: freshness metadata from the cache records' stored
+ * retrieval timestamps. When several upstream endpoints contribute to one
+ * response, the OLDEST timestamp governs (the most conservative honest
+ * claim about how current the assembled snapshot is). `as_of` and
+ * `fetched_at` coincide by construction in this architecture — the upstream
+ * serves live state at request time and its own war `now` is game-epoch
+ * (not a usable real-world timestamp; see ROADMAP) — but they remain
+ * separate fields because they answer different questions: when the
+ * snapshot is FROM vs when this server RETRIEVED it.
+ */
+export function freshnessFrom(
+  fetchedAts: ReadonlyArray<number>,
+  nowMs: number,
+): FreshnessMeta {
+  const valid = fetchedAts.filter((t) => Number.isFinite(t));
+  if (valid.length === 0) {
+    return { as_of: null, fetched_at: null, cache_age_seconds: null };
+  }
+  const oldest = Math.min(...valid);
+  const iso = new Date(oldest).toISOString();
+  return {
+    as_of: iso,
+    fetched_at: iso,
+    cache_age_seconds: Math.max(0, Math.round((nowMs - oldest) / 1000)),
+  };
+}
+
+/** Shared note text for the freshness metadata — stated once, spread into
+ * each tool's notes so the semantics travel with the fields. */
+export const FRESHNESS_NOTE =
+  "as_of = the moment the war state in this response reflects; fetched_at = when this server retrieved the underlying upstream payload (oldest contributing endpoint when several are joined); cache_age_seconds = now − fetched_at. The upstream serves live state at request time and its own war `now` field is game-epoch time (not a comparable real-world timestamp), so as_of and fetched_at coincide here by construction — they remain separate fields because they answer different questions. stale: true additionally marks an expired-cache fallback after an upstream failure.";
+
+/** Lowercased, punctuation/space-stripped form used for name matching only —
+ * never emitted; output names stay verbatim upstream casing. */
+function normalizeQueryName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Plain Levenshtein edit distance — O(len a × len b), tiny inputs. */
+export function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(
+        prev[j]! + 1,
+        cur[j - 1]! + 1,
+        prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+/** Fuzzy candidates are capped so a wild query can't return the galaxy. */
+export const RESOLVE_MAX_CANDIDATES = 5;
+/** Fuzzy threshold: normalized edit distance ≤ 2, or a prefix of length ≥ 3. */
+export const RESOLVE_MAX_DISTANCE = 2;
+
+/**
+ * Stage 6, Part C: resolve a loose planet query to the canonical upstream
+ * planet. Resolution order: exact case-insensitive match, then
+ * punctuation/space-normalized match (still the same name — never a
+ * substitution), then fuzzy (edit distance ≤ RESOLVE_MAX_DISTANCE on the
+ * normalized forms, or a ≥3-char normalized prefix). Fuzzy NEVER auto-
+ * matches: a near-miss returns ranked candidates (`score` = edit distance,
+ * lower is closer) with matched: false, and so does any tie — the consumer
+ * disambiguates; the server never guesses. Returned names are verbatim
+ * upstream casing.
+ */
+export function resolvePlanetName(
+  query: string,
+  planets: ReadonlyArray<{ index: number; name: string }>,
+): PlanetResolution {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return {
+      matched: false,
+      candidates: [],
+      hint: "Empty query — provide a planet name (e.g. \"Gacrux\").",
+    };
+  }
+
+  const lower = trimmed.toLowerCase();
+  const exact = planets.filter((p) => p.name.toLowerCase() === lower);
+  if (exact.length === 1) {
+    const p = exact[0]!;
+    return { matched: true, planet: { index: p.index, name: p.name }, candidates: [] };
+  }
+  if (exact.length > 1) {
+    return {
+      matched: false,
+      candidates: exact.map((p) => ({ index: p.index, name: p.name, score: 0 })),
+      hint: "Multiple planets match this name exactly — disambiguate by index.",
+    };
+  }
+
+  const qn = normalizeQueryName(trimmed);
+  if (qn.length > 0) {
+    const normalized = planets.filter((p) => normalizeQueryName(p.name) === qn);
+    if (normalized.length === 1) {
+      const p = normalized[0]!;
+      return { matched: true, planet: { index: p.index, name: p.name }, candidates: [] };
+    }
+    if (normalized.length > 1) {
+      return {
+        matched: false,
+        candidates: normalized.map((p) => ({
+          index: p.index,
+          name: p.name,
+          score: 0,
+        })),
+        hint: "Multiple planets match after normalization — disambiguate by index.",
+      };
+    }
+  }
+
+  const scored: PlanetCandidate[] = [];
+  for (const p of planets) {
+    const pn = normalizeQueryName(p.name);
+    const distance = levenshtein(qn, pn);
+    const isPrefix = qn.length >= 3 && pn.startsWith(qn);
+    if (distance <= RESOLVE_MAX_DISTANCE || isPrefix) {
+      scored.push({ index: p.index, name: p.name, score: distance });
+    }
+  }
+  scored.sort((a, b) => a.score - b.score || a.name.localeCompare(b.name));
+  const candidates = scored.slice(0, RESOLVE_MAX_CANDIDATES);
+  return {
+    matched: false,
+    candidates,
+    hint:
+      candidates.length > 0
+        ? "No exact match. Ranked near-matches listed (score = edit distance, lower is closer) — pick one explicitly; this server never substitutes a planet."
+        : "No planet name is close to this query. Check spelling, or list active planets via get_campaigns.",
+  };
+}
+
+/**
+ * Stage 6, Part B: AND-combined filters over the ALREADY-normalized campaign
+ * list — filtering only narrows the returned array; every invariant ran
+ * identically before this is called. An unset (or false) flag filters
+ * nothing, so the no-args call is byte-identical to the unfiltered list.
+ * Faction comparison is case-insensitive on the INPUT only; output strings
+ * stay verbatim upstream.
+ */
+export function filterCampaigns(
+  campaigns: ReadonlyArray<EnrichedCampaign>,
+  filters: CampaignFilters,
+): EnrichedCampaign[] {
+  const faction = filters.faction?.trim().toLowerCase();
+  return campaigns.filter(
+    (c) =>
+      (!faction || c.faction.toLowerCase() === faction) &&
+      (!filters.major_order_only || c.is_major_order_target) &&
+      (!filters.has_rate || c.hp_per_hour != null) &&
+      (!filters.hpc_only || c.hpc),
+  );
+}
+
+/**
+ * Stage 6, Part A: the MO ↔ live-trajectory join — for each Major Order
+ * target planet index, the live state of exactly that planet, echoed from
+ * the already-normalized campaign when one is active. A target with NO
+ * active campaign is still included (never dropped) with the planet's
+ * static state and has_active_campaign: false; the campaign-derived fields
+ * (hp_per_hour, stabilizing, hpc, decay) are null there — unknowns, never
+ * fabricated. Pure assembly of existing facts; no ordering by desirability
+ * (indices keep the MO map's upstream order).
+ */
+export function buildMajorOrderTargets(
+  planetIndices: Iterable<number>,
+  campaigns: ReadonlyArray<EnrichedCampaign>,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+): WarBriefTarget[] {
+  const campaignByPlanet = new Map(
+    campaigns.map((c) => [c.planet_index, c] as const),
+  );
+  const targets: WarBriefTarget[] = [];
+  for (const index of planetIndices) {
+    const c = campaignByPlanet.get(index);
+    if (c) {
+      targets.push({
+        index,
+        name: c.planet_name,
+        has_active_campaign: true,
+        campaign_kind: c.campaign_kind,
+        faction: c.faction,
+        raw_hp: c.raw_hp,
+        max_hp: c.max_hp,
+        hp_per_hour: c.hp_per_hour,
+        direction: c.direction,
+        stabilizing: c.stabilizing,
+        hpc: c.hpc,
+        decay_per_hour: c.decay_per_hour,
+        player_count: c.statistics?.player_count ?? null,
+      });
+      continue;
+    }
+    const planet = planetByIndex.get(index);
+    targets.push({
+      index,
+      name: typeof planet?.name === "string" ? planet.name : null,
+      has_active_campaign: false,
+      campaign_kind: null,
+      faction:
+        typeof planet?.currentOwner === "string" ? planet.currentOwner : null,
+      raw_hp: finiteOrNull(planet?.health),
+      max_hp: finiteOrNull(planet?.maxHealth),
+      hp_per_hour: null,
+      direction: "unknown" satisfies Direction,
+      stabilizing: null,
+      hpc: null,
+      decay_per_hour: null,
+      player_count: finiteOrNull(planet?.statistics?.playerCount),
+    });
+  }
+  return targets;
+}
+
+/**
+ * Stage 6, Part A: campaigns with a live event surfaced at a glance —
+ * presence + identity facts echoed verbatim from the normalized campaigns.
+ * Empty array when no events are live (the current norm), never an error.
+ */
+export function buildActiveEvents(
+  campaigns: ReadonlyArray<EnrichedCampaign>,
+): WarBriefEvent[] {
+  return campaigns
+    .filter((c) => c.event_type != null || c.modifier != null)
+    .map((c) => ({
+      planet_index: c.planet_index,
+      planet_name: c.planet_name,
+      faction: c.faction,
+      campaign_kind: c.campaign_kind,
+      event_type: c.event_type,
+      modifier: c.modifier,
+      defense_ends_at: c.defense_ends_at ?? null,
+      defense_hours_remaining: c.defense_hours_remaining ?? null,
+    }));
 }
 
 /** Hazard pass-through: always an array — [] when upstream sends none. */
