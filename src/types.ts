@@ -170,11 +170,17 @@ export interface HazardInfo {
   description: string | null;
 }
 
-/** Defense deadline facts — emitted only when a defense event is active. */
+/** Defense deadline facts — emitted only when a defense event is active.
+ * Stage 6, Part F: seconds + human-readable aliases sit alongside the
+ * original hours field (additive — same instant, three unit renderings). */
 export interface DefenseTiming {
   defense_started_at: string | null;
   defense_ends_at: string | null;
   defense_hours_remaining: number | null;
+  /** Same remaining span as defense_hours_remaining, in whole seconds. */
+  defense_seconds_remaining: number | null;
+  /** Same remaining span, humanized ("1d 4h 12m") — a rendering, not data. */
+  defense_time_remaining: string | null;
   defense_expired: boolean | null;
 }
 
@@ -385,6 +391,90 @@ export interface SectorRollup {
   planet_count: number;
   owners: Record<string, number>;
   active_campaigns: number;
+}
+
+/* --------------------------- Stage 6 outputs --------------------------- */
+
+/** Stage 6, Parts D+E: retrieval/freshness metadata on every response that
+ * derives from an upstream fetch. Pure metadata — describes WHEN the data is
+ * from, never what to think about it.
+ *
+ * `as_of` is the moment the war state in the response reflects; `fetched_at`
+ * is when this server retrieved the underlying upstream payload (the cache
+ * record's stored timestamp; the OLDEST contributing endpoint when several
+ * are joined). The upstream API serves live state at request time and its
+ * own war `now` field is game-epoch time (observed "1972-04-26T…", not a
+ * comparable real-world timestamp — see ROADMAP), so the two coincide by
+ * construction here; they stay separate fields because they answer different
+ * questions (when the snapshot is FROM vs when WE fetched it). */
+export interface FreshnessMeta {
+  as_of: string | null;
+  fetched_at: string | null;
+  cache_age_seconds: number | null;
+}
+
+/** Stage 6, Part C: one ranked candidate from planet-name resolution.
+ * `score` is the edit distance between the normalized query and the
+ * normalized planet name — lower is closer; 0 = exact after normalization. */
+export interface PlanetCandidate {
+  index: number;
+  name: string;
+  score: number;
+}
+
+/** Stage 6, Part C: result of resolving a loose planet query. `matched` is
+ * true only for an exact or punctuation/space-normalized exact match (the
+ * same planet, never a substitution); any fuzzy near-miss or tie returns
+ * ranked candidates with matched: false — the consumer disambiguates. */
+export interface PlanetResolution {
+  matched: boolean;
+  planet?: { index: number; name: string };
+  candidates: PlanetCandidate[];
+  hint?: string;
+}
+
+/** Stage 6, Part B: optional get_campaigns filters. AND-combined; an unset
+ * (or false) flag filters nothing, so no-args behavior is unchanged. */
+export interface CampaignFilters {
+  faction?: string;
+  major_order_only?: boolean;
+  has_rate?: boolean;
+  hpc_only?: boolean;
+}
+
+/** Stage 6, Part A: one Major Order target planet in the war brief — the
+ * MO ↔ live-campaign join. When the planet has no active campaign it is
+ * still included (has_active_campaign: false) with its static state; the
+ * campaign-derived fields are null there, never fabricated. */
+export interface WarBriefTarget {
+  index: number;
+  name: string | null;
+  has_active_campaign: boolean;
+  campaign_kind: "liberation" | "defense" | null;
+  /** Campaign faction when a campaign is active; otherwise the planet's
+   * verbatim currentOwner. */
+  faction: string | null;
+  raw_hp: number | null;
+  max_hp: number | null;
+  hp_per_hour: number | null;
+  direction: Direction;
+  stabilizing: boolean | null;
+  hpc: boolean | null;
+  decay_per_hour: number | null;
+  player_count: number | null;
+}
+
+/** Stage 6, Part A: one active special event surfaced in the war brief —
+ * presence + identity facts echoed from the normalized campaign. */
+export interface WarBriefEvent {
+  planet_index: number;
+  planet_name: string;
+  faction: string;
+  campaign_kind: "liberation" | "defense";
+  event_type: number | null;
+  modifier: string | null;
+  defense_ends_at: string | null;
+  defense_hours_remaining: number | null;
 }
 
 /** Worker environment bindings. */

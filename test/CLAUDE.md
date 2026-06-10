@@ -8,7 +8,12 @@ the logic, don't mock the world. Two sanctioned exceptions:
 `samplePlanetRates` in `src/client.ts` (stage5.test.ts), which does no
 network I/O — both use the same ~10-line in-memory KV stub; no network, no
 global mocking. The stub's `puts` log is what proves the one-write-per-cycle
-budget.
+budget. A third sanctioned exception (stage6.test.ts): the `get_war_brief` /
+`get_campaigns` / `resolve_planet` handlers run against the same KV stub
+with every `raw:` cache entry pre-seeded FRESH and `globalThis.fetch`
+replaced by a stub that throws — proving the handlers add zero upstream
+fetch volume beyond the shared cache (the stub is restored in `afterEach`;
+it forbids the network, it never simulates it).
 
 ## Coverage that must never regress
 
@@ -103,6 +108,30 @@ the project's definition of done:
     Stage 3 null-honesty pattern with coverage counts.
   - Combined worst-case store (full galaxy × max points + max signatures +
     max global samples) stays far under the 5MB KV value limit.
+
+- Stage 6 (`stage6.test.ts`):
+  - `resolvePlanetName`: exact and punctuation/space-normalized matches
+    resolve (canonical upstream casing); fuzzy near-misses and ties return
+    RANKED candidates with `matched: false` — never a silent substitution;
+    no match → empty candidates + hint; candidate list capped.
+  - `filterCampaigns`: each filter narrows correctly, filters AND-combine,
+    no-args (and explicit-false flags) return the full list with the SAME
+    object references — filtering never re-normalizes.
+  - `freshnessFrom`: as_of/fetched_at from the cache record's stored
+    timestamp (OLDEST contributing endpoint governs), age in whole seconds
+    clamped at 0, empty/garbled input → nulls.
+  - Part F aliases: `defense_seconds_remaining` / `defense_time_remaining`
+    agree with the untouched `defense_hours_remaining`; missing endTime →
+    all null; `shapeMajorOrders` keeps the exact legacy get_major_order
+    field set incl. the seconds + humanized pair.
+  - Brief assembly: MO targets joined to live campaigns; a target with no
+    active campaign is included with static state, never dropped; dangling
+    MO index keeps nulls; `buildActiveEvents` empty when no events.
+  - **Fetch/write budget**: with the raw cache pre-seeded fresh, getWarBrief
+    makes ZERO network fetches and exactly one `samples:planets` put;
+    resolve_planet makes zero KV writes.
+  - **Prime directive pin**: every key in the brief payload (recursively) is
+    checked against interpretive names (recommend/priority/rank/score/...).
 
 ## Conventions
 

@@ -46,6 +46,10 @@ export interface UpstreamResult<T> {
   data: T;
   /** True when served from an expired cache copy due to upstream failure. */
   stale: boolean;
+  /** Worker-clock ms epoch of when this payload was retrieved from upstream
+   * (the cache record's stored timestamp — NOT when this request ran).
+   * Stage 6 freshness metadata derives from it. */
+  fetchedAt: number;
 }
 
 async function readCache(
@@ -75,7 +79,7 @@ export async function fetchUpstream<T>(
   const cached = await readCache(env, key);
   const now = Date.now();
   if (cached && now - cached.fetchedAt < CACHE_TTL_SECONDS * 1000) {
-    return { data: cached.body as T, stale: false };
+    return { data: cached.body as T, stale: false, fetchedAt: cached.fetchedAt };
   }
 
   let response: Response;
@@ -90,14 +94,18 @@ export async function fetchUpstream<T>(
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (err) {
-    if (cached) return { data: cached.body as T, stale: true };
+    if (cached) {
+      return { data: cached.body as T, stale: true, fetchedAt: cached.fetchedAt };
+    }
     throw new UpstreamError(
       `Upstream request to ${path} failed (${err instanceof Error ? err.message : "network error"}) and no cached copy is available.`,
     );
   }
 
   if (!response.ok) {
-    if (cached) return { data: cached.body as T, stale: true };
+    if (cached) {
+      return { data: cached.body as T, stale: true, fetchedAt: cached.fetchedAt };
+    }
     const reason =
       response.status === 429
         ? "rate limited (429)"
@@ -120,7 +128,7 @@ export async function fetchUpstream<T>(
       // Cache write failures must never break a successful upstream read.
     }
   }
-  return { data: body, stale: false };
+  return { data: body, stale: false, fetchedAt: now };
 }
 
 /* ------------------------------------------------------------------------

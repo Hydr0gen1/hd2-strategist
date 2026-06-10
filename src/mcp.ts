@@ -15,7 +15,9 @@ import {
   getPlanet,
   getPlanetHistory,
   getPlanetWiki,
+  getWarBrief,
   getWarStatus,
+  resolvePlanetTool,
 } from "./tools";
 import { WikiError } from "./wikiClient";
 import type { Env } from "./types";
@@ -29,6 +31,12 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set([
 
 const TOOL_DEFINITIONS = [
   {
+    name: "get_war_brief",
+    description:
+      "Single-call war digest: the current Major Order joined with the live trajectory of exactly its target planets (raw_hp, signed hp_per_hour, direction, stabilizing, hpc, decay_per_hour, player_count), per-faction front rollups, any active special events, and global totals — a pre-joined assembly of the same normalized facts get_war_status / get_campaigns / get_major_order return, with freshness metadata. Pure assembly: no recommended target, no ranking, no verdict. Use this first for \"what's the state of the war?\".",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
     name: "get_war_status",
     description:
       "Overall Galactic War state: active fronts grouped by enemy faction, total planets in play, war timing, global statistics, plus deterministic faction and sector rollups (planets owned, active campaigns, the same per-front net hp_per_hour aggregate, known player-count sums, per-sector owner tallies) — counts and sums over fetched data, never a verdict.",
@@ -37,8 +45,31 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_campaigns",
     description:
-      "All active campaigns with strategy-ready, invariant-normalized data: raw_hp (primary field), max_hp, signed hp_per_hour, cosmetic liberation_pct_display_only, faction, planet, campaign type/kind, and trajectory flags (direction, stabilizing, hpc). Each campaign also carries per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, hazards, Major Order membership (is_major_order_target / major_order_id — a pure join, not a priority score), and — on defense campaigns — defense_started_at / defense_ends_at / defense_hours_remaining.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      "All active campaigns with strategy-ready, invariant-normalized data: raw_hp (primary field), max_hp, signed hp_per_hour, cosmetic liberation_pct_display_only, faction, planet, campaign type/kind, and trajectory flags (direction, stabilizing, hpc). Each campaign also carries per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, hazards, Major Order membership (is_major_order_target / major_order_id — a pure join, not a priority score), and — on defense campaigns — defense_started_at / defense_ends_at / defense_hours_remaining. Optional AND-combined filters narrow the returned subset (filtered_count vs total_count states coverage); no args returns all campaigns.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faction: {
+          type: "string",
+          description:
+            'Only campaigns on this faction\'s front (e.g. "Terminids", "Automaton", "Illuminate"); matched case-insensitively against the campaign faction.',
+        },
+        major_order_only: {
+          type: "boolean",
+          description: "Only campaigns whose planet is a current Major Order target.",
+        },
+        has_rate: {
+          type: "boolean",
+          description:
+            "Only campaigns with a non-null hp_per_hour (excludes cold-start/unsampled planets).",
+        },
+        hpc_only: {
+          type: "boolean",
+          description: "Only High Priority Campaigns (hpc: true).",
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: "get_major_order",
@@ -130,6 +161,22 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "resolve_planet",
+    description:
+      "Resolve a loose planet name to the canonical upstream planet: exact case-insensitive match first, then punctuation/space-normalized, then fuzzy. Returns matched: true with the planet only for an exact/normalized match; a near-miss or tie returns ranked candidates (score = edit distance, lower is closer) with matched: false — never a silent substitution. Names come back in verbatim upstream casing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: 'Loose planet name to resolve (e.g. "gacrux", "mort epsilon").',
+        },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "get_observed_signatures",
     description:
       "Accumulated record of every distinct campaign signature tuple {campaign_type, event_type, has_event, faction} this server has observed while polling, newest last_seen first, with first/last seen timestamps and a 60s-deduplicated sample_count. Passive raw observation only — it captures rare states (special-faction event types, defense campaign types) with timestamps; no interpretation. Empty on cold start.",
@@ -175,10 +222,30 @@ async function dispatchTool(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   switch (name) {
+    case "get_war_brief":
+      return toolText(await getWarBrief(env));
     case "get_war_status":
       return toolText(await getWarStatus(env));
     case "get_campaigns":
-      return toolText(await getCampaigns(env));
+      return toolText(
+        await getCampaigns(env, {
+          faction: typeof args.faction === "string" ? args.faction : undefined,
+          major_order_only:
+            typeof args.major_order_only === "boolean"
+              ? args.major_order_only
+              : undefined,
+          has_rate:
+            typeof args.has_rate === "boolean" ? args.has_rate : undefined,
+          hpc_only:
+            typeof args.hpc_only === "boolean" ? args.hpc_only : undefined,
+        }),
+      );
+    case "resolve_planet":
+      return toolText(
+        await resolvePlanetTool(env, {
+          query: typeof args.query === "string" ? args.query : undefined,
+        }),
+      );
     case "get_major_order":
       return toolText(await getMajorOrder(env));
     case "get_planet":
