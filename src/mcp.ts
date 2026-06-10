@@ -30,7 +30,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_campaigns",
     description:
-      "All active campaigns with strategy-ready, invariant-normalized data: raw_hp (primary field), max_hp, signed hp_per_hour, cosmetic liberation_pct_display_only, faction, planet, campaign type/kind, and trajectory flags (direction, stabilizing, hpc).",
+      "All active campaigns with strategy-ready, invariant-normalized data: raw_hp (primary field), max_hp, signed hp_per_hour, cosmetic liberation_pct_display_only, faction, planet, campaign type/kind, and trajectory flags (direction, stabilizing, hpc). Each campaign also carries per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, hazards, and — on defense campaigns — defense_started_at / defense_ends_at / defense_hours_remaining.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -42,7 +42,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_planet",
     description:
-      "Deep dive on one planet by index or name: raw HP, regen/decay (defense decay is always null — it is cosmetic), signed hp_per_hour, hours_to_resolution projection derived from raw HP (never from liberation %), and direction flag.",
+      "Deep dive on one planet by index or name: raw HP, regen/decay (defense decay is always null — it is cosmetic), signed hp_per_hour, hours_to_resolution projection derived from raw HP (never from liberation %), direction flag, per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, environmental hazards, and defense timing (defense_ends_at / defense_hours_remaining) when a defense event is active.",
     inputSchema: {
       type: "object",
       properties: {

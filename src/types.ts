@@ -12,6 +12,16 @@ export interface RawStatistics {
   accuracy: number;
 }
 
+export interface RawBiome {
+  name?: string | null;
+  description?: string | null;
+}
+
+export interface RawHazard {
+  name?: string | null;
+  description?: string | null;
+}
+
 export interface RawEvent {
   id: number;
   eventType: number;
@@ -36,7 +46,9 @@ export interface RawPlanet {
   event: RawEvent | null;
   attacking: number[];
   waypoints: number[];
-  statistics?: RawStatistics;
+  statistics?: RawStatistics | null;
+  biome?: RawBiome | null;
+  hazards?: RawHazard[] | null;
 }
 
 export interface RawCampaign {
@@ -114,6 +126,47 @@ export interface NormalizedCampaign extends TrajectorySignal, Projection {
   /** Invariant 2: cosmetic only — never used in any math. */
   liberation_pct_display_only: number | null;
   data_quality?: "degraded";
+}
+
+/** Lean named subset of the upstream per-planet statistics block. */
+export interface PlanetStatistics {
+  player_count: number | null;
+  mission_wins: number | null;
+  mission_losses: number | null;
+  /** Derived: wins / (wins + losses) × 100; null when zero missions. */
+  mission_success_rate: number | null;
+  kills: {
+    terminid: number | null;
+    automaton: number | null;
+    illuminate: number | null;
+  };
+}
+
+export interface BiomeInfo {
+  name: string | null;
+  description: string | null;
+}
+
+export interface HazardInfo {
+  name: string | null;
+  description: string | null;
+}
+
+/** Defense deadline facts — emitted only when a defense event is active. */
+export interface DefenseTiming {
+  defense_started_at: string | null;
+  defense_ends_at: string | null;
+  defense_hours_remaining: number | null;
+  defense_expired: boolean | null;
+}
+
+/** NormalizedCampaign plus the additive Stage 1 fact pass-throughs. */
+export interface EnrichedCampaign
+  extends NormalizedCampaign,
+    Partial<DefenseTiming> {
+  statistics: PlanetStatistics | null;
+  biome: BiomeInfo | null;
+  hazards: HazardInfo[];
 }
 
 /** Context passed into pure normalization — assembled by the handler layer. */

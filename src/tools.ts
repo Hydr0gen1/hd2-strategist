@@ -9,11 +9,18 @@ import {
   type SampleInput,
 } from "./client";
 import {
+  defenseTiming,
+  selectBiome,
+  selectHazards,
+  selectPlanetStatistics,
+} from "./enrichment";
+import {
   HPC_CAMPAIGN_TYPES,
   campaignKind,
   normalizeCampaign,
 } from "./invariants";
 import type {
+  EnrichedCampaign,
   Env,
   NormalizedCampaign,
   RawAssignment,
@@ -57,7 +64,7 @@ function defenseAgeMs(planet: RawPlanet, nowMs: number): number | null {
 }
 
 interface CampaignBundle {
-  campaigns: NormalizedCampaign[];
+  campaigns: EnrichedCampaign[];
   stale: boolean;
 }
 
@@ -82,7 +89,7 @@ async function loadNormalizedCampaigns(env: Env): Promise<CampaignBundle> {
     nowMs,
   );
 
-  const campaigns = raw.map((c) => {
+  const campaigns = raw.map((c): EnrichedCampaign => {
     const sample = samples.get(c.planet.index);
     // Defense events carry an authoritative start time; prefer it over the
     // Worker's first-seen tracking for ramp-up age.
@@ -90,12 +97,19 @@ async function loadNormalizedCampaigns(env: Env): Promise<CampaignBundle> {
       campaignKind(c) === "defense"
         ? (defenseAgeMs(c.planet, nowMs) ?? sample?.campaignAgeMs ?? null)
         : (sample?.campaignAgeMs ?? null);
-    return normalizeCampaign(c, {
+    const normalized = normalizeCampaign(c, {
       hpPerHour: sample?.hpPerHour ?? null,
       campaignAgeMs,
       hpcTypes: HPC_CAMPAIGN_TYPES,
       moPlanetIndices,
     });
+    return {
+      ...normalized,
+      statistics: selectPlanetStatistics(c.planet.statistics),
+      biome: selectBiome(c.planet.biome),
+      hazards: selectHazards(c.planet.hazards),
+      ...(c.planet.event ? defenseTiming(c.planet.event, nowMs) : {}),
+    };
   });
 
   return { campaigns, stale: campaignsRes.stale || assignmentsRes.stale };
@@ -155,6 +169,10 @@ export async function getCampaigns(env: Env): Promise<unknown> {
         "Cosmetic display value only. All quantitative logic must use raw_hp.",
       hp_per_hour:
         "Net signed rate sampled by this server: positive = progressing toward resolution, negative = losing ground. Null until two samples >60s apart exist.",
+      mission_success_rate:
+        "Derived per planet as mission_wins / (mission_wins + mission_losses) × 100. Null when no missions are recorded — never 0.",
+      defense_hours_remaining:
+        "Defense campaigns only: (endTime − now) in hours, clamped at 0 with defense_expired: true once past. A deadline fact, not an urgency judgment.",
     },
     ...(bundle.stale ? { stale: true } : {}),
   };
@@ -320,7 +338,11 @@ export async function getPlanet(
           end_time: planet.event.endTime,
         }
       : null,
+    ...(planet.event ? defenseTiming(planet.event, Date.now()) : {}),
     player_count: planet.statistics?.playerCount ?? null,
+    statistics: selectPlanetStatistics(planet.statistics),
+    biome: selectBiome(planet.biome),
+    hazards: selectHazards(planet.hazards),
     ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
   };
 }

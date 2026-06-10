@@ -59,9 +59,9 @@ Tiers are ordered by cost/risk, not necessarily by priority. Within the prime di
 
 ### Tier 1 — surface data already in fetched payloads (cheap, safe, do first)
 
-- [ ] **Per-planet `statistics`** — player count, mission win/loss, kills per planet. Exposes where the playerbase actually is vs. where HP is moving.
-- [ ] **Defense `endTime` + `hours_remaining`** — the hard deadline on a defense campaign. The single most decision-relevant fact when a defense is live. (Currently unexercised — no live defenses — so verify against real data when one appears.)
-- [ ] **Biome + environmental hazard per planet** — factual, feeds loadout reasoning (cold/atmospheric hazards).
+- [x] **Per-planet `statistics`** — player count, mission win/loss, kills per planet. Exposes where the playerbase actually is vs. where HP is moving.
+- [x] **Defense `endTime` + `hours_remaining`** — the hard deadline on a defense campaign. The single most decision-relevant fact when a defense is live. (Currently unexercised — no live defenses — so verify against real data when one appears.)
+- [x] **Biome + environmental hazard per planet** — factual, feeds loadout reasoning (cold/atmospheric hazards).
 
 ### Tier 2 — new upstream endpoints
 
@@ -88,6 +88,8 @@ Tiers are ordered by cost/risk, not necessarily by priority. Within the prime di
 
 - **`campaign_type` enum is unverified.** Live data shows every active campaign is `type: 0`; HPC detection currently rides entirely on the Major-Order link. The `HPC_CAMPAIGN_TYPES = {1,2,3}` seed has had zero live coverage. **Action:** log distinct `(type, hasEvent)` pairs over time and confirm what non-zero types actually mean before trusting the type half of HPC detection.
 - **Invariant 1 (defense-null) unexercised live.** No defense campaigns have appeared since launch; the path is unit-tested only. Re-verify against real data when a defense goes active.
+- **Defense timing (Stage 1) unexercised live.** Same gap: `defense_hours_remaining` / `defense_expired` are unit-tested against the documented `event` shape only. Verify against real data when a defense goes active.
+- **Upstream `war.now` is game-epoch time** (observed `1972-04-26T…`), NOT comparable to the real-world ISO timestamps in `event.startTime`/`endTime` or MO `expiration`. All deadline math (MO `expires_in`, defense timing) therefore uses the Worker clock against those real-world timestamps.
 - **Impact multiplier is very low** (~0.024 observed). Not a bug, but worth remembering when interpreting why heavily-populated planets stall.
 - **Connector tool-list refresh.** Adding a tool requires the MCP client to re-discover `tools/list`; budget a connector toggle after any deploy that changes the tool set.
 
