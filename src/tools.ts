@@ -11,7 +11,9 @@ import {
   type SampleInput,
 } from "./client";
 import {
+  aggregateFrontRate,
   buildHistoryPoints,
+  decayPerHour,
   defenseTiming,
   selectBiome,
   selectHazards,
@@ -31,6 +33,7 @@ import {
 import type {
   EnrichedCampaign,
   Env,
+  FrontRateAggregate,
   NormalizedCampaign,
   RawAssignment,
   RawCampaign,
@@ -116,6 +119,9 @@ async function loadNormalizedCampaigns(env: Env): Promise<CampaignBundle> {
     });
     return {
       ...normalized,
+      // Stage 3: unit conversion of the invariant-1 normalized regen (already
+      // force-nulled for defenses) — never of the raw upstream regen.
+      decay_per_hour: decayPerHour(normalized.regen_per_second),
       statistics: selectPlanetStatistics(c.planet.statistics),
       biome: selectBiome(c.planet.biome),
       hazards: selectHazards(c.planet.hazards),
@@ -133,19 +139,29 @@ export async function getWarStatus(env: Env): Promise<unknown> {
   ]);
   const war = warRes.data;
 
+  const byFaction = new Map<string, EnrichedCampaign[]>();
+  for (const c of bundle.campaigns) {
+    const list = byFaction.get(c.faction) ?? [];
+    list.push(c);
+    byFaction.set(c.faction, list);
+  }
+
   const fronts: Record<
     string,
-    { campaigns: number; defenses: number; planets: string[] }
+    {
+      campaigns: number;
+      defenses: number;
+      planets: string[];
+    } & FrontRateAggregate
   > = {};
-  for (const c of bundle.campaigns) {
-    const front = (fronts[c.faction] ??= {
-      campaigns: 0,
-      defenses: 0,
-      planets: [],
-    });
-    front.campaigns += 1;
-    if (c.campaign_kind === "defense") front.defenses += 1;
-    front.planets.push(c.planet_name);
+  for (const [faction, list] of byFaction) {
+    fronts[faction] = {
+      campaigns: list.length,
+      defenses: list.filter((c) => c.campaign_kind === "defense").length,
+      planets: list.map((c) => c.planet_name),
+      // Stage 3: the SAME signed per-campaign rates, summed — no recompute.
+      ...aggregateFrontRate(list.map((c) => c.hp_per_hour)),
+    };
   }
 
   return {
@@ -166,6 +182,10 @@ export async function getWarStatus(env: Env): Promise<unknown> {
       illuminate_kills: war.statistics.illuminateKills,
       deaths: war.statistics.deaths,
     },
+    notes: {
+      net_hp_per_hour:
+        "Per-front sum of the same signed per-campaign hp_per_hour values (positive = progressing toward resolution). Only planets with a known rate are summed — planets_with_rate vs planets_total states the coverage. Null means no planet on the front has a rate yet (e.g. cold start), not zero.",
+    },
     ...(warRes.stale || bundle.stale ? { stale: true } : {}),
   };
 }
@@ -184,6 +204,8 @@ export async function getCampaigns(env: Env): Promise<unknown> {
         "Derived per planet as mission_wins / (mission_wins + mission_losses) × 100. Null when no missions are recorded — never 0.",
       defense_hours_remaining:
         "Defense campaigns only: (endTime − now) in hours, clamped at 0 with defense_expired: true once past. A deadline fact, not an urgency judgment.",
+      decay_per_hour:
+        "regen_per_second × 3600 — regen in the same units as hp_per_hour. Derived from the invariant-normalized regen, so it is always null on defense campaigns (cosmetic decay stays suppressed) and null when regen is unknown.",
     },
     ...(bundle.stale ? { stale: true } : {}),
   };
@@ -358,6 +380,9 @@ export async function getPlanet(
     max_hp: normalized.max_hp,
     hp_per_hour: normalized.hp_per_hour,
     regen_per_second: normalized.regen_per_second,
+    // Stage 3: derived from the invariant-1 normalized regen above — a
+    // defense planet can never re-expose its cosmetic decay here.
+    decay_per_hour: decayPerHour(normalized.regen_per_second),
     liberation_pct_display_only: normalized.liberation_pct_display_only,
     hours_to_resolution: normalized.hours_to_resolution,
     projection_status: normalized.status,

@@ -71,8 +71,8 @@ Tiers are ordered by cost/risk, not necessarily by priority. Within the prime di
 
 ### Tier 3 — deterministic derivations (on the right side of the line)
 
-- [ ] **Per-front aggregated `hp_per_hour`** — sum of net rates across a faction’s planets. A sum, not a verdict; gives the *inputs* to reason about a front’s trajectory without the server concluding.
-- [ ] **`decay_per_hour`** — `regenPerSecond × 3600`, so regen reads in the same units as the rate. Pure unit conversion.
+- [x] **Per-front aggregated `hp_per_hour`** — sum of net rates across a faction’s planets. A sum, not a verdict; gives the *inputs* to reason about a front’s trajectory without the server concluding. (`get_war_status` fronts: `net_hp_per_hour` + `planets_with_rate`/`planets_total` coverage counts. Sums the SAME signed per-campaign rates — never recomputed; null rates are excluded, never coerced to 0; a front with no known rates reports null, not a fake 0.)
+- [x] **`decay_per_hour`** — `regenPerSecond × 3600`, so regen reads in the same units as the rate. Pure unit conversion. (On `get_campaigns` and `get_planet`. Derived from the invariant-1 normalized `regen_per_second`, so defense campaigns stay null — the conversion cannot resurrect suppressed cosmetic decay; regression-tested in `test/stage3.test.ts`.)
 
 ### Explicitly OUT of scope (do not build server-side, ever)
 
