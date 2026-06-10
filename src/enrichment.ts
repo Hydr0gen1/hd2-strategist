@@ -9,6 +9,7 @@ import type {
   BiomeInfo,
   DefenseTiming,
   DispatchInfo,
+  FrontRateAggregate,
   HazardInfo,
   PatchNoteInfo,
   PlanetHistoryPoint,
@@ -22,6 +23,7 @@ import type {
 } from "./types";
 
 const MS_PER_HOUR = 3_600_000;
+const SECONDS_PER_HOUR = 3_600;
 
 /** Dispatch feed limits: bound the payload, never the facts. */
 export const DISPATCHES_DEFAULT_LIMIT = 10;
@@ -206,6 +208,58 @@ export function buildHistoryPoints(
       delta_hours: prev ? (s.t - prev.t) / MS_PER_HOUR : null,
     };
   });
+}
+
+/**
+ * Stage 3: regen expressed per hour — regenPerSecond × 3600, a pure unit
+ * conversion so regen reads in the same units as hp_per_hour.
+ *
+ * Invariant-1 guard: the input MUST be the already-normalized
+ * `regen_per_second` (force-nulled for defense campaigns by
+ * nullifyDefenseDecay) — never the raw upstream value. Deriving from the
+ * nulled field means this conversion can never re-expose a defense
+ * campaign's cosmetic decay. Missing/garbled regen → null, never fabricated.
+ */
+export function decayPerHour(
+  normalizedRegenPerSecond: number | null,
+): number | null {
+  if (
+    normalizedRegenPerSecond == null ||
+    !Number.isFinite(normalizedRegenPerSecond)
+  ) {
+    return null;
+  }
+  return normalizedRegenPerSecond * SECONDS_PER_HOUR;
+}
+
+/**
+ * Stage 3: per-front aggregate over the SAME signed per-campaign hp_per_hour
+ * values the normalization layer already produced — one signed source of
+ * truth, never recomputed here. A bare sum plus coverage counts, not a
+ * verdict: a negative or zero sum is a legitimate value and carries no
+ * label or alert.
+ *
+ * Honesty rules: null rates (stabilizing/cold-start planets) are unknowns —
+ * excluded from the sum, never coerced to 0, with the gap legible as
+ * planets_with_rate < planets_total. A front with zero known rates reports
+ * net_hp_per_hour: null (honest unknown), never a fake 0.
+ */
+export function aggregateFrontRate(
+  rates: ReadonlyArray<number | null>,
+): FrontRateAggregate {
+  let sum = 0;
+  let withRate = 0;
+  for (const rate of rates) {
+    if (typeof rate === "number" && Number.isFinite(rate)) {
+      sum += rate;
+      withRate += 1;
+    }
+  }
+  return {
+    net_hp_per_hour: withRate > 0 ? sum : null,
+    planets_with_rate: withRate,
+    planets_total: rates.length,
+  };
 }
 
 /** Hazard pass-through: always an array — [] when upstream sends none. */

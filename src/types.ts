@@ -185,6 +185,19 @@ export interface EnrichedCampaign
   statistics: PlanetStatistics | null;
   biome: BiomeInfo | null;
   hazards: HazardInfo[];
+  /** Stage 3: regen_per_second × 3600 — derived from the invariant-1
+   * normalized regen, so it is always null for defense campaigns. */
+  decay_per_hour: number | null;
+}
+
+/** Stage 3: per-front sum of the signed per-campaign hp_per_hour values —
+ * a bare sum plus coverage counts, never a verdict. Null rates (stabilizing
+ * planets) are excluded from the sum, never coerced to 0; a front with no
+ * known rates reports null, never a fake 0. */
+export interface FrontRateAggregate {
+  net_hp_per_hour: number | null;
+  planets_with_rate: number;
+  planets_total: number;
 }
 
 /** One dispatch as returned by get_dispatches — upstream facts, untouched. */
