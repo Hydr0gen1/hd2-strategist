@@ -20,11 +20,23 @@ export const RAMP_UP_THRESHOLD_MS = 3_600_000;
 
 /**
  * Invariant 5: campaign `type` values treated as High Priority Campaigns.
- * Type 0 is a standard liberation campaign; anything else is classified as
- * HPC. When in doubt, classify AS HPC — over-inclusion is fail-safe,
- * under-inclusion reintroduces the false-collapse bug.
+ *
+ * Ships EMPTY. The original `{1, 2, 3}` seed was a guess made when every
+ * live campaign was `type: 0` and the enum was unknown; corrected on
+ * 2026-06-10 from live `get_observed_signatures` data, which has now
+ * observed the real enum:
+ *
+ *   - `campaign_type: 0` — standard liberation (all three factions seen)
+ *   - `campaign_type: 4` (+ `event_type: 1`, `has_event: true`) — defense
+ *
+ * `{1, 2, 3}` never appeared live, and `4` is a DEFENSE type — not HPC —
+ * already handled by the defense path (invariant 1, `campaign_kind`).
+ * No campaign type is currently confirmed to mean "HPC", so HPC detection
+ * relies entirely on the Major-Order link (`moPlanetIndices`), which has
+ * always been the reliable signal. This set stays as the configurable hook
+ * for a future live-confirmed HPC type value.
  */
-export const HPC_CAMPAIGN_TYPES: ReadonlySet<number> = new Set([1, 2, 3]);
+export const HPC_CAMPAIGN_TYPES: ReadonlySet<number> = new Set();
 
 export function campaignKind(raw: RawCampaign): "liberation" | "defense" {
   return raw.planet.event != null ? "defense" : "liberation";

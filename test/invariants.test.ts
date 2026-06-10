@@ -193,18 +193,26 @@ describe("invariant 5: HPC decay never flags as failure", () => {
     expect(result.hpc_note).toMatch(/intentionally deceptive/);
   });
 
-  it("suppresses collapse alerts for HPC campaign types", () => {
+  it("ships an EMPTY type set — no campaign type currently means HPC", () => {
+    // Corrected 2026-06-10 from live get_observed_signatures data: only
+    // types 0 (liberation) and 4 (defense) exist; the old {1,2,3} seed was
+    // a guess with zero live coverage. MO link is the sole HPC signal.
+    expect(HPC_CAMPAIGN_TYPES.size).toBe(0);
+  });
+
+  it("type clause still works when a future confirmed type is injected", () => {
     const result = suppressHpcFalseFailure(baseSignal, {
       ...hpcCtx,
       planetIndex: 1,
       moPlanetIndices: new Set<number>(),
-      campaignType: 2,
+      hpcTypes: new Set([7]),
+      campaignType: 7,
     });
     expect(result.alert).toBeNull();
     expect(result.hpc).toBe(true);
   });
 
-  it("leaves non-HPC campaigns untouched", () => {
+  it("leaves non-HPC campaigns untouched (type 0, no MO link)", () => {
     const result = suppressHpcFalseFailure(baseSignal, {
       ...hpcCtx,
       planetIndex: 1,
@@ -212,6 +220,46 @@ describe("invariant 5: HPC decay never flags as failure", () => {
       campaignType: 0,
     });
     expect(result).toEqual(baseSignal);
+  });
+
+  it("type 4 (defense) is NOT HPC — defense must not ride the type clause", () => {
+    const result = suppressHpcFalseFailure(baseSignal, {
+      ...hpcCtx,
+      planetIndex: 1,
+      moPlanetIndices: new Set<number>(),
+      campaignType: 4,
+    });
+    expect(result).toEqual(baseSignal);
+    expect(result.hpc).toBe(false);
+  });
+});
+
+describe("HPC classification with the observed (2026-06-10) type enum", () => {
+  it("MO-linked planet → hpc: true regardless of campaign type", () => {
+    const normalized = normalizeCampaign(
+      makeCampaign({}),
+      ctx({ moPlanetIndices: new Set([175]) }),
+    );
+    expect(normalized.hpc).toBe(true);
+  });
+
+  it("type 4 defense outside the MO set → hpc: false, kind defense (defense ≠ HPC)", () => {
+    const normalized = normalizeCampaign(
+      makeCampaign({
+        type: 4,
+        planet: { event: makeEvent(), regenPerSecond: 2.78 },
+      }),
+      ctx(),
+    );
+    expect(normalized.hpc).toBe(false);
+    expect(normalized.campaign_kind).toBe("defense");
+    // Invariant 1 still governs defense regardless of HPC status.
+    expect(normalized.regen_per_second).toBeNull();
+  });
+
+  it("type 0 liberation outside the MO set → hpc: false", () => {
+    const normalized = normalizeCampaign(makeCampaign({ type: 0 }), ctx());
+    expect(normalized.hpc).toBe(false);
   });
 });
 
@@ -238,9 +286,14 @@ describe("edge case 4: negative rate on a liberation campaign", () => {
 
 describe("edge case 8: newly opened HPC with steep decay (invariants 4+5 stack)", () => {
   it("must not surface as failing", () => {
+    // HPC via MO link — the sole live HPC signal since the type set emptied.
     const normalized = normalizeCampaign(
-      makeCampaign({ type: 2, id: 99 }),
-      ctx({ hpPerHour: -250_000, campaignAgeMs: 5 * 60_000 }),
+      makeCampaign({ id: 99 }),
+      ctx({
+        hpPerHour: -250_000,
+        campaignAgeMs: 5 * 60_000,
+        moPlanetIndices: new Set([175]),
+      }),
     );
     expect(normalized.alert).toBeNull();
     expect(normalized.stabilizing).toBe(true);
@@ -293,8 +346,8 @@ describe("losing defense campaign with RISING health (sign-convention mirror of 
 
   it("HPC losing defense: invariant 5 still suppresses the collapse alert", () => {
     const normalized = normalizeCampaign(
-      losingDefense({ type: 2 }),
-      ctx({ hpPerHour }),
+      losingDefense(),
+      ctx({ hpPerHour, moPlanetIndices: new Set([175]) }),
     );
     expect(normalized.direction).toBe("losing");
     expect(normalized.alert).toBeNull();
