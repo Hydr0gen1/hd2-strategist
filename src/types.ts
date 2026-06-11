@@ -662,6 +662,129 @@ export interface DefenseEtaBlock {
   resolution_within_defense_window_historical: boolean | null;
 }
 
+/* --------------------------- Stage 10 types ---------------------------- */
+
+/** Raw ArrowHead war-status planet entry (wrapper /raw endpoint — verified
+ * live 2026-06-11). `owner` is the numeric faction enum (1=Humans,
+ * 2=Terminids, 3=Automaton, 4=Illuminate — see RAW_FACTION_NAMES). Note:
+ * carries NO maxHealth and NO liberation % — those are WarInfo / derived. */
+export interface RawStatusPlanet {
+  index: number;
+  owner?: number;
+  health?: number;
+  regenPerSecond?: number;
+  players?: number;
+}
+
+/** Raw ArrowHead campaign entry: `id` joins the normalized campaign id
+ * exactly; `race` is the numeric faction enum. */
+export interface RawStatusCampaign {
+  id: number;
+  planetIndex?: number;
+  type?: number;
+  race?: number;
+}
+
+/** Raw ArrowHead planet event (defense) entry. `health`/`maxHealth` are the
+ * event health the defense path tracks; times are game-epoch (unusable —
+ * the existing war.now lesson) and deliberately not cross-checked. */
+export interface RawStatusEvent {
+  id: number;
+  planetIndex?: number;
+  eventType?: number;
+  race?: number;
+  health?: number;
+  maxHealth?: number;
+  campaignId?: number;
+}
+
+/** The slice of /raw/api/WarSeason/{war}/Status this server cross-checks. */
+export interface RawWarStatus {
+  warId?: number;
+  impactMultiplier?: number;
+  planetStatus?: RawStatusPlanet[];
+  campaigns?: RawStatusCampaign[];
+  planetEvents?: RawStatusEvent[];
+}
+
+/** Raw ArrowHead assignment (wrapper /raw/api/v2/Assignment/War/{war}):
+ * `id32` equals the normalized assignment id; `setting.tasks` carries the
+ * SAME positional type/values/valueTypes arrays the normalized payload
+ * does (verified byte-identical live 2026-06-11). */
+export interface RawWarStatusAssignment {
+  id32: number;
+  progress?: number[];
+  expiresIn?: number;
+  setting?: {
+    type?: number;
+    overrideTitle?: string;
+    tasks?: RawAssignmentTask[];
+  };
+}
+
+/** Stage 10: the normalized-side view a cross-check runs against — assembled
+ * by the handler from values the payload itself carries, so every check is
+ * verifiable in place. campaign_id null/-1 = no real campaign (a quiet-planet
+ * probe makes no campaign_type claim to check). */
+export interface CrossCheckSubject {
+  planet_index: number;
+  campaign_id: number | null;
+  campaign_kind: "liberation" | "defense";
+  campaign_type: number | null;
+  current_owner: string | null;
+  raw_hp: number | null;
+  max_hp: number | null;
+  regen_per_second: number | null;
+  liberation_pct_display_only: number | null;
+  event_type: number | null;
+  player_count: number | null;
+}
+
+/** Stage 10: one cross-checked field. `agrees` is exact for discrete fields,
+ * within CROSS_CHECK_FLOAT_TOLERANCE for floats, and null (with a reason)
+ * when one side has no counterpart. `expected_transform: true` marks a field
+ * an invariant DELIBERATELY transforms — documented behavior, never a
+ * mismatch. Both values always ride together: a disagreement is presented,
+ * never resolved — no field anywhere names a side as correct. */
+export interface CrossCheckField {
+  field: string;
+  normalized_value: number | string | boolean | null;
+  raw_value: number | string | boolean | null;
+  agrees: boolean | null;
+  abs_diff?: number;
+  pct_diff?: number;
+  expected_transform?: true;
+  reason?: string;
+}
+
+/** Stage 10: the cross_check block on get_planet. When /raw cannot be
+ * served the block degrades to available: false with a machine-readable
+ * reason — the primary response is never blocked, the missing side never
+ * guessed. Both sides' retrieval timestamps are exposed so fetch-moment
+ * skew is visible, not silently compared across time. */
+export type CrossCheckBlock =
+  | {
+      available: true;
+      raw_source: string;
+      checked: CrossCheckField[];
+      fields_checked: number;
+      agreements: number;
+      unexpected_disagreements: number;
+      expected_transforms: number;
+      uncheckable: number;
+      normalized_as_of: string;
+      raw_as_of: string;
+      raw_stale?: true;
+      note: string;
+    }
+  | {
+      available: false;
+      raw_source: string;
+      reason: "raw_unavailable" | "normalized_unavailable";
+      detail?: string;
+      note: string;
+    };
+
 /** Worker environment bindings. */
 export interface Env {
   WAR_CACHE?: KVNamespace;
