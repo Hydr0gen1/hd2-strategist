@@ -8,12 +8,13 @@ the logic, don't mock the world. Two sanctioned exceptions:
 `samplePlanetRates` in `src/client.ts` (stage5.test.ts), which does no
 network I/O — both use the same ~10-line in-memory KV stub; no network, no
 global mocking. The stub's `puts` log is what proves the one-write-per-cycle
-budget. A third sanctioned exception (stage6.test.ts): the `get_war_brief` /
-`get_campaigns` / `resolve_planet` handlers run against the same KV stub
-with every `raw:` cache entry pre-seeded FRESH and `globalThis.fetch`
-replaced by a stub that throws — proving the handlers add zero upstream
-fetch volume beyond the shared cache (the stub is restored in `afterEach`;
-it forbids the network, it never simulates it).
+budget. A third sanctioned exception (stage6.test.ts, and scheduled.test.ts
+on the same pattern): the `get_war_brief` / `get_campaigns` /
+`resolve_planet` handlers — and the Worker's cron `scheduled` handler — run
+against the same KV stub with every `raw:` cache entry pre-seeded FRESH and
+`globalThis.fetch` replaced by a stub that throws — proving the handlers add
+zero upstream fetch volume beyond the shared cache (the stub is restored in
+`afterEach`; it forbids the network, it never simulates it).
 
 ## Coverage that must never regress
 
@@ -132,6 +133,20 @@ the project's definition of done:
     resolve_planet makes zero KV writes.
   - **Prime directive pin**: every key in the brief payload (recursively) is
     checked against interpretive names (recommend/priority/rank/score/...).
+
+- Scheduled sampling (`scheduled.test.ts`):
+  - The cron `scheduled` handler writes the IDENTICAL merged store a
+    request-driven `get_war_status` poll writes (stores compared deep-equal
+    with Worker-clock timestamps normalized) with the identical write set —
+    behavioral proof the cron path rides the request path's own loader,
+    never a fork.
+  - A cold-store tick seeds planet series + signature tuple + global point;
+    a tick past the 60s interval appends history points and bumps the
+    signature count; a tick within 60s double-samples NOTHING (the
+    `MIN_SAMPLE_INTERVAL_MS` guard is never bypassed).
+  - Exactly ONE `samples:planets` put per tick (30-day TTL), nothing extra.
+  - Upstream failure during a tick resolves silently with zero writes —
+    best-effort, swallowed, never a thrown exception out of the Worker.
 
 ## Conventions
 

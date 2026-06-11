@@ -208,6 +208,28 @@ async function loadNormalizedCampaigns(
   };
 }
 
+/**
+ * Cron-driven sampling entry: the Worker's `scheduled` handler (index.ts,
+ * fired by the wrangler.toml [triggers] schedule) delegates here. It drives
+ * EXACTLY the request path's poll — loadNormalizedCampaigns with the war
+ * fetch joined: the same cache/fetch logic, the same 60s minimum sample
+ * interval, and the same single merged sample-store write (planet series +
+ * signatures + global statistics) inside samplePlanetRates. The cron path
+ * cannot drift from the request path because it IS the request path's
+ * loader — never a forked sampler. Best-effort by design: no user is
+ * watching a cron tick, so an upstream failure is logged and swallowed and
+ * the next tick retries.
+ */
+export async function runScheduledSample(env: Env): Promise<void> {
+  try {
+    await loadNormalizedCampaigns(env, { withWar: true });
+  } catch (err) {
+    console.warn(
+      `scheduled sample skipped: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 export async function getWarStatus(env: Env): Promise<unknown> {
   // Stage 5: the war fetch rides inside loadNormalizedCampaigns (withWar) so
   // its global statistics reach the single sample-store write; the planets
