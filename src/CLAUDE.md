@@ -13,7 +13,7 @@ Module boundaries are strict; respect them when editing:
 | `tools.ts` | The twelve tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. Stage 6: `get_war_brief` is pure assembly of facts the other tools return (never a recommendation/ranking); `resolve_planet` and the shared name resolution never silently substitute a planet — near-misses surface ranked candidates. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
-| `index.ts` | Entry/routing | POST `/` or `/mcp` only. |
+| `index.ts` | Entry/routing + cron entry | POST `/` or `/mcp` only; the `scheduled` handler (Cron Trigger, always UTC) delegates to `runScheduledSample` in tools.ts — the request path's own loader and store write, never a fork; failures are swallowed (no user watches a cron tick). |
 
 ## The five invariants (do not weaken)
 
@@ -94,6 +94,17 @@ carries a 30-day KV TTL refreshed on every write (planet samples still age
 out in code at 48h): long enough for accumulated signatures to survive gaps
 in usage, while a truly abandoned store still evaporates.
 `get_observed_signatures` and `get_global_history` are read-only.
+
+A Cron Trigger (wrangler.toml `[triggers]`, every 2 minutes, UTC) drives
+this same path on a schedule via `runScheduledSample` (tools.ts): one
+merged store write per tick through the same `samplePlanetRates` call —
+the war fetch is joined so global statistics sample on every tick — plus
+the normal raw-cache refreshes from `fetchUpstream`. The 60s
+`MIN_SAMPLE_INTERVAL_MS` guard applies unchanged, overlapping cron/request
+samples stay last-write-wins on the single key, and an upstream failure
+during a tick is swallowed (next tick retries). The cadence-vs-KV-write-
+budget rationale lives in the comment next to the cron line — re-check it
+before tightening the schedule.
 
 ## Stage 6 consumption rules
 

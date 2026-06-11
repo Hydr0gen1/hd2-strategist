@@ -104,7 +104,7 @@ The rate needs **two calls separated by more than 60 seconds of wall-clock time*
 
 The same timing governs `get_planet_history`: it returns the samples accumulated by polling (`get_campaigns` / `get_war_status` / `get_planet` calls), so on a cold start it correctly reports an empty series with `insufficient_history: true` — populate it with two polls >60s apart.
 
-`get_global_history` follows the same rule, with one narrowing: global statistics are sampled only on `get_war_status` polls (the one path that fetches `/api/v1/war`), so populate it with two `get_war_status` calls >60s apart. `get_observed_signatures` accumulates on every campaign poll and is expected to be empty on a cold start. Both tools are read-only:
+`get_global_history` follows the same rule, with one narrowing: global statistics are sampled only when the war state is fetched (`get_war_status` polls — and every cron tick, see below), so locally populate it with two `get_war_status` calls >60s apart. `get_observed_signatures` accumulates on every campaign poll and is expected to be empty on a cold start. Both tools are read-only:
 
 ```bash
 curl -s localhost:8787/mcp -H 'content-type: application/json' \
@@ -114,10 +114,27 @@ curl -s localhost:8787/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_global_history","arguments":{}}}'
 ```
 
+### Background sampling (Cron Trigger)
+
+A Cloudflare Cron Trigger (`[triggers]` in `wrangler.toml`) fires the Worker's `scheduled` handler **every 2 minutes** and drives exactly the same sampling path a request-driven poll does: the same cache/fetch logic, the same 60s minimum sample interval, and the same single merged `samples:planets` write (planet series + observed signatures + global statistics — global stats are sampled on every tick because the war fetch is joined). The accumulation layers behind `get_planet_history`, `get_global_history`, and `get_observed_signatures` therefore advance continuously on the deployed Worker, independent of user calls. It introduces no new data, fields, or interpretation — it only runs the existing sampler on a schedule.
+
+- **Cadence & KV write budget:** every 2 minutes, deliberately not every minute — the KV free tier allows ~1,000 writes/day, and at 1-min cadence the merged store write alone would be 1,440/day; at 2-min it is ~720/day. **Caveat:** the 45s raw response cache is always expired at this cadence, so each tick also refreshes up to three `raw:` cache keys — total cron-driven KV writes are ~4 per run (~2,880/day worst case), which exceeds the free-tier write ceiling on its own. If the free-tier budget must hold strictly, widen the cadence (e.g. `*/10`); re-check the full budget before ever tightening it.
+- **UTC:** Cloudflare cron always evaluates in UTC. Irrelevant for a fixed-interval poll, but any future time-of-day schedule must account for it.
+- **Failure is silent by design:** an upstream failure during a scheduled run is logged and swallowed (no user is watching a cron tick); the next tick retries. The interval guard makes overlapping cron/request samples safe — last-write-wins on the single merged store, with `first_seen` preserved by the merge.
+- **Cron triggers only run on the deployed Worker.** Locally, test the handler via wrangler's scheduled-test mode:
+
+```bash
+npm run dev -- --test-scheduled
+# then trigger a tick:
+curl "http://localhost:8787/__scheduled?cron=*/2+*+*+*+*"
+```
+
+After a deploy, verify it end-to-end by leaving the server idle and checking that `get_observed_signatures` `last_seen` and `get_global_history` timestamps keep advancing on their own.
+
 ## Architecture
 
 ```
-src/index.ts       Worker entry — routes POST / and /mcp
+src/index.ts       Worker entry — routes POST / and /mcp; `scheduled` cron entry
 src/mcp.ts         JSON-RPC 2.0: initialize, tools/list, tools/call
 src/client.ts      Upstream fetch + KV cache (raw responses) + rate sampling
 src/invariants.ts  Pure normalization — the five invariants, no I/O

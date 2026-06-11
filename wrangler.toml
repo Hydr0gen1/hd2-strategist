@@ -8,3 +8,19 @@ compatibility_date = "2026-06-01"
 binding = "WAR_CACHE"
 # Replace with the id printed by: wrangler kv namespace create WAR_CACHE
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# Background sampling schedule. Cloudflare cron always evaluates in UTC —
+# irrelevant for a fixed-interval poll, but any future time-of-day schedule
+# must account for it.
+#
+# Every 2 minutes, deliberately NOT every minute: each run performs the
+# request path's single merged sample-store write, and the KV free tier
+# allows ~1,000 writes/day — at 1-min cadence the store write alone is
+# 1,440/day (over budget); at 2-min it is ~720/day. NOTE the full per-run
+# count is higher: the 45s raw response cache is always expired at this
+# cadence, so each run also refreshes up to three raw: cache keys (~4 KV
+# writes/run total — see README "Background sampling"). If this cadence is
+# ever tightened, or the free-tier write ceiling must hold strictly,
+# re-check the KV write budget first.
+[triggers]
+crons = ["*/2 * * * *"]
