@@ -5,12 +5,12 @@ Module boundaries are strict; respect them when editing:
 | File | Role | Boundary rule |
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
-| `enrichment.ts` | Stage 1+2+4+5+6+7 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups), Stage 6 consumption helpers (MO shaping, freshness metadata, planet-name resolution, campaign filters, brief target/event assembly), Stage 7 objective framing (`winCondition` / `hpRemainingToObjective` / `defenseWindowProjection`, the MO objective decode maps `TASK_TYPE_NAMES`/`TASK_VALUE_TYPE_NAMES`, and the inline-convention note constants) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `enrichment.ts` | Stage 1+2+4+5+6+7 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups), Stage 6 consumption helpers (MO shaping, freshness metadata, planet-name resolution, campaign filters, brief target/event assembly), Stage 7 objective framing (`winCondition` / `hpRemainingToObjective` / `defenseWindowProjection`, the MO objective decode maps `TASK_TYPE_NAMES`/`TASK_VALUE_TYPE_NAMES`, and the inline-convention note constants), Stage 8 MO progress history (`moProgressObservations`, `buildMoHistorySeries`, the shared `decodeObjectiveTarget`/`objectiveProgressPct` decode) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
 | `wiki.ts` | Stage 4 LORE source, pure half: wiki query plan (title candidates, one multi-title request), response shaping, extract cap, mandatory attribution | **Pure. Zero I/O. SEPARATE source** — never imports from or feeds into the live war-state pipeline; no live war number in any output. |
 | `wikiClient.ts` | Stage 4 LORE source, I/O half: helldivers.wiki.gg fetch (descriptive User-Agent) + long-TTL KV cache in the `wiki:` namespace with stale fallback | Deliberately separate from `client.ts`. Injectable fetch for tests. Never touches `raw:`/`samples:` keys. |
-| `sampling.ts` | Pure sample-store logic: the bounded planet ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants, and the Stage 5 accumulation layers (`foldSignatures`, `advanceGlobalSeries`) | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
+| `sampling.ts` | Pure sample-store logic: the bounded planet ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants, the Stage 5 accumulation layers (`foldSignatures`, `advanceGlobalSeries`), and the Stage 8 Major Order progress series (`advanceMoSeries`) | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
 | `client.ts` | Upstream fetch + KV cache + rate sampling | Owns the `hp_per_hour` sign convention (comment block) and all KV access. |
-| `tools.ts` | The twelve tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. Stage 6: `get_war_brief` is pure assembly of facts the other tools return (never a recommendation/ranking); `resolve_planet` and the shared name resolution never silently substitute a planet — near-misses surface ranked candidates. |
+| `tools.ts` | The thirteen tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. Stage 6: `get_war_brief` is pure assembly of facts the other tools return (never a recommendation/ranking); `resolve_planet` and the shared name resolution never silently substitute a planet — near-misses surface ranked candidates. Stage 8: `get_major_order_history` is read-only observed data — no forecast, required pace, or on-track verdict, ever. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
 | `index.ts` | Entry/routing + cron entry | POST `/` or `/mcp` only; the `scheduled` handler (Cron Trigger, always UTC) delegates to `runScheduledSample` in tools.ts — the request path's own loader and store write, never a fork; failures are swallowed (no user watches a cron tick). |
@@ -108,11 +108,28 @@ out in code at 48h): long enough for accumulated signatures to survive gaps
 in usage, while a truly abandoned store still evaporates.
 `get_observed_signatures` and `get_global_history` are read-only.
 
+Stage 8 adds a third accumulation layer on the same rules — the Major Order
+progress series (`mo`): one bounded series (96 points / 48h, the
+planet/global discipline) per {major_order_id, objective_index}, sampled on
+every campaign poll from the SAME assignments fetch and the SAME Stage 7
+objective decode (`decodeObjectiveTarget` — never a second decode of the
+positional arrays). Same single folded write, same 60s guard, always carries
+forward; the section stays absent until data accrues. MO TURNOVER: a new MO
+id seeds fresh series while the prior MO's series are retained (queryable by
+id) until their samples age out — series not observed in a cycle get plain
+age eviction and drop when emptied; points never move across series. Worst
+case adds ~0.35MB (defensive 50-series cap × 96 points; in practice a few
+KB) — combined store still far under the 5MB KV limit (size-tested).
+`get_major_order_history` is read-only and serves observed points + raw
+consecutive deltas only — no forecast, no required pace, no on-track/behind
+verdict (the prime directive applied to time-series).
+
 A Cron Trigger (wrangler.toml `[triggers]`, every 10 minutes, UTC) drives
 this same path on a schedule via `runScheduledSample` (tools.ts): one
 merged store write per tick through the same `samplePlanetRates` call —
-the war fetch is joined so global statistics sample on every tick — plus
-the normal raw-cache refreshes from `fetchUpstream`. The 60s
+the war fetch is joined so global statistics sample on every tick, and MO
+progress samples on every tick too (assignments are part of the loader's
+fetch set) — plus the normal raw-cache refreshes from `fetchUpstream`. The 60s
 `MIN_SAMPLE_INTERVAL_MS` guard applies unchanged, overlapping cron/request
 samples stay last-write-wins on the single key, and an upstream failure
 during a tick is swallowed (next tick retries). The cadence-vs-KV-write-

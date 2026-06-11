@@ -3,7 +3,7 @@
 Headless MCP server on a single Cloudflare Worker. It fronts the Helldivers 2
 community API (`api.helldivers2.dev`) as a **correctness layer**: it normalizes
 raw war data to strip known deceptive/cosmetic fields and exposes exactly
-twelve MCP tools. There is no frontend and no upstream app — the Worker IS
+thirteen MCP tools. There is no frontend and no upstream app — the Worker IS
 the app.
 
 ## Commands
@@ -28,20 +28,21 @@ wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
 
 ## Hard rules (project-wide)
 
-- **Exactly twelve tools**: `get_war_brief`, `get_war_status`,
+- **Exactly thirteen tools**: `get_war_brief`, `get_war_status`,
   `get_campaigns`, `get_major_order`, `get_planet`, `get_dispatches`,
   `get_patch_notes`, `get_planet_history`, `get_planet_wiki`,
-  `get_observed_signatures`, `get_global_history`, `resolve_planet`. Do not
-  add tools or rename them.
+  `get_observed_signatures`, `get_global_history`,
+  `get_major_order_history`, `resolve_planet`. Do not add tools or rename
+  them.
 - **The digest never concludes**: `get_war_brief` is pure ASSEMBLY of facts
   the other tools already return (MO + its targets' live trajectories,
   faction rollups, events, totals). No recommended target, no priority
   ranking, no "war is going well/badly" — ever. Judgment lives in the
   conversation layer.
 - **KV write budget**: one KV read + one KV write per poll cycle is the
-  ceiling. The Stage 5 accumulation layers (observed campaign signatures,
-  global statistics series) fold into the existing `samples:planets` write —
-  never a second per-cycle write.
+  ceiling. The Stage 5/8 accumulation layers (observed campaign signatures,
+  global statistics series, Major Order progress series) fold into the
+  existing `samples:planets` write — never a second per-cycle write.
 - **Two sources, never mixed**: everything except `get_planet_wiki` is live
   war state from `api.helldivers2.dev`; `get_planet_wiki` is community LORE
   from `helldivers.wiki.gg` (own pipeline `src/wiki.ts` + `src/wikiClient.ts`,
@@ -70,8 +71,10 @@ wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
    >60s wall-clock (use 70–90s — past both the 45s raw-cache TTL and the 60s
    `MIN_SAMPLE_INTERVAL_MS`). A `null` rate before that is expected, not a bug.
    The same timing governs `get_global_history` (two `get_war_status` polls
-   >60s apart — global stats are sampled only on that path), and
-   `get_observed_signatures` / `get_global_history` are expected to be empty
+   >60s apart — global stats are sampled only on that path) and
+   `get_major_order_history` (two campaign polls >60s apart — MO progress
+   samples on every poll), and `get_observed_signatures` /
+   `get_global_history` / `get_major_order_history` are expected to be empty
    on a cold start.
 4. Freshness metadata (`as_of` / `fetched_at` / `cache_age_seconds`) rides
    every upstream-derived response. `as_of` and `fetched_at` coincide by

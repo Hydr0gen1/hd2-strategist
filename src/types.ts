@@ -525,6 +525,45 @@ export interface WarBriefEvent {
   defense_hours_remaining: number | null;
 }
 
+/* --------------------------- Stage 8 outputs --------------------------- */
+
+/** Stage 8: one observed point in a Major Order objective's progress series.
+ * `progress` / `target` are the Stage-7-decoded values get_major_order
+ * returns (missing upstream → null, never 0). Deltas are raw differences
+ * from the prior OBSERVATION — never a projection; null on the first point
+ * or when either end's progress is null. */
+export interface MoHistoryPoint {
+  t: number;
+  observed_at: string;
+  progress: number | null;
+  target: number | null;
+  delta_progress: number | null;
+  delta_hours: number | null;
+}
+
+/** Stage 8: one shaped Major Order objective series as returned by
+ * get_major_order_history. Observed samples + deterministic derivations
+ * only: no forecast, no required pace, no on-track/behind verdict — pace
+ * judgment lives in the conversation layer. `objective_kind` reuses the
+ * Stage 7 TASK_TYPE_NAMES decode (null when the task type is unconfirmed —
+ * never fabricated); `progress_pct` = latest progress / target × 100, null
+ * when the target is 0 or unknown (never a divide-by-zero or fabricated
+ * denominator). With fewer than 2 points `insufficient_history` is true and
+ * the span is null — the same honesty as the other history tools. */
+export interface MoHistorySeries {
+  major_order_id: number;
+  objective_index: number;
+  task_type: number | null;
+  objective_kind: string | null;
+  points: number;
+  samples: MoHistoryPoint[];
+  latest_progress: number | null;
+  target: number | null;
+  progress_pct: number | null;
+  samples_span_hours: number | null;
+  insufficient_history: boolean;
+}
+
 /** Worker environment bindings. */
 export interface Env {
   WAR_CACHE?: KVNamespace;

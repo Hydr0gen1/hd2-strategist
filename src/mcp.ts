@@ -10,6 +10,7 @@ import {
   getDispatches,
   getGlobalHistory,
   getMajorOrder,
+  getMajorOrderHistory,
   getObservedSignatures,
   getPatchNotes,
   getPlanet,
@@ -188,6 +189,27 @@ const TOOL_DEFINITIONS = [
       "Global war statistics time-series sampled by this server (player count, missions won/lost, deaths, per-faction kills): retained points with raw observed deltas between consecutive samples. Observed values and deterministic differences only — never a forecast or trend verdict. Samples accrue on get_war_status polls; empty series (insufficient_history: true) is expected on cold start.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
+  {
+    name: "get_major_order_history",
+    description:
+      "Observed Major Order objective-progress time-series sampled by this server: one bounded series per objective (keyed by major_order_id + objective_index) with per-point delta_progress / delta_hours between consecutive observations, latest progress/target, and deterministic progress_pct. Observed samples and raw deltas only — never a forecast, completion estimate, required pace, or on-track/behind verdict (pace judgment belongs to the consumer). No args → all series for the currently active Major Order(s); a recently ended MO's series stays queryable by major_order_id until it ages out. Empty/sparse series (insufficient_history: true) is expected on cold start.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        major_order_id: {
+          type: "number",
+          description:
+            "Specific Major Order id — including a recently ended MO whose series is still retained. Default: the currently active MO(s).",
+        },
+        objective_index: {
+          type: "number",
+          description:
+            "Narrow to one objective index within the Major Order (an MO can have several objectives, each with its own series).",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 interface JsonRpcRequest {
@@ -285,6 +307,19 @@ async function dispatchTool(
       return toolText(await getObservedSignatures(env));
     case "get_global_history":
       return toolText(await getGlobalHistory(env));
+    case "get_major_order_history":
+      return toolText(
+        await getMajorOrderHistory(env, {
+          major_order_id:
+            typeof args.major_order_id === "number"
+              ? args.major_order_id
+              : undefined,
+          objective_index:
+            typeof args.objective_index === "number"
+              ? args.objective_index
+              : undefined,
+        }),
+      );
     default:
       return null;
   }

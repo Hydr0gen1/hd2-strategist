@@ -160,6 +160,38 @@ the project's definition of done:
     hp_remaining_to_objective + resolution_within_defense_window: false,
     with the convention notes riding the payloads — the retired misread,
     pinned.
+- Stage 8 (`stage8.test.ts`):
+  - `advanceMoSeries`: seeds per-objective series with `{t, progress, target}`;
+    appends only past the 60s guard (cache replays never double-sample);
+    multiple objectives tracked independently; MO TURNOVER — a new id starts
+    a fresh series, the prior MO's series is retained with no point
+    cross-contamination and ages out (stale samples drop, an emptied
+    inactive series disappears); no active MO → carried forward, never
+    wiped; missing progress/target → null in the sample (never 0) while a
+    target of 0 is recorded as observed; non-finite series identity skipped;
+    bounded per series (MAX_MO_SAMPLES, newest survives) and in series count
+    (MAX_MO_SERIES, oldest newest-sample evicted).
+  - `coerceStore` mo section: pre-Stage-8 store round-trips WITHOUT an `mo`
+    key; stored series round-trip; garbage drops without throwing.
+  - **Folded write**: `samplePlanetRates` performs exactly ONE put containing
+    the folded MO series; the batch poll and a `carryForward` probe both
+    preserve the layer; no empty `mo` section is ever written.
+  - `moProgressObservations`: PARITY with `shapeMajorOrders` objectives
+    (progress/target from the SAME `decodeObjectiveTarget` — never a second
+    decode); missing progress/goal slot → null; non-finite assignment id
+    skipped.
+  - `buildMoHistorySeries`: exact consecutive `delta_progress`/`delta_hours`
+    (first point null, null-propagating, negative deltas pass through);
+    `progress_pct` divide-by-zero (target 0/missing) → null; < 2 points →
+    `insufficient_history` with span null; `objective_kind` from the map
+    only (unknown task_type → null label, never fabricated); **prime
+    directive pin** — no forecast/pace/on-track/verdict key anywhere.
+  - `getMajorOrderHistory` handler (KV stub, stage6 pattern): cold start →
+    empty flagged series, zero KV writes, zero fetches; no active MO →
+    flagged not an error, prior MO still queryable by id; default returns
+    only the active MO's series; `objective_index` narrows.
+  - Combined worst-case store INCLUDING max MO series stays far under the
+    5MB KV value limit.
 - Scheduled sampling (`scheduled.test.ts`):
   - The cron `scheduled` handler writes the IDENTICAL merged store a
     request-driven `get_war_status` poll writes (stores compared deep-equal
