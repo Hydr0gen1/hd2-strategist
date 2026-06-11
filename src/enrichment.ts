@@ -555,6 +555,9 @@ export function buildGlobalHistoryPoints(
       terminid_kills: s.terminid_kills,
       automaton_kills: s.automaton_kills,
       illuminate_kills: s.illuminate_kills,
+      // Stage 11: pre-Stage-11 points lack these keys → null (never 0).
+      impact_multiplier: s.impact_multiplier ?? null,
+      active_campaign_count: s.active_campaign_count ?? null,
       delta_hours: prev ? (s.t - prev.t) / MS_PER_HOUR : null,
       delta_player_count: delta(s.player_count, prev?.player_count),
       delta_missions_won: delta(s.missions_won, prev?.missions_won),
@@ -565,6 +568,14 @@ export function buildGlobalHistoryPoints(
       delta_illuminate_kills: delta(
         s.illuminate_kills,
         prev?.illuminate_kills,
+      ),
+      delta_impact_multiplier: delta(
+        s.impact_multiplier ?? null,
+        prev ? (prev.impact_multiplier ?? null) : undefined,
+      ),
+      delta_active_campaign_count: delta(
+        s.active_campaign_count ?? null,
+        prev ? (prev.active_campaign_count ?? null) : undefined,
       ),
     };
   });

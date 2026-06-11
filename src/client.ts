@@ -217,6 +217,11 @@ export async function samplePlanetRates(
     carryForward?: boolean;
     signatures?: SignatureObservation[];
     globalStatistics?: RawStatistics | null;
+    /** Stage 11: raw war-root impactMultiplier + active-campaign count,
+     * co-sampled into the same global point — recorded only when
+     * globalStatistics gates a sample in; absent → null, never 0. */
+    globalImpactMultiplier?: number | null;
+    globalActiveCampaignCount?: number | null;
     moProgress?: MoProgressObservation[];
   } = {},
 ): Promise<Map<number, SampleOutput>> {
@@ -243,6 +248,10 @@ export async function samplePlanetRates(
     store.global,
     opts.globalStatistics ?? null,
     nowMs,
+    {
+      impactMultiplier: opts.globalImpactMultiplier ?? null,
+      activeCampaignCount: opts.globalActiveCampaignCount ?? null,
+    },
   );
   if (global.length > 0) nextStore.global = global;
   // Stage 8: MO progress series — same single write, same carry-forward.

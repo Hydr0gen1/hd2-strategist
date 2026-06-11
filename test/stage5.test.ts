@@ -185,6 +185,9 @@ describe("advanceGlobalSeries: global statistics ring buffer", () => {
         terminid_kills: 1_000,
         automaton_kills: 2_000,
         illuminate_kills: 3_000,
+        // Stage 11: co-sampled extras not supplied here → null, never 0.
+        impact_multiplier: null,
+        active_campaign_count: null,
       },
     ]);
   });

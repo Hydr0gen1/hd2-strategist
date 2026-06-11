@@ -259,6 +259,12 @@ async function loadNormalizedCampaigns(
       // every poll (assignments are always part of this fetch set).
       signatures: signatureObservationsFrom(raw),
       globalStatistics: warRes?.data?.statistics ?? null,
+      // Stage 11: co-sampled into the same global point (gated, like the
+      // statistics, on the war fetch being present). impactMultiplier sits
+      // at the war-payload root (verified live 2026-06-11); the campaign
+      // count is the length of the same campaigns list this poll fetched.
+      globalImpactMultiplier: warRes?.data?.impactMultiplier ?? null,
+      globalActiveCampaignCount: campaignsRes.data ? raw.length : null,
       moProgress: moProgressObservations(assignmentsRes.data ?? []),
     },
   );
@@ -1013,6 +1019,8 @@ export async function getGlobalHistory(env: Env): Promise<unknown> {
     notes: {
       sampling:
         "A lean named subset of upstream war.statistics sampled over time on the Worker clock. A field missing upstream is null at that point, never 0; deltas are null when either end is null. Observed values and raw consecutive differences only — no smoothing, no forecast, no trend verdict.",
+      impact_multiplier:
+        "Stage 11: the raw upstream war.impactMultiplier observed at sample time, with active_campaign_count (campaigns-list length) co-sampled beside it. Points stored before these fields existed read as null — never backfilled. Raw observed series only; any relationship between the multiplier, player count, and campaign count is for the consumer to read off the curves — the server computes no correlation, model, or prediction.",
     },
   };
 }

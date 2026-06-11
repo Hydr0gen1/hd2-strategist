@@ -125,7 +125,12 @@ campaign set must drop and reseed a null rate, as always).
 Stage 5 adds two ACCUMULATION layers inside the same store/key — observed
 campaign signatures (`signatures`, capped at 500 tuples) and the global
 statistics series (`global`, 96 points / 48h, sampled only when the
-get_war_status path supplies `war.statistics`). Both fold into the SAME
+get_war_status path supplies `war.statistics`). Stage 11 co-samples
+`impact_multiplier` (raw war-root `impactMultiplier`) and
+`active_campaign_count` (campaigns-list length) into the same global point —
+same gate, same write, OPTIONAL fields so pre-Stage-11 points read as null
+(never backfilled, never 0); served by get_global_history with raw deltas
+only — no correlation/model/prediction field relating them, ever. Both fold into the SAME
 single per-cycle write (never a second put), and both ALWAYS carry forward —
 `carryForward` semantics apply to planet series/campaign ages only. The
 sections stay absent until they first accrue data, so pre-Stage-5 stores
