@@ -69,6 +69,8 @@ function makeEnriched(over: Partial<EnrichedCampaign> = {}): EnrichedCampaign {
     hp_per_hour: 10_000,
     regen_per_second: 1.5,
     liberation_pct_display_only: 40,
+    win_condition: "raw_hp_to_zero",
+    hp_remaining_to_objective: 600_000,
     direction: "liberating",
     alert: null,
     stabilizing: false,

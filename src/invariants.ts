@@ -96,11 +96,24 @@ export function projectResolution(
  * Direction comes from the sign of the one shared hp_per_hour value
  * (positive = health depleting = progressing toward resolution; negative =
  * health rising = losing ground; see the convention block in client.ts).
+ *
+ * Stage 7: the positive-rate LABEL is objective-relative per campaign kind —
+ * "liberating" on a liberation, "repelling" on a defense. The sign semantics
+ * are identical for both kinds (a successful defense depletes the event
+ * health toward zero — verified live 2026-06-11 on Crimsica/Bore Rock); only
+ * the word changed, because "liberating" on a defense at high event HP
+ * misread as nearly-won when the planet was nearly lost. Negative is
+ * "losing" for both kinds, unchanged. The kind default keeps bare calls
+ * (and all liberation behavior) exactly as before.
  */
-export function directionFromRate(hpPerHour: number | null): Direction {
+export function directionFromRate(
+  hpPerHour: number | null,
+  kind: "liberation" | "defense" = "liberation",
+): Direction {
   if (hpPerHour == null || !Number.isFinite(hpPerHour)) return "unknown";
   if (hpPerHour === 0) return "stalemate";
-  return hpPerHour > 0 ? "liberating" : "losing";
+  if (hpPerHour < 0) return "losing";
+  return kind === "defense" ? "repelling" : "liberating";
 }
 
 /**
@@ -178,7 +191,7 @@ export function normalizeCampaign(
   const hpPerHour = degraded ? null : ctx.hpPerHour;
 
   let signal: TrajectorySignal = {
-    direction: directionFromRate(hpPerHour),
+    direction: directionFromRate(hpPerHour, kind),
     alert: null,
     stabilizing: false,
     hpc: false,
