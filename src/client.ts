@@ -166,6 +166,11 @@ export interface SampleOutput {
   hpPerHour: number | null;
   /** ms since the campaign was first seen by this Worker; null if no id. */
   campaignAgeMs: number | null;
+  /** Stage 9: the planet's retained sample series as of this poll (post-
+   * advance, oldest → newest) — exposed so the campaign path can derive the
+   * historical trend rate from the SAME single KV read this call already
+   * performs, never a second read. Empty when no series is retained. */
+  samples: HealthSample[];
 }
 
 async function readSampleStore(env: Env): Promise<SampleStore> {
@@ -270,7 +275,11 @@ export async function samplePlanetRates(
       campaignAgeMs = nowMs - firstSeen;
     }
 
-    results.set(input.planetIndex, { hpPerHour, campaignAgeMs });
+    results.set(input.planetIndex, {
+      hpPerHour,
+      campaignAgeMs,
+      samples: advanced.series?.samples ?? [],
+    });
   }
 
   if (env.WAR_CACHE) {

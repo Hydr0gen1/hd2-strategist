@@ -19,6 +19,8 @@ import {
 import {
   aggregateFrontRate,
   buildActiveEvents,
+  buildDefenseEtaBlock,
+  buildEtaBlock,
   buildFactionRollup,
   buildGlobalHistoryPoints,
   buildHistoryPoints,
@@ -28,10 +30,12 @@ import {
   buildSectorRollup,
   decayPerHour,
   decodeEventModifier,
+  DEFENSE_ETA_NOTE,
   DEFENSE_WINDOW_NOTE,
   defenseTiming,
   defenseWindowProjection,
   DIRECTION_NOTE,
+  ETA_NOTE,
   filterCampaigns,
   freshnessFrom,
   FRESHNESS_NOTE,
@@ -39,10 +43,13 @@ import {
   hpRemainingToObjective,
   LIBERATION_PCT_NOTE,
   MO_OBJECTIVE_DECODE_NOTE,
+  moIntervalRates,
   moPlanetAssignmentMap,
   moProgressObservations,
+  perIntervalRates,
   RATE_SIGN_NOTE,
   resolvePlanetName,
+  seriesSpanHours,
   selectBiome,
   selectHazards,
   selectPlanetStatistics,
@@ -67,12 +74,16 @@ import {
   MAX_SAMPLE_AGE_MS,
   MAX_SAMPLES_PER_PLANET,
   MAX_SIGNATURES,
+  type HealthSample,
+  type MoObjectiveSeries,
   type SignatureObservation,
 } from "./sampling";
 import type {
   CampaignFilters,
+  DefenseTiming,
   EnrichedCampaign,
   Env,
+  EtaBlock,
   FrontRateAggregate,
   NormalizedCampaign,
   RawAssignment,
@@ -122,6 +133,36 @@ function defenseAgeMs(planet: RawPlanet, nowMs: number): number | null {
   if (!planet.event?.startTime) return null;
   const started = Date.parse(planet.event.startTime);
   return Number.isFinite(started) ? Math.max(0, nowMs - started) : null;
+}
+
+/**
+ * Stage 9: the eta block for one campaign — assembled from facts already in
+ * hand, never a second computation path: the distance is the Stage 7
+ * orientation (hp_remaining_to_objective), the instantaneous rate is THE
+ * sampled hp_per_hour (post data-quality gate, so a degraded record gets
+ * reason no_current_rate like every other projection), and the historical
+ * trend comes from the SAME retained sample series the single KV read
+ * supplied (perIntervalRates — the get_planet_history derivation). A defense
+ * gets the competing-clocks block against its deadline.
+ */
+function campaignEta(
+  normalized: NormalizedCampaign,
+  samples: HealthSample[],
+  timing: DefenseTiming | null,
+): EnrichedCampaign["eta"] {
+  const inputs = {
+    distance: hpRemainingToObjective(normalized.raw_hp),
+    instantaneousRate: normalized.hp_per_hour,
+    intervalRates: perIntervalRates(samples),
+    sampleCount: samples.length,
+    samplesSpanHours: seriesSpanHours(samples),
+  };
+  return timing
+    ? buildDefenseEtaBlock({
+        ...inputs,
+        defenseHoursRemaining: timing.defense_hours_remaining,
+      })
+    : buildEtaBlock(inputs);
 }
 
 interface CampaignBundle {
@@ -193,6 +234,7 @@ async function loadNormalizedCampaigns(
       moPlanetIndices,
     });
     const timing = c.planet.event ? defenseTiming(c.planet.event, nowMs) : null;
+    const eta = campaignEta(normalized, sample?.samples ?? [], timing);
     return {
       ...normalized,
       // Stage 3: unit conversion of the invariant-1 normalized regen (already
@@ -224,6 +266,11 @@ async function loadNormalizedCampaigns(
       // invariant 5 consumes; membership fact, not a priority score.
       is_major_order_target: moMap.has(c.planet.index),
       major_order_id: moMap.get(c.planet.index) ?? null,
+      // Stage 9: dual ETAs (instantaneous + historical) + divergence, from
+      // the SAME signed rate and the SAME retained sample series the single
+      // KV read already supplied. Defenses get competing depletion ETAs vs
+      // the deadline — never a single ETA, never a success prediction.
+      eta,
     };
   });
 
@@ -373,6 +420,8 @@ export async function getCampaigns(
       direction: DIRECTION_NOTE,
       win_condition: WIN_CONDITION_NOTE,
       defense_window: DEFENSE_WINDOW_NOTE,
+      eta: ETA_NOTE,
+      defense_eta: DEFENSE_ETA_NOTE,
       mission_success_rate:
         "Derived per planet as mission_wins / (mission_wins + mission_losses) × 100. Null when no missions are recorded — never 0.",
       defense_hours_remaining:
@@ -394,8 +443,41 @@ export async function getCampaigns(
   };
 }
 
+/**
+ * Stage 9: the dual-ETA block for one Major Order objective. Distance =
+ * target − progress (the decoded Stage 7 values, clamped at 0 — progress
+ * counts UP toward the target, so smaller distance = closer, the same
+ * orientation discipline as hp_remaining_to_objective). The instantaneous
+ * rate is the LATEST observed per-interval delta of the Stage 8 series; the
+ * historical rate is the mean across the retained window — both from the
+ * same observed points get_major_order_history serves, never a parallel
+ * derivation. No series / a cold start → null ETAs with reasons.
+ */
+function moObjectiveEta(
+  progress: number | null,
+  target: number | null,
+  series: MoObjectiveSeries | undefined,
+): EtaBlock {
+  const samples = series?.samples ?? [];
+  const rates = moIntervalRates(samples);
+  return buildEtaBlock({
+    distance:
+      progress != null && target != null ? Math.max(0, target - progress) : null,
+    instantaneousRate: rates.length > 0 ? rates[rates.length - 1]! : null,
+    intervalRates: rates,
+    sampleCount: samples.length,
+    samplesSpanHours: seriesSpanHours(samples),
+  });
+}
+
 export async function getMajorOrder(env: Env): Promise<unknown> {
-  const res = await fetchUpstream<RawAssignment[]>(env, "/api/v1/assignments");
+  // Stage 9: the retained MO progress series joins the assignment fetch so
+  // each objective can carry its dual ETAs. Read-only on the sample store —
+  // one KV read, zero writes (the get_major_order_history discipline).
+  const [res, moSeries] = await Promise.all([
+    fetchUpstream<RawAssignment[]>(env, "/api/v1/assignments"),
+    readMoSeries(env),
+  ]);
   const assignments = res.data ?? [];
   const freshness = freshnessFrom([res.fetchedAt], Date.now());
   if (assignments.length === 0) {
@@ -409,9 +491,25 @@ export async function getMajorOrder(env: Env): Promise<unknown> {
 
   return {
     active: true,
-    major_orders: shapeMajorOrders(assignments, Date.now()),
+    major_orders: shapeMajorOrders(assignments, Date.now()).map((order) => ({
+      ...order,
+      objectives: order.objectives.map((objective) => ({
+        ...objective,
+        // Stage 9: additive eta beside the untouched decode fields.
+        eta: moObjectiveEta(
+          objective.progress,
+          objective.target,
+          moSeries.find(
+            (s) =>
+              s.major_order_id === order.id &&
+              s.objective_index === objective.index,
+          ),
+        ),
+      })),
+    })),
     notes: {
       objectives: MO_OBJECTIVE_DECODE_NOTE,
+      eta: ETA_NOTE,
       freshness: FRESHNESS_NOTE,
     },
     ...freshness,
@@ -499,6 +597,7 @@ export async function getPlanet(
   );
 
   let normalized: NormalizedCampaign;
+  let probeSamples: HealthSample[] = [];
   if (active) {
     normalized = active;
   } else {
@@ -520,6 +619,7 @@ export async function getPlanet(
       { carryForward: true },
     );
     const sample = samples.get(planet.index);
+    probeSamples = sample?.samples ?? [];
     normalized = normalizeCampaign(
       { id: -1, planet, type: 0, count: 0, faction: planet.currentOwner },
       {
@@ -534,6 +634,10 @@ export async function getPlanet(
   // Stage 7: defense timing computed once so the Part B window projection
   // derives from the same clamped hours value the payload itself carries.
   const timing = planet.event ? defenseTiming(planet.event, Date.now()) : null;
+
+  // Stage 9: the campaign's own eta block when one is active (computed once
+  // in the loader — never recomputed); otherwise from the probe's series.
+  const eta = active ? active.eta : campaignEta(normalized, probeSamples, timing);
 
   return {
     planet_index: planet.index,
@@ -587,6 +691,9 @@ export async function getPlanet(
           hoursToResolution: normalized.hours_to_resolution,
         })
       : {}),
+    // Stage 9: dual ETAs + divergence (competing depletion ETAs vs the
+    // deadline on a defense) — projections under stated assumptions only.
+    eta,
     player_count: planet.statistics?.playerCount ?? null,
     statistics: selectPlanetStatistics(planet.statistics),
     biome: selectBiome(planet.biome),
@@ -607,6 +714,8 @@ export async function getPlanet(
       win_condition: WIN_CONDITION_NOTE,
       liberation_pct_display_only: LIBERATION_PCT_NOTE,
       defense_window: DEFENSE_WINDOW_NOTE,
+      eta: ETA_NOTE,
+      defense_eta: DEFENSE_ETA_NOTE,
       neighbors:
         "Upstream's own waypoints array for this planet, in upstream order — joined by index against the full planets list and the active campaign set, never symmetrized or rerouted (direction semantics are upstream's). A dangling index still counts in neighbor_summary.total with name/owner null, tallied under by_owner.unknown.",
       frontline:
@@ -870,7 +979,16 @@ export async function getMajorOrderHistory(
         a.major_order_id - b.major_order_id ||
         a.objective_index - b.objective_index,
     )
-    .map((s) => buildMoHistorySeries(s));
+    .map((s) => {
+      // Stage 9: eta rides BESIDE the untouched observed-series shape —
+      // distance from the series' own latest progress/target, rates from the
+      // same retained points the samples array shows (verifiable in place).
+      const shaped = buildMoHistorySeries(s);
+      return {
+        ...shaped,
+        eta: moObjectiveEta(shaped.latest_progress, shaped.target, s),
+      };
+    });
 
   let note: string | undefined;
   if (series.length === 0) {
@@ -917,6 +1035,7 @@ export async function getMajorOrderHistory(
         "latest_progress / target × 100, from the newest sample — deterministic; null when the target is 0 or unknown or progress is unknown (never a divide-by-zero, never a fabricated denominator).",
       objective_kind:
         "Decoded from the stored raw task_type only for enum values confirmed against live Major Orders (TASK_TYPE_NAMES); an unconfirmed type keeps its raw number with objective_kind null — a name is never fabricated.",
+      eta: ETA_NOTE,
       turnover:
         "Series are keyed by major_order_id + objective_index, each objective tracked independently. When a Major Order is replaced, its series stop accruing but remain queryable by major_order_id until they age out; the new MO starts fresh series — points are never mixed across MO ids.",
       freshness: FRESHNESS_NOTE,

@@ -265,6 +265,13 @@ export interface EnrichedCampaign
   /** Stage 5: id of the first assignment whose task list names this planet
    * (upstream array order), null when the planet is in no MO task. */
   major_order_id: number | null;
+  /** Stage 9: dual ETAs (instantaneous + historical) toward this campaign's
+   * win state, with divergence. Liberation campaigns carry EtaBlock; defense
+   * campaigns carry DefenseEtaBlock (competing depletion ETAs vs the
+   * deadline — never a success prediction). Optional in the TYPE only so
+   * pre-Stage-9 fixtures keep compiling; the campaign loader always emits
+   * it. */
+  eta?: EtaBlock | DefenseEtaBlock;
 }
 
 /** Stage 3: per-front sum of the signed per-campaign hp_per_hour values —
@@ -562,6 +569,97 @@ export interface MoHistorySeries {
   progress_pct: number | null;
   samples_span_hours: number | null;
   insufficient_history: boolean;
+}
+
+/* --------------------------- Stage 9 outputs --------------------------- */
+
+/** Stage 9: machine-readable reason a projection is null. Every null ETA
+ * carries one — the consumer can say WHY there is no estimate, not just that
+ * there isn't one. A confident number faked from too little data would be
+ * worse than no number. */
+export type EtaReason =
+  /** No current rate exists yet (cold start / fewer than two samples >60s
+   * apart) — the same condition under which hp_per_hour itself is null. */
+  | "no_current_rate"
+  /** The rate is exactly 0 — no movement at the assumed rate, never a
+   * divide-by-zero, never Infinity. */
+  | "stalemate"
+  /** The retained history series has too few points (< 2, the same
+   * threshold the history tools flag as insufficient_history). */
+  | "insufficient_history"
+  /** The distance to the objective is unknown (missing HP / progress /
+   * target) — never substituted with 0. */
+  | "unknown_distance";
+
+/** Stage 9: deterministic comparison of the instantaneous and historical
+ * rates. This is arithmetic — "the two rates disagree by X" — explicitly NOT
+ * a regime-change verdict; inferring WHY they disagree (a city fell, players
+ * redeployed) is the consumer's. Null when either rate is null (one number
+ * cannot be compared to nothing). */
+export interface RateDivergence {
+  /** |instantaneous_rate − historical_rate|. */
+  abs_diff: number;
+  /** abs_diff / max(|instantaneous|, |historical|) × 100 — a symmetric
+   * relative measure; 0 when both rates are 0 (abs_diff is then 0 too). */
+  pct_diff: number;
+  /** pct_diff ≥ RATE_DIVERGENCE_THRESHOLD_PCT — a documented arithmetic
+   * threshold, not a judgment. */
+  diverging: boolean;
+}
+
+/** Stage 9: dual ETAs toward an objective — both projections presented with
+ * their assumptions, side by side. The server never picks the "right" one:
+ * the instantaneous ETA reacts to a regime change but is noisy; the
+ * historical ETA is stable but lags. Their divergence is itself information
+ * the consumer reads. ETA hours = distance ÷ |rate| (the invariant-3
+ * magnitude convention — direction carries the sign elsewhere); a positive
+ * ETA = time until the objective is reached at that assumed rate. */
+export interface EtaBlock {
+  /** distance ÷ |instantaneous_rate| — reacts immediately, noisy. */
+  eta_instantaneous_hours: number | null;
+  /** The signed current rate used (hp_per_hour for campaigns, the latest
+   * observed progress delta per hour for MO objectives). */
+  instantaneous_rate: number | null;
+  eta_instantaneous_reason: EtaReason | null;
+  /** distance ÷ |historical_rate| — stable, lags after a regime change. */
+  eta_historical_hours: number | null;
+  /** Unweighted mean of the per-interval observed rates over the retained
+   * history window (the same rate_mean convention as get_planet_history). */
+  historical_rate: number | null;
+  eta_historical_reason: EtaReason | null;
+  /** Points in the retained history series the historical rate is built on. */
+  sample_count: number;
+  samples_span_hours: number | null;
+  /** Observed spread (max − min) of the per-interval rates — a variance
+   * fact, NOT a confidence score. Null with fewer than two interval rates. */
+  rate_stability: number | null;
+  rate_divergence: RateDivergence | null;
+}
+
+/** Stage 9: a defense's competing clocks, side by side — NEVER a success
+ * prediction. Both depletion ETAs (the dual model on the event health) are
+ * presented against the fixed deadline; the deterministic comparison is
+ * exposed against EACH rate, labeled. Calling the winner of the race is a
+ * verdict and is deliberately absent. */
+export interface DefenseEtaBlock {
+  depletion_eta_instantaneous_hours: number | null;
+  instantaneous_rate: number | null;
+  depletion_eta_instantaneous_reason: EtaReason | null;
+  depletion_eta_historical_hours: number | null;
+  historical_rate: number | null;
+  depletion_eta_historical_reason: EtaReason | null;
+  sample_count: number;
+  samples_span_hours: number | null;
+  rate_stability: number | null;
+  rate_divergence: RateDivergence | null;
+  /** The fixed deadline, echoed for co-location with the two ETAs racing it. */
+  defense_hours_remaining: number | null;
+  /** depletion_eta_instantaneous_hours ≤ defense_hours_remaining — the Stage 7
+   * comparison evaluated against the INSTANTANEOUS rate; null when that ETA
+   * or the window is null. */
+  resolution_within_defense_window_instantaneous: boolean | null;
+  /** The same comparison evaluated against the HISTORICAL rate. */
+  resolution_within_defense_window_historical: boolean | null;
 }
 
 /** Worker environment bindings. */

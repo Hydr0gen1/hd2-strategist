@@ -5,7 +5,7 @@ Module boundaries are strict; respect them when editing:
 | File | Role | Boundary rule |
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
-| `enrichment.ts` | Stage 1+2+4+5+6+7 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups), Stage 6 consumption helpers (MO shaping, freshness metadata, planet-name resolution, campaign filters, brief target/event assembly), Stage 7 objective framing (`winCondition` / `hpRemainingToObjective` / `defenseWindowProjection`, the MO objective decode maps `TASK_TYPE_NAMES`/`TASK_VALUE_TYPE_NAMES`, and the inline-convention note constants), Stage 8 MO progress history (`moProgressObservations`, `buildMoHistorySeries`, the shared `decodeObjectiveTarget`/`objectiveProgressPct` decode) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `enrichment.ts` | Stage 1+2+4+5+6+7 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups), Stage 6 consumption helpers (MO shaping, freshness metadata, planet-name resolution, campaign filters, brief target/event assembly), Stage 7 objective framing (`winCondition` / `hpRemainingToObjective` / `defenseWindowProjection`, the MO objective decode maps `TASK_TYPE_NAMES`/`TASK_VALUE_TYPE_NAMES`, and the inline-convention note constants), Stage 8 MO progress history (`moProgressObservations`, `buildMoHistorySeries`, the shared `decodeObjectiveTarget`/`objectiveProgressPct` decode), Stage 9 dual ETAs (`buildEtaBlock`/`buildDefenseEtaBlock`, `rateDivergence`, `perIntervalRates`/`moIntervalRates`) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
 | `wiki.ts` | Stage 4 LORE source, pure half: wiki query plan (title candidates, one multi-title request), response shaping, extract cap, mandatory attribution | **Pure. Zero I/O. SEPARATE source** — never imports from or feeds into the live war-state pipeline; no live war number in any output. |
 | `wikiClient.ts` | Stage 4 LORE source, I/O half: helldivers.wiki.gg fetch (descriptive User-Agent) + long-TTL KV cache in the `wiki:` namespace with stale fallback | Deliberately separate from `client.ts`. Injectable fetch for tests. Never touches `raw:`/`samples:` keys. |
 | `sampling.ts` | Pure sample-store logic: the bounded planet ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants, the Stage 5 accumulation layers (`foldSignatures`, `advanceGlobalSeries`), and the Stage 8 Major Order progress series (`advanceMoSeries`) | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
@@ -61,6 +61,32 @@ Defense campaigns add `projected_hp_at_defense_end` /
 `resolution_within_defense_window` (`defenseWindowProjection`) — comparisons
 of co-located numbers from the SAME signed rate, never success predictions,
 both null without a rate.
+
+## Stage 9 ETA rules (projections under transparency, never a pick)
+
+ETAs are the ONE permitted class of derived number, and only as a dual:
+`eta_instantaneous_hours` (distance ÷ |current rate| — reactive, noisy) and
+`eta_historical_hours` (distance ÷ |trend rate|, the unweighted mean of the
+per-interval observed rates — stable, lags a regime change), both presented
+with their assumptions; the server NEVER picks one, predicts success/failure,
+or says on-track/behind. Reuse rules: distance = the Stage 7 orientation
+(`hp_remaining_to_objective`; `target − progress` for MO objectives); the
+campaign instantaneous rate IS the sampled `hp_per_hour` (liberation
+`eta_instantaneous_hours` equals `hours_to_resolution` exactly — pinned);
+historical rates come from `perIntervalRates` (the get_planet_history
+derivation, extracted — never a parallel path) over the series the existing
+single KV read already supplies (`SampleOutput.samples`), or from the Stage 8
+MO series via `moIntervalRates` (latest delta = instantaneous). ETAs take the
+rate's MAGNITUDE (invariant-3 convention); the signed rate rides alongside.
+`rate_divergence` (abs/pct/`diverging` ≥ 50%) and `rate_stability` (max −
+min) are documented as arithmetic/observed spread — never confidence or
+regime verdicts. Defenses carry COMPETING clocks (`depletion_eta_*` vs the
+deadline, the window comparison evaluated against each rate, labeled) and no
+success/fail field, key-name pinned. Every null ETA carries a machine-
+readable `reason` (`no_current_rate` / `insufficient_history` / `stalemate` /
+`unknown_distance`); rate 0 is a stalemate reason, never a divide-by-zero or
+Infinity. `get_major_order` gained one read-only KV read for the series;
+write budget unchanged everywhere.
 
 ## Stage 4 source-separation rule (live vs lore)
 
