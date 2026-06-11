@@ -192,6 +192,40 @@ the project's definition of done:
     only the active MO's series; `objective_index` narrows.
   - Combined worst-case store INCLUDING max MO series stays far under the
     5MB KV value limit.
+- Stage 9 (`stage9.test.ts`):
+  - `perIntervalRates` IS the `historyRateAggregates` derivation (parity-
+    pinned — never a parallel path); non-positive Δt pairs skipped.
+    `moIntervalRates`: progress counts UP, positive = progressing; null-
+    progress pairs skipped (missing is never 0).
+  - `buildEtaBlock` on a known fixture: eta_instantaneous = distance ÷
+    |current rate|, eta_historical = distance ÷ mean of interval rates;
+    negative rates project by MAGNITUDE with the signed rate carried
+    alongside; `rate_stability` = exact max − min spread (null below two
+    rates).
+  - Thin-history honesty: no current rate → null + `no_current_rate`;
+    < 2 points → null + `insufficient_history`; rate 0 (either path) →
+    null + `stalemate` with every numeric field finite (no divide-by-zero,
+    no Infinity); unknown distance → null + `unknown_distance` while the
+    observed rates stay reported. Every null ETA has a reason; every
+    computed ETA has none.
+  - `rateDivergence`: exact abs/pct (symmetric over max(|a|,|b|)); null when
+    EITHER rate is null; both-zero → pct 0, no division; `diverging` flips
+    exactly at the documented threshold.
+  - `buildDefenseEtaBlock`: both depletion ETAs computed; the window
+    comparison evaluated against EACH rate independently (a fast current
+    rate flips only the instantaneous column); null ETAs/window → null
+    comparisons; Stage 7 orientation preserved (high event HP = LARGE
+    depletion ETA); **key-name pin** — no success/fail/outcome/predict/
+    verdict key anywhere in the block.
+  - End-to-end (KV stub, stage6 pattern): liberation
+    `eta_instantaneous_hours` === `hours_to_resolution` (one projection
+    source); the defense block agrees with the Stage 7
+    `resolution_within_defense_window`; cold start → reasons; getCampaigns
+    still performs exactly one `samples:planets` put; getMajorOrder /
+    getMajorOrderHistory stay at ZERO KV writes; the MO eta uses the latest
+    delta (instantaneous) and series mean (historical) with the
+    (target − progress) numerator, and rides BESIDE the byte-identical
+    Stage 8 series shape.
 - Scheduled sampling (`scheduled.test.ts`):
   - The cron `scheduled` handler writes the IDENTICAL merged store a
     request-driven `get_war_status` poll writes (stores compared deep-equal

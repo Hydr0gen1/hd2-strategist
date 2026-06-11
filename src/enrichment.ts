@@ -9,6 +9,7 @@ import type {
   HealthSample,
   MoObjectiveSeries,
   MoProgressObservation,
+  MoProgressSample,
   ObservedSignature,
 } from "./sampling";
 import type {
@@ -45,6 +46,10 @@ import type {
   RawStatistics,
   RawSteamNews,
   SectorRollup,
+  DefenseEtaBlock,
+  EtaBlock,
+  EtaReason,
+  RateDivergence,
   WarBriefEvent,
   WarBriefTarget,
   WinCondition,
@@ -505,13 +510,7 @@ export function buildNeighbors(
 export function historyRateAggregates(
   samples: HealthSample[],
 ): HistoryRateAggregates {
-  const rates: number[] = [];
-  for (let i = 1; i < samples.length; i++) {
-    const prev = samples[i - 1]!;
-    const cur = samples[i]!;
-    const hours = (cur.t - prev.t) / MS_PER_HOUR;
-    if (hours > 0) rates.push((prev.h - cur.h) / hours);
-  }
+  const rates = perIntervalRates(samples);
   const first = samples[0];
   const last = samples[samples.length - 1];
   return {
@@ -1253,3 +1252,228 @@ export function buildMoHistorySeries(
     insufficient_history: insufficient,
   };
 }
+
+/* ----------------------------- Stage 9 -------------------------------- */
+
+/**
+ * Stage 9: per-interval observed rates over a retained health series, in the
+ * hp_per_hour sign convention from client.ts — (previous.health −
+ * current.health) / hoursElapsed, positive = progressing. Extracted from
+ * historyRateAggregates (which now calls it) so the Stage 9 historical trend
+ * rate is by construction the SAME per-interval rates get_planet_history
+ * aggregates — one derivation, never a parallel path. Pairs with a
+ * non-positive time delta are skipped, never divided.
+ */
+export function perIntervalRates(samples: HealthSample[]): number[] {
+  const rates: number[] = [];
+  for (let i = 1; i < samples.length; i++) {
+    const prev = samples[i - 1]!;
+    const cur = samples[i]!;
+    const hours = (cur.t - prev.t) / MS_PER_HOUR;
+    if (hours > 0) rates.push((prev.h - cur.h) / hours);
+  }
+  return rates;
+}
+
+/**
+ * Stage 9: per-interval observed progress rates over a retained Major Order
+ * objective series — (current.progress − previous.progress) / hoursElapsed.
+ * MO progress counts UP toward its target, so positive = progressing toward
+ * the objective (the same objective-relative orientation as a positive
+ * hp_per_hour, even though the underlying counter runs the other way). A
+ * pair where either progress is null (missing upstream — never treated as
+ * 0) or the time delta is non-positive is skipped, never divided. The
+ * LATEST entry of this array is the "most recent observed MO delta" the
+ * instantaneous MO ETA uses — the same latest-pair semantics as
+ * get_planet_history's latest_rate.
+ */
+export function moIntervalRates(samples: MoProgressSample[]): number[] {
+  const rates: number[] = [];
+  for (let i = 1; i < samples.length; i++) {
+    const prev = samples[i - 1]!;
+    const cur = samples[i]!;
+    const hours = (cur.t - prev.t) / MS_PER_HOUR;
+    if (hours > 0 && prev.progress != null && cur.progress != null) {
+      rates.push((cur.progress - prev.progress) / hours);
+    }
+  }
+  return rates;
+}
+
+/** Stage 9: span of a retained series in hours — null below the existing
+ * insufficient_history threshold (< 2 points), like every history surface. */
+export function seriesSpanHours(
+  samples: ReadonlyArray<{ t: number }>,
+): number | null {
+  if (samples.length < 2) return null;
+  return (samples[samples.length - 1]!.t - samples[0]!.t) / MS_PER_HOUR;
+}
+
+/**
+ * Stage 9: the documented arithmetic threshold for rate_divergence.diverging
+ * — pct_diff at or above this marks the two rates as disagreeing strongly.
+ * A constant comparison, not a judgment: WHY they disagree (regime change,
+ * noise) is the consumer's inference.
+ */
+export const RATE_DIVERGENCE_THRESHOLD_PCT = 50;
+
+/**
+ * Stage 9: deterministic comparison of the instantaneous and historical
+ * rates — "the two rates disagree by X", nothing more. pct_diff is symmetric
+ * (abs_diff / max(|a|,|b|) × 100) so neither rate is privileged as the
+ * baseline; when both rates are 0 the difference is 0 and pct_diff is 0 —
+ * never a divide-by-zero. Null when either rate is null: one number cannot
+ * be compared to nothing.
+ */
+export function rateDivergence(
+  instantaneous: number | null,
+  historical: number | null,
+): RateDivergence | null {
+  if (
+    instantaneous == null ||
+    !Number.isFinite(instantaneous) ||
+    historical == null ||
+    !Number.isFinite(historical)
+  ) {
+    return null;
+  }
+  const absDiff = Math.abs(instantaneous - historical);
+  const denom = Math.max(Math.abs(instantaneous), Math.abs(historical));
+  const pctDiff = denom > 0 ? (absDiff / denom) * 100 : 0;
+  return {
+    abs_diff: absDiff,
+    pct_diff: pctDiff,
+    diverging: pctDiff >= RATE_DIVERGENCE_THRESHOLD_PCT,
+  };
+}
+
+/** ETA arithmetic shared by both projections: distance ÷ |rate| — the
+ * invariant-3 magnitude convention (the rate's SIGN is carried by direction
+ * / the signed rate field beside the ETA, never re-encoded here). The
+ * callers guard null/zero before reaching this. */
+function etaHours(distance: number, rate: number): number {
+  return distance / Math.abs(rate);
+}
+
+interface EtaInputs {
+  /** Distance to the win state in the objective's own units — the Stage 7
+   * orientation (hp_remaining_to_objective for campaigns, target − progress
+   * for MO objectives): always ≥ 0, smaller = closer. Null when unknown. */
+  distance: number | null;
+  /** The signed current rate — hp_per_hour for campaigns (the ONE sampled
+   * rate), the latest observed per-interval delta for MO objectives. */
+  instantaneousRate: number | null;
+  /** Per-interval observed rates over the retained history window
+   * (perIntervalRates / moIntervalRates output). */
+  intervalRates: ReadonlyArray<number>;
+  /** Points in the retained series the interval rates derive from. */
+  sampleCount: number;
+  samplesSpanHours: number | null;
+}
+
+/**
+ * Stage 9: the dual-ETA block — BOTH projections with their assumptions,
+ * plus their divergence. The server never picks one, never predicts
+ * success/failure, never says on-track/behind; the consumer interprets:
+ *
+ * - instantaneous: distance ÷ |current rate| — reacts immediately to a
+ *   regime change (a city falls, players redeploy) but is noisy. Null with
+ *   reason no_current_rate (cold start / <2 samples) or stalemate (rate 0 —
+ *   never divide-by-zero, never Infinity).
+ * - historical: distance ÷ |trend rate| where the trend rate is the
+ *   unweighted mean of the per-interval observed rates (the SAME rate_mean
+ *   convention as get_planet_history). Stable but LAGS right after a regime
+ *   change. Null with reason insufficient_history below the existing <2
+ *   points threshold, or stalemate on a 0 mean.
+ * - rate_stability = max − min of the interval rates: observed spread, a
+ *   variance fact — NOT a confidence score. rate_divergence: see
+ *   rateDivergence. Unknown distance → both ETAs null, reason
+ *   unknown_distance — never substituted with 0.
+ */
+export function buildEtaBlock(args: EtaInputs): EtaBlock {
+  const distance =
+    args.distance != null && Number.isFinite(args.distance)
+      ? Math.max(0, args.distance)
+      : null;
+  const instantaneous = finiteOrNull(args.instantaneousRate);
+  const rates = args.intervalRates.filter((r) => Number.isFinite(r));
+  const historical =
+    rates.length > 0
+      ? rates.reduce((sum, r) => sum + r, 0) / rates.length
+      : null;
+
+  let etaInstantaneous: number | null = null;
+  let instantaneousReason: EtaReason | null = null;
+  if (distance == null) instantaneousReason = "unknown_distance";
+  else if (instantaneous == null) instantaneousReason = "no_current_rate";
+  else if (instantaneous === 0) instantaneousReason = "stalemate";
+  else etaInstantaneous = etaHours(distance, instantaneous);
+
+  let etaHistorical: number | null = null;
+  let historicalReason: EtaReason | null = null;
+  if (distance == null) historicalReason = "unknown_distance";
+  else if (historical == null) historicalReason = "insufficient_history";
+  else if (historical === 0) historicalReason = "stalemate";
+  else etaHistorical = etaHours(distance, historical);
+
+  return {
+    eta_instantaneous_hours: etaInstantaneous,
+    instantaneous_rate: instantaneous,
+    eta_instantaneous_reason: instantaneousReason,
+    eta_historical_hours: etaHistorical,
+    historical_rate: historical,
+    eta_historical_reason: historicalReason,
+    sample_count: args.sampleCount,
+    samples_span_hours: args.samplesSpanHours,
+    rate_stability:
+      rates.length >= 2 ? Math.max(...rates) - Math.min(...rates) : null,
+    rate_divergence: rateDivergence(instantaneous, historical),
+  };
+}
+
+/**
+ * Stage 9: a defense's competing clocks — the dual depletion ETAs (the same
+ * model as buildEtaBlock, over the event health) presented BESIDE the fixed
+ * deadline, with the Stage 7 deterministic window comparison evaluated
+ * against EACH rate and labeled which one it used. The race between the
+ * depletion ETAs and the deadline IS the information; no single ETA, no
+ * success/failure flag — calling the winner is a verdict and stays out.
+ */
+export function buildDefenseEtaBlock(
+  args: EtaInputs & { defenseHoursRemaining: number | null },
+): DefenseEtaBlock {
+  const base = buildEtaBlock(args);
+  const windowKnown =
+    args.defenseHoursRemaining != null &&
+    Number.isFinite(args.defenseHoursRemaining);
+  const withinWindow = (eta: number | null): boolean | null =>
+    eta != null && windowKnown ? eta <= args.defenseHoursRemaining! : null;
+  return {
+    depletion_eta_instantaneous_hours: base.eta_instantaneous_hours,
+    instantaneous_rate: base.instantaneous_rate,
+    depletion_eta_instantaneous_reason: base.eta_instantaneous_reason,
+    depletion_eta_historical_hours: base.eta_historical_hours,
+    historical_rate: base.historical_rate,
+    depletion_eta_historical_reason: base.eta_historical_reason,
+    sample_count: base.sample_count,
+    samples_span_hours: base.samples_span_hours,
+    rate_stability: base.rate_stability,
+    rate_divergence: base.rate_divergence,
+    defense_hours_remaining: windowKnown ? args.defenseHoursRemaining : null,
+    resolution_within_defense_window_instantaneous: withinWindow(
+      base.eta_instantaneous_hours,
+    ),
+    resolution_within_defense_window_historical: withinWindow(
+      base.eta_historical_hours,
+    ),
+  };
+}
+
+/** Stage 9: the dual-ETA model, stated inline on every payload that carries
+ * an eta block — projections under transparent assumptions, never a pick. */
+export const ETA_NOTE =
+  "eta presents TWO projections of time-to-objective, side by side, with their assumptions: eta_instantaneous_hours = distance ÷ |current rate| (reacts immediately to a rate change, noisy) and eta_historical_hours = distance ÷ |trend rate| (the unweighted mean of per-interval observed rates over the retained history window — stable, but lags right after a rate change). Neither is 'the' ETA and this server never picks one. rate_divergence states by how much the two rates disagree (abs_diff; pct_diff = abs_diff / max(|rates|) × 100; diverging = pct_diff ≥ 50) — arithmetic only: strong disagreement is consistent with a recent rate regime change, but that inference is the consumer's. rate_stability = max − min of the per-interval rates: observed spread, not a confidence score. A null ETA always carries a machine-readable reason (no_current_rate, insufficient_history, stalemate, unknown_distance) — a rate of 0 yields a stalemate reason, never a divide-by-zero or Infinity. ETAs use the rate's magnitude (the invariant-3 convention); the signed rate rides alongside and direction stays the sole carrier of progressing-vs-losing.";
+
+/** Stage 9: the defense competing-clocks framing, stated inline. */
+export const DEFENSE_ETA_NOTE =
+  "Defense campaigns carry COMPETING clocks, never a prediction: depletion_eta_instantaneous_hours / depletion_eta_historical_hours (time to deplete the event health to the win state, computed under each rate assumption — defenses regime-change hard when reinforcements arrive or leave, so both matter) versus defense_hours_remaining (the fixed deadline, echoed for co-location). resolution_within_defense_window_instantaneous / _historical evaluate the Stage 7 comparison (depletion ETA ≤ deadline) against each rate, labeled which one was used. The race between the depletion ETAs and the deadline IS the information; no success/failure field exists by design — calling the winner is the consumer's judgment.";
