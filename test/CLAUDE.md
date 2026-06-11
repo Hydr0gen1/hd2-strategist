@@ -226,6 +226,22 @@ the project's definition of done:
     delta (instantaneous) and series mean (historical) with the
     (target − progress) numerator, and rides BESIDE the byte-identical
     Stage 8 series shape.
+- Stage 11 (`stage11.test.ts`):
+  - `advanceGlobalSeries` extras: `impact_multiplier` / `active_campaign_count`
+    recorded on a sampled point; absent/null/non-finite → null, never 0;
+    extras never create a sample alone (the stats gate and 60s guard are
+    unchanged).
+  - Back-compat: pre-Stage-11 global points coerce with both new fields null
+    — never backfilled; new-shape points round-trip intact.
+  - **Folded write**: the extras ride the existing single `samples:planets`
+    put; a later poll without them appends nulls, never 0.
+  - `buildGlobalHistoryPoints`: exact `delta_impact_multiplier` /
+    `delta_active_campaign_count`, null-propagating, negative deltas pass
+    through; full series with the new fields stays far under the KV limit.
+  - Handlers (KV stub): `get_war_status` exposes the current raw
+    `impact_multiplier`; `get_global_history` serves the new fields read-only
+    with a **prime-directive key-name pin** — no correlation/regression/
+    forecast/model/formula key anywhere.
 - Scheduled sampling (`scheduled.test.ts`):
   - The cron `scheduled` handler writes the IDENTICAL merged store a
     request-driven `get_war_status` poll writes (stores compared deep-equal

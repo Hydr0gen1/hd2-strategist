@@ -44,7 +44,14 @@ export interface ObservedSignature extends SignatureObservation {
 }
 
 /** Stage 5: one retained global war-statistics sample — a lean named subset
- * of upstream `war.statistics`. Missing fields are null, never 0. */
+ * of upstream `war.statistics`. Missing fields are null, never 0.
+ *
+ * Stage 11 adds two co-sampled fields from the SAME war/campaigns fetch:
+ * `impact_multiplier` (raw upstream `war.impactMultiplier`, war-payload root
+ * — verified live 2026-06-11) and `active_campaign_count` (length of the
+ * campaigns list at sample time). Both are OPTIONAL: points stored before
+ * Stage 11 lack them and read as null — never backfilled, never 0. Raw
+ * observed values only; no field relating them is ever computed. */
 export interface GlobalSample {
   t: number;
   player_count: number | null;
@@ -54,6 +61,8 @@ export interface GlobalSample {
   terminid_kills: number | null;
   automaton_kills: number | null;
   illuminate_kills: number | null;
+  impact_multiplier?: number | null;
+  active_campaign_count?: number | null;
 }
 
 /** Stage 8: one observed Major Order objective-progress sample. `progress`
@@ -112,8 +121,9 @@ export const MIN_SAMPLE_INTERVAL_MS = 60_000;
  * cover ~1.6h of continuous polling; under typical sporadic MCP use the 48h
  * age cap is the binding limit. Worst-case serialized size: ~261 planets ×
  * 96 samples × ~35 bytes ≈ 0.9 MB; the Stage 5 accumulation layers add at
- * most ~500 signatures × ~120 B ≈ 60 KB and 96 global samples × ~150 B ≈
- * 15 KB — combined still far under the 5 MB KV value limit (asserted in
+ * most ~500 signatures × ~120 B ≈ 60 KB and 96 global samples × ~220 B ≈
+ * 22 KB (incl. the Stage 11 impact_multiplier / active_campaign_count
+ * fields) — combined still far under the 5 MB KV value limit (asserted in
  * test/stage2.test.ts and test/stage5.test.ts). Note the store KEY carries
  * a 30-day KV TTL refreshed on every write (client.ts) — long enough that
  * the accumulated signature record survives gaps in usage, while a truly
@@ -225,6 +235,9 @@ function coerceGlobalEntry(entry: unknown): GlobalSample | undefined {
     terminid_kills: numberOrNull(e.terminid_kills),
     automaton_kills: numberOrNull(e.automaton_kills),
     illuminate_kills: numberOrNull(e.illuminate_kills),
+    // Stage 11: pre-Stage-11 points lack these keys → null, never backfilled.
+    impact_multiplier: numberOrNull(e.impact_multiplier),
+    active_campaign_count: numberOrNull(e.active_campaign_count),
   };
 }
 
@@ -463,11 +476,20 @@ export function foldSignatures(
  *   sampler); each field is recorded as a finite number or null — never 0.
  * - bounded like the planet series: MAX_SAMPLE_AGE_MS age eviction, then
  *   the newest MAX_GLOBAL_SAMPLES points (newest always survives).
+ *
+ * Stage 11: `extras` co-samples the raw war-root `impactMultiplier` and the
+ * active-campaign count from the SAME poll cycle; an absent value is null at
+ * that point, never 0, never fabricated. The append gate is unchanged
+ * (stats presence + the 60s guard) — extras never create a sample alone.
  */
 export function advanceGlobalSeries(
   existing: GlobalSample[] | undefined,
   stats: RawStatistics | null | undefined,
   nowMs: number,
+  extras: {
+    impactMultiplier?: number | null;
+    activeCampaignCount?: number | null;
+  } = {},
 ): GlobalSample[] {
   const series = existing ?? [];
   if (stats == null) return series;
@@ -485,6 +507,8 @@ export function advanceGlobalSeries(
       terminid_kills: finiteOrNull(stats.terminidKills),
       automaton_kills: finiteOrNull(stats.automatonKills),
       illuminate_kills: finiteOrNull(stats.illuminateKills),
+      impact_multiplier: finiteOrNull(extras.impactMultiplier),
+      active_campaign_count: finiteOrNull(extras.activeCampaignCount),
     },
   ];
   const cutoff = nowMs - MAX_SAMPLE_AGE_MS;

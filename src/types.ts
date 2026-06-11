@@ -401,6 +401,13 @@ export interface GlobalHistoryPoint {
   terminid_kills: number | null;
   automaton_kills: number | null;
   illuminate_kills: number | null;
+  /** Stage 11: raw upstream war.impactMultiplier observed at sample time;
+   * null on points stored before Stage 11 (never backfilled) or when absent
+   * upstream. */
+  impact_multiplier: number | null;
+  /** Stage 11: number of active campaigns at sample time (campaigns-list
+   * length); same null rules as impact_multiplier. */
+  active_campaign_count: number | null;
   delta_hours: number | null;
   delta_player_count: number | null;
   delta_missions_won: number | null;
@@ -409,6 +416,8 @@ export interface GlobalHistoryPoint {
   delta_terminid_kills: number | null;
   delta_automaton_kills: number | null;
   delta_illuminate_kills: number | null;
+  delta_impact_multiplier: number | null;
+  delta_active_campaign_count: number | null;
 }
 
 /** Stage 5: one accumulated campaign-signature tuple as returned by
