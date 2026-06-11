@@ -16,6 +16,7 @@ import {
   getPlanet,
   getPlanetHistory,
   getPlanetWiki,
+  getSourceCrossCheck,
   getWarBrief,
   getWarStatus,
   resolvePlanetTool,
@@ -81,7 +82,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_planet",
     description:
-      "Deep dive on one planet by index or name: raw HP, regen/decay (defense decay is always null — it is cosmetic), signed hp_per_hour, hours_to_resolution projection derived from raw HP (never from liberation %), direction flag, per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, environmental hazards, defense timing (defense_ends_at / defense_hours_remaining) when a defense event is active, and waypoint neighbor context: neighbors (joined name/owner/campaign per upstream waypoint), neighbor_summary counts, and the frontline adjacency fact (borders territory of a different owner).",
+      "Deep dive on one planet by index or name: raw HP, regen/decay (defense decay is always null — it is cosmetic), signed hp_per_hour, hours_to_resolution projection derived from raw HP (never from liberation %), direction flag, per-planet statistics (players, mission wins/losses + derived success rate, kills), biome, environmental hazards, defense timing (defense_ends_at / defense_hours_remaining) when a defense event is active, and waypoint neighbor context: neighbors (joined name/owner/campaign per upstream waypoint), neighbor_summary counts, and the frontline adjacency fact (borders territory of a different owner). Also carries a cross_check block verifying the normalized fields against the raw ArrowHead status (/raw) — both values surfaced on any disagreement, never resolved; degrades to a reasoned null when /raw is unavailable.",
     inputSchema: {
       type: "object",
       properties: {
@@ -210,6 +211,12 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "get_source_crosscheck",
+    description:
+      "Normalization-faithfulness health check: every active campaign and Major Order objective cross-checked against the raw ArrowHead payloads (the same upstream wrapper's /raw endpoints — same host, auth, and cache; not a second provider). Returns deterministic tallies (agreements, unexpected disagreements, expected invariant transforms, uncheckable fields) plus the specific divergent fields with BOTH values and the difference. Pure observation: a disagreement is surfaced, never resolved — no side is ranked correct. Expected transforms (defense decay force-nulled, liberation % recomputed) are classified as documented invariant behavior, never mismatches. Degrades to a reasoned unavailable section when /raw cannot be fetched.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
 ] as const;
 
 interface JsonRpcRequest {
@@ -307,6 +314,8 @@ async function dispatchTool(
       return toolText(await getObservedSignatures(env));
     case "get_global_history":
       return toolText(await getGlobalHistory(env));
+    case "get_source_crosscheck":
+      return toolText(await getSourceCrossCheck(env));
     case "get_major_order_history":
       return toolText(
         await getMajorOrderHistory(env, {

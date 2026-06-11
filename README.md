@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through thirteen MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through fourteen MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -30,7 +30,7 @@ The convention is identical for defense campaigns (the tracked health there is t
 | `get_war_status` | War state, active fronts by faction, global stats, faction/sector rollups (counts and sums over fetched data) |
 | `get_campaigns` | All active campaigns, invariant-normalized, with Major Order membership (`is_major_order_target` / `major_order_id`). Optional AND-combined filters: `faction`, `major_order_only`, `has_rate`, `hpc_only` (`filtered_count` vs `total_count` states coverage; no args → all) |
 | `get_major_order` | Current MO: objectives, progress, rewards, time remaining. Objectives are decoded into named fields (`target`, `progress_pct`, `objective_kind`, `value_labels`) beside the untouched raw `values`/`value_types` arrays — labels only for live-confirmed enum values, never fabricated |
-| `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection and waypoint neighbor context (`neighbors` / `neighbor_summary` / `frontline` adjacency fact) |
+| `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection, waypoint neighbor context (`neighbors` / `neighbor_summary` / `frontline` adjacency fact), and a `cross_check` block verifying the normalized fields against the raw ArrowHead status (both values surfaced on any disagreement, never resolved; degrades to a reasoned null when `/raw` is unavailable) |
 | `get_dispatches` | In-fiction war news feed, newest first (`limit` optional, default 10 / cap 25) |
 | `get_patch_notes` | Steam news / patch notes, newest first, verbatim BBCode content (`limit` optional, default 5 / cap 10) |
 | `get_planet_history` | Observed health time-series for one planet by `index` or `name`: retained samples + per-point `delta_health`/`delta_hours` and observed-only aggregates (`rate_min`/`rate_max`/`rate_mean`/`latest_rate`, `samples_span_hours`) — observed values, never a forecast |
@@ -39,6 +39,7 @@ The convention is identical for defense campaigns (the tracked health there is t
 | `get_global_history` | Global war statistics time-series sampled by this server (player count, missions, deaths, kills): retained points + raw observed deltas — observed values, never a forecast. Accrues on `get_war_status` polls |
 | `get_major_order_history` | Observed Major Order objective-progress time-series: one bounded series per objective (`major_order_id` + `objective_index`) with per-point `delta_progress`/`delta_hours`, latest progress/target, and `progress_pct` — observed samples and deltas only, never a forecast, required pace, or on-track verdict. No args → the active MO(s); a recently ended MO stays queryable by `major_order_id` until it ages out |
 | `resolve_planet` | Resolve a loose planet name (`query`) to the canonical planet: exact → punctuation/space-normalized → fuzzy. Near-misses and ties return ranked candidates (`score` = edit distance) with `matched: false` — never a silent substitution |
+| `get_source_crosscheck` | Normalization-faithfulness health check: every active campaign and Major Order objective cross-checked against the raw ArrowHead payloads (the same wrapper's `/raw` endpoints — same host, auth, and cache, not a second provider). Tallies agreements / unexpected disagreements / expected invariant transforms / uncheckable fields, plus the specific divergent fields with BOTH values and the diff. Disagreements are surfaced, never resolved — no side is ranked correct |
 
 ### Freshness metadata (Stage 6)
 
@@ -146,7 +147,7 @@ src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
 src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode)
 src/wiki.ts        Pure wiki lore logic (query plan, response shaping, attribution) — separate source
 src/wikiClient.ts  Wiki fetch + long-TTL KV cache (`wiki:` namespace) — separate from client.ts
-src/tools.ts       The thirteen tool implementations
+src/tools.ts       The fourteen tool implementations
 src/types.ts       Raw upstream + normalized types
 ```
 

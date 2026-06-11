@@ -1,5 +1,5 @@
 /**
- * The thirteen MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The fourteen MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
@@ -60,6 +60,17 @@ import {
   WIN_CONDITION_NOTE,
   winCondition,
 } from "./enrichment";
+import {
+  buildCrossCheckBlock,
+  CROSS_CHECK_NOTE,
+  crossCheckAssignments,
+  crossCheckSubject,
+  RAW_ASSIGNMENT_PATH,
+  RAW_STATUS_PATH,
+  summarizeChecks,
+  unavailableCrossCheck,
+  unmatchedCampaigns,
+} from "./crosscheck";
 import { planWikiQuery, shapeWikiResult } from "./wiki";
 import { fetchWikiQuery } from "./wikiClient";
 import {
@@ -80,6 +91,8 @@ import {
 } from "./sampling";
 import type {
   CampaignFilters,
+  CrossCheckField,
+  CrossCheckSubject,
   DefenseTiming,
   EnrichedCampaign,
   Env,
@@ -92,6 +105,8 @@ import type {
   RawPlanet,
   RawSteamNews,
   RawWar,
+  RawWarStatus,
+  RawWarStatusAssignment,
 } from "./types";
 
 export class ToolError extends Error {}
@@ -163,6 +178,35 @@ function campaignEta(
         defenseHoursRemaining: timing.defense_hours_remaining,
       })
     : buildEtaBlock(inputs);
+}
+
+/**
+ * Stage 10: best-effort raw-side fetch through the SAME fetchUpstream
+ * machinery (same host, headers, raw: cache envelope, stale fallback). A
+ * /raw failure degrades the cross-check to a reasoned null — it must never
+ * block the primary (normalized) response.
+ */
+async function tryFetchRaw<T>(
+  env: Env,
+  path: string,
+): Promise<
+  | { ok: true; data: T; fetchedAt: number; stale: boolean }
+  | { ok: false; detail: string }
+> {
+  try {
+    const res = await fetchUpstream<T>(env, path);
+    return {
+      ok: true,
+      data: res.data,
+      fetchedAt: res.fetchedAt,
+      stale: res.stale,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 interface CampaignBundle {
@@ -577,9 +621,12 @@ export async function getPlanet(
 ): Promise<unknown> {
   assertPlanetArgs(args);
 
-  const [planetsRes, bundle] = await Promise.all([
+  const [planetsRes, bundle, rawStatus] = await Promise.all([
     fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
     loadNormalizedCampaigns(env),
+    // Stage 10: the raw ArrowHead status rides the same client/cache path;
+    // a /raw failure degrades the cross_check block, never this response.
+    tryFetchRaw<RawWarStatus>(env, RAW_STATUS_PATH),
   ]);
   const planets = planetsRes.data ?? [];
 
@@ -638,6 +685,34 @@ export async function getPlanet(
   // Stage 9: the campaign's own eta block when one is active (computed once
   // in the loader — never recomputed); otherwise from the probe's series.
   const eta = active ? active.eta : campaignEta(normalized, probeSamples, timing);
+
+  // Stage 10: cross-check the normalized fields THIS payload carries against
+  // the raw ArrowHead status. The subject is assembled from the same values
+  // returned below, so every check is verifiable in place; a quiet-planet
+  // probe makes no campaign_type claim (campaign_id null skips that check).
+  const crossCheckMeta: CrossCheckSubject = {
+    planet_index: planet.index,
+    campaign_id: active ? active.campaign_id : null,
+    campaign_kind: normalized.campaign_kind,
+    campaign_type: active ? active.campaign_type : null,
+    current_owner: planet.currentOwner ?? null,
+    raw_hp: normalized.raw_hp,
+    max_hp: normalized.max_hp,
+    regen_per_second: normalized.regen_per_second,
+    liberation_pct_display_only: normalized.liberation_pct_display_only,
+    event_type: planet.event?.eventType ?? null,
+    player_count: planet.statistics?.playerCount ?? null,
+  };
+  const cross_check = rawStatus.ok
+    ? buildCrossCheckBlock(crossCheckMeta, rawStatus.data, {
+        normalizedFetchedAtMs: Math.min(
+          planetsRes.fetchedAt,
+          ...bundle.fetchedAts,
+        ),
+        rawFetchedAtMs: rawStatus.fetchedAt,
+        rawStale: rawStatus.stale,
+      })
+    : unavailableCrossCheck("raw_unavailable", rawStatus.detail);
 
   return {
     planet_index: planet.index,
@@ -708,11 +783,15 @@ export async function getPlanet(
         bundle.campaigns.map((c) => [c.planet_index, c.campaign_kind]),
       ),
     ),
+    // Stage 10: normalized-vs-raw verification block — surfaced
+    // disagreement is data; no side is ever picked or averaged.
+    cross_check,
     notes: {
       hp_per_hour: RATE_SIGN_NOTE,
       direction: DIRECTION_NOTE,
       win_condition: WIN_CONDITION_NOTE,
       liberation_pct_display_only: LIBERATION_PCT_NOTE,
+      cross_check: CROSS_CHECK_NOTE,
       defense_window: DEFENSE_WINDOW_NOTE,
       eta: ETA_NOTE,
       defense_eta: DEFENSE_ETA_NOTE,
@@ -1150,5 +1229,144 @@ export async function resolvePlanetTool(
     },
     ...freshnessFrom([planetsRes.fetchedAt], Date.now()),
     ...(planetsRes.stale ? { stale: true } : {}),
+  };
+}
+
+/**
+ * Stage 10: the normalization-faithfulness health check — every active
+ * campaign and Major Order objective cross-checked against the raw ArrowHead
+ * payloads (the wrapper's /raw endpoints: same host, auth, and cache as
+ * every other fetch). Returns deterministic tallies (agreements, unexpected
+ * disagreements excluding the documented expected transforms, uncheckable
+ * fields) plus the specific divergent fields with BOTH values and the diff.
+ * Pure observation: no verdict on which side is right exists anywhere — a
+ * divergence is surfaced for the consumer to interpret. Fetch budget: the
+ * normalized side is exactly a get_campaigns poll (same shared cache, same
+ * single sample-store write); the raw side is two read-through-cached
+ * fetches with zero additional sample-store writes.
+ */
+export async function getSourceCrossCheck(env: Env): Promise<unknown> {
+  const [planetsRes, bundle, rawStatus, rawAssignments] = await Promise.all([
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+    loadNormalizedCampaigns(env),
+    tryFetchRaw<RawWarStatus>(env, RAW_STATUS_PATH),
+    tryFetchRaw<RawWarStatusAssignment[]>(env, RAW_ASSIGNMENT_PATH),
+  ]);
+  const planetByIndex = new Map(
+    (planetsRes.data ?? []).map((p) => [p.index, p]),
+  );
+  const normalizedFetchedAtMs = Math.min(
+    planetsRes.fetchedAt,
+    ...bundle.fetchedAts,
+  );
+
+  let campaignsSection: unknown;
+  if (rawStatus.ok) {
+    const allChecks: CrossCheckField[] = [];
+    const divergent: ({ planet_index: number; planet_name: string } & CrossCheckField)[] =
+      [];
+    for (const c of bundle.campaigns) {
+      const planet = planetByIndex.get(c.planet_index);
+      const checks = crossCheckSubject(
+        {
+          planet_index: c.planet_index,
+          campaign_id: c.campaign_id,
+          campaign_kind: c.campaign_kind,
+          campaign_type: c.campaign_type,
+          // The planet's verbatim currentOwner (a defense campaign's
+          // `faction` is the ATTACKER, not the owner — different fact).
+          current_owner: planet?.currentOwner ?? null,
+          raw_hp: c.raw_hp,
+          max_hp: c.max_hp,
+          regen_per_second: c.regen_per_second,
+          liberation_pct_display_only: c.liberation_pct_display_only,
+          event_type: c.event_type,
+          player_count: c.statistics?.player_count ?? null,
+        },
+        rawStatus.data,
+      );
+      allChecks.push(...checks);
+      for (const check of checks) {
+        if (check.agrees === false) {
+          divergent.push({
+            planet_index: c.planet_index,
+            planet_name: c.planet_name,
+            ...check,
+          });
+        }
+      }
+    }
+    campaignsSection = {
+      available: true,
+      raw_source: RAW_STATUS_PATH,
+      campaigns_checked: bundle.campaigns.length,
+      ...summarizeChecks(allChecks),
+      divergent_fields: divergent,
+      // Campaign-set membership on one side only — reported, never dropped.
+      unmatched: unmatchedCampaigns(
+        bundle.campaigns.map((c) => c.planet_index),
+        rawStatus.data,
+      ),
+      normalized_as_of: new Date(normalizedFetchedAtMs).toISOString(),
+      raw_as_of: new Date(rawStatus.fetchedAt).toISOString(),
+      ...(rawStatus.stale ? { raw_stale: true } : {}),
+    };
+  } else {
+    campaignsSection = {
+      available: false,
+      raw_source: RAW_STATUS_PATH,
+      reason: "raw_unavailable",
+      detail: rawStatus.detail,
+    };
+  }
+
+  let majorOrdersSection: unknown;
+  if (rawAssignments.ok) {
+    const perAssignment = crossCheckAssignments(
+      bundle.assignments,
+      rawAssignments.data ?? [],
+    );
+    const allChecks = perAssignment.flatMap((a) => a.checked);
+    majorOrdersSection = {
+      available: true,
+      raw_source: RAW_ASSIGNMENT_PATH,
+      assignments_checked: perAssignment.length,
+      ...summarizeChecks(allChecks),
+      divergent_fields: perAssignment.flatMap((a) =>
+        a.checked
+          .filter((check) => check.agrees === false)
+          .map((check) => ({ major_order_id: a.major_order_id, ...check })),
+      ),
+      unmatched_assignments: perAssignment
+        .filter((a) => !a.matched_in_raw)
+        .map((a) => a.major_order_id),
+      normalized_as_of: new Date(normalizedFetchedAtMs).toISOString(),
+      raw_as_of: new Date(rawAssignments.fetchedAt).toISOString(),
+      ...(rawAssignments.stale ? { raw_stale: true } : {}),
+    };
+  } else {
+    majorOrdersSection = {
+      available: false,
+      raw_source: RAW_ASSIGNMENT_PATH,
+      reason: "raw_unavailable",
+      detail: rawAssignments.detail,
+    };
+  }
+
+  return {
+    campaigns: campaignsSection,
+    major_orders: majorOrdersSection,
+    notes: {
+      purpose:
+        "Normalization-faithfulness health check: the server's normalized fields verified against the raw ArrowHead payloads they derive from (the wrapper's /raw endpoints — same host, auth, and cache as every other fetch; not a new provider). Counts and the specific divergent fields only — no verdict on which side is right, ever.",
+      cross_check: CROSS_CHECK_NOTE,
+      unexpected_disagreements:
+        "Fields where both sides have a value and they differ beyond the documented tolerance — EXCLUDING the expected transforms (defense decay force-nulled by invariant 1, liberation % recomputed by invariant 2), which are normalization doing its job. A non-zero count can also reflect fetch-moment skew between the two cached payloads (live values move) — the normalized_as_of / raw_as_of timestamps expose that; interpreting a divergence is the consumer's.",
+      uncheckable:
+        "Fields with no counterpart on one side (e.g. liberation max_hp — the raw status carries event maxHealth only) or an unconfirmed raw enum value — agrees: null with a reason, never counted as a mismatch.",
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshnessFrom([planetsRes.fetchedAt, ...bundle.fetchedAts], Date.now()),
+    ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
   };
 }

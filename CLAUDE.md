@@ -3,7 +3,7 @@
 Headless MCP server on a single Cloudflare Worker. It fronts the Helldivers 2
 community API (`api.helldivers2.dev`) as a **correctness layer**: it normalizes
 raw war data to strip known deceptive/cosmetic fields and exposes exactly
-thirteen MCP tools. There is no frontend and no upstream app — the Worker IS
+fourteen MCP tools. There is no frontend and no upstream app — the Worker IS
 the app.
 
 ## Commands
@@ -28,12 +28,20 @@ wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
 
 ## Hard rules (project-wide)
 
-- **Exactly thirteen tools**: `get_war_brief`, `get_war_status`,
+- **Exactly fourteen tools**: `get_war_brief`, `get_war_status`,
   `get_campaigns`, `get_major_order`, `get_planet`, `get_dispatches`,
   `get_patch_notes`, `get_planet_history`, `get_planet_wiki`,
   `get_observed_signatures`, `get_global_history`,
-  `get_major_order_history`, `resolve_planet`. Do not add tools or rename
-  them.
+  `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`.
+  Do not add tools or rename them.
+- **Cross-checks surface, never resolve** (Stage 10): the raw-source
+  cross-check layer (`src/crosscheck.ts`, the wrapper's `/raw` endpoints —
+  same host/auth/cache, NOT a second provider) presents the normalized
+  value, the raw value, and the difference. It must never pick a side,
+  average, or flag one source as correct; the only permitted classification
+  is `expected_transform: true` for documented invariant transforms
+  (defense decay force-nulled, liberation % recomputed) — key-name pinned
+  by test.
 - **The digest never concludes**: `get_war_brief` is pure ASSEMBLY of facts
   the other tools already return (MO + its targets' live trajectories,
   faction rollups, events, totals). No recommended target, no priority

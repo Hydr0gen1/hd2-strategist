@@ -240,6 +240,43 @@ the project's definition of done:
   - Upstream failure during a tick resolves silently with zero writes —
     best-effort, swallowed, never a thrown exception out of the Worker.
 
+- Stage 10 (`stage10.test.ts`):
+  - `crossCheckSubject`: agreeing liberation fields all `agrees: true` with
+    both values present; a genuine divergence → `agrees: false` with both
+    values AND abs/pct diff (never resolved); discrete divergence
+    (campaign_type) surfaced with both values; owner decoded via the
+    live-verified `RAW_FACTION_NAMES` map only — an unmapped enum value →
+    `agrees: null` + `unconfirmed_raw_enum_value`, never a guessed name.
+  - Float tolerance (documented relative 1e-6): within → `agrees: true`;
+    outside → `agrees: false` with the diff; `floatsAgree` flips exactly
+    around the threshold.
+  - **Expected transforms are never mismatches**: defense regen (invariant-1
+    force-null) → `expected_transform: true` with the raw value shown beside
+    the deliberate null, NOT `agrees: false` (specific test); liberation %
+    (invariant-2 recompute) → `expected_transform: true`; a defense compares
+    EVENT health/maxHealth (the tracked health).
+  - Absent sides → `agrees: null` + reason (`field_absent_in_raw`,
+    `field_absent_in_normalized`, `planet_absent_in_raw`,
+    `campaign_absent_in_raw`), never a false mismatch; a quiet-planet probe
+    makes no campaign_type claim at all.
+  - `summarizeChecks`: agreements / unexpected disagreements / expected
+    transforms / uncheckable tallied apart — transforms never count as
+    disagreements.
+  - `crossCheckAssignments`: identical assignment fully agrees (one shared
+    goal decode); divergent progress → both values; an absent raw assignment
+    is reported, never dropped. `unmatchedCampaigns`: both directions, sorted.
+  - **Key-name pin (prime directive)**: no source-resolution key
+    (authoritative/chosen/trusted/preferred/winner/correct/resolved/verdict)
+    exists recursively in a built block (agreeing AND diverging), the
+    unavailable block, or the full `get_source_crosscheck` payload.
+  - Handlers (KV stub, stage6 pattern): `get_planet` cross_check agrees on a
+    seeded match with invariant transforms classified; `/raw` outage →
+    `available: false, reason: "raw_unavailable"` with the primary response
+    unaffected; `get_source_crosscheck` summarizes with expected transforms
+    excluded from disagreements and lists divergent fields with planet
+    context + both values + diff; **the raw fetch adds ZERO sample-store
+    writes** — still exactly one `samples:planets` put per poll.
+
 ## Conventions
 
 - Build fixtures with the `makeCampaign` / `makeEvent` / `ctx` helpers in
