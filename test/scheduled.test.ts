@@ -131,7 +131,7 @@ function forbidNetwork(): { calls: number } {
 /** Fire one cron tick through the real exported `scheduled` handler. */
 async function cronTick(env: Env): Promise<void> {
   await worker.scheduled(
-    { scheduledTime: Date.now(), cron: "*/2 * * * *", noRetry() {} },
+    { scheduledTime: Date.now(), cron: "*/10 * * * *", noRetry() {} },
     env,
     {
       waitUntil() {},
@@ -245,7 +245,7 @@ describe("scheduled handler — shared sampling path (never a fork)", () => {
   it("past the 60s interval a tick appends history points and bumps the signature count", async () => {
     const kv = fakeKv();
     const env = seededEnv(kv);
-    seedStoreAt(kv, Date.now() - 120_000); // one 2-min cron period ago
+    seedStoreAt(kv, Date.now() - 120_000); // well past the 60s interval
     forbidNetwork();
 
     await cronTick(env);
@@ -253,7 +253,7 @@ describe("scheduled handler — shared sampling path (never a fork)", () => {
     const store = coerceStore(JSON.parse(kv.store.get("samples:planets")!));
     const series = store.planets["175"]!;
     expect(series.samples).toHaveLength(2);
-    // 700k → 600k over ~2 minutes: positive rate, sign convention intact.
+    // 700k → 600k over the elapsed window: positive rate, sign intact.
     expect(series.lastRate).toBeGreaterThan(0);
     expect(store.signatures?.[0]?.sample_count).toBe(2);
     expect(store.global).toHaveLength(2);

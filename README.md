@@ -116,9 +116,9 @@ curl -s localhost:8787/mcp -H 'content-type: application/json' \
 
 ### Background sampling (Cron Trigger)
 
-A Cloudflare Cron Trigger (`[triggers]` in `wrangler.toml`) fires the Worker's `scheduled` handler **every 2 minutes** and drives exactly the same sampling path a request-driven poll does: the same cache/fetch logic, the same 60s minimum sample interval, and the same single merged `samples:planets` write (planet series + observed signatures + global statistics — global stats are sampled on every tick because the war fetch is joined). The accumulation layers behind `get_planet_history`, `get_global_history`, and `get_observed_signatures` therefore advance continuously on the deployed Worker, independent of user calls. It introduces no new data, fields, or interpretation — it only runs the existing sampler on a schedule.
+A Cloudflare Cron Trigger (`[triggers]` in `wrangler.toml`) fires the Worker's `scheduled` handler **every 10 minutes** and drives exactly the same sampling path a request-driven poll does: the same cache/fetch logic, the same 60s minimum sample interval, and the same single merged `samples:planets` write (planet series + observed signatures + global statistics — global stats are sampled on every tick because the war fetch is joined). The accumulation layers behind `get_planet_history`, `get_global_history`, and `get_observed_signatures` therefore advance continuously on the deployed Worker, independent of user calls. It introduces no new data, fields, or interpretation — it only runs the existing sampler on a schedule.
 
-- **Cadence & KV write budget:** every 2 minutes, deliberately not every minute — the KV free tier allows ~1,000 writes/day, and at 1-min cadence the merged store write alone would be 1,440/day; at 2-min it is ~720/day. **Caveat:** the 45s raw response cache is always expired at this cadence, so each tick also refreshes up to three `raw:` cache keys — total cron-driven KV writes are ~4 per run (~2,880/day worst case), which exceeds the free-tier write ceiling on its own. If the free-tier budget must hold strictly, widen the cadence (e.g. `*/10`); re-check the full budget before ever tightening it.
+- **Cadence & KV write budget:** the KV free tier allows ~1,000 writes/day, and a tick costs ~4 KV writes — the single merged store write **plus** up to three `raw:` cache refreshes (the 45s response cache is always expired between ticks). At `*/10` that is 144 runs × 4 ≈ 576 writes/day, comfortably under the ceiling with headroom for user traffic; a 2-min cadence would be ~2,880/day (≈3× over budget — KV writes then fail silently and the sampler stalls for the rest of the UTC day). Faster sampling also *shortens* the visible history window: the 96-point ring buffer spans 16h at `*/10` but only ~3h at `*/2`. Re-check the full budget before ever tightening the cadence.
 - **UTC:** Cloudflare cron always evaluates in UTC. Irrelevant for a fixed-interval poll, but any future time-of-day schedule must account for it.
 - **Failure is silent by design:** an upstream failure during a scheduled run is logged and swallowed (no user is watching a cron tick); the next tick retries. The interval guard makes overlapping cron/request samples safe — last-write-wins on the single merged store, with `first_seen` preserved by the merge.
 - **Cron triggers only run on the deployed Worker.** Locally, test the handler via wrangler's scheduled-test mode:
@@ -126,7 +126,7 @@ A Cloudflare Cron Trigger (`[triggers]` in `wrangler.toml`) fires the Worker's `
 ```bash
 npm run dev -- --test-scheduled
 # then trigger a tick:
-curl "http://localhost:8787/__scheduled?cron=*/2+*+*+*+*"
+curl "http://localhost:8787/__scheduled?cron=*/10+*+*+*+*"
 ```
 
 After a deploy, verify it end-to-end by leaving the server idle and checking that `get_observed_signatures` `last_seen` and `get_global_history` timestamps keep advancing on their own.

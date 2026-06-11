@@ -95,7 +95,7 @@ out in code at 48h): long enough for accumulated signatures to survive gaps
 in usage, while a truly abandoned store still evaporates.
 `get_observed_signatures` and `get_global_history` are read-only.
 
-A Cron Trigger (wrangler.toml `[triggers]`, every 2 minutes, UTC) drives
+A Cron Trigger (wrangler.toml `[triggers]`, every 10 minutes, UTC) drives
 this same path on a schedule via `runScheduledSample` (tools.ts): one
 merged store write per tick through the same `samplePlanetRates` call —
 the war fetch is joined so global statistics sample on every tick — plus
