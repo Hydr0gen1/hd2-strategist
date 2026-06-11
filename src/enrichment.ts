@@ -13,6 +13,7 @@ import type {
   BiomeInfo,
   CampaignFilters,
   DefenseTiming,
+  DefenseWindowProjection,
   Direction,
   DispatchInfo,
   EnrichedCampaign,
@@ -42,6 +43,7 @@ import type {
   SectorRollup,
   WarBriefEvent,
   WarBriefTarget,
+  WinCondition,
 } from "./types";
 
 const MS_PER_HOUR = 3_600_000;
@@ -349,6 +351,14 @@ export function decodeEventModifier(
 
 /** Upstream assignment task valueType that denotes a planet index. */
 export const TASK_VALUE_TYPE_PLANET = 12;
+
+/** Stage 7, Part D: upstream assignment task valueType that denotes the
+ * objective's goal quantity (the progress denominator). Confirmed against
+ * both live Major Orders on 2026-06-11: MO 2616794736 carried 1,750,000 in
+ * its valueType-3 slot with progress 281,226 counting toward it (~16%), and
+ * MO 3257352995 ("Hold Crimsica") carried goal 1 with progress 1 while the
+ * planet was held. */
+export const TASK_VALUE_TYPE_GOAL = 3;
 
 /**
  * Stage 5: planet index → Major Order assignment id, from the same
@@ -667,18 +677,39 @@ export function shapeMajorOrders(assignments: RawAssignment[], nowMs: number) {
       title: a.title,
       briefing: a.briefing,
       description: a.description,
-      objectives: (a.tasks ?? []).map((task, i) => ({
-        index: i,
-        task_type: task.type,
-        progress: a.progress?.[i] ?? null,
-        values: task.values,
-        value_types: task.valueTypes,
-        planet_indices: (task.valueTypes ?? []).flatMap((vt, j) =>
-          vt === TASK_VALUE_TYPE_PLANET && task.values?.[j] != null
-            ? [task.values[j]!]
-            : [],
-        ),
-      })),
+      objectives: (a.tasks ?? []).map((task, i) => {
+        const types = task.valueTypes ?? [];
+        const values = task.values ?? [];
+        // Stage 7, Part D: decode the positional arrays into named fields —
+        // additive beside the raw arrays, which stay authoritative. Unknown
+        // enum values keep their raw number with a null label (the
+        // EVENT_MODIFIER_NAMES fail-safe: never fabricate a name).
+        const goalSlot = types.findIndex((vt) => vt === TASK_VALUE_TYPE_GOAL);
+        const target =
+          goalSlot >= 0 ? finiteOrNull(values[goalSlot]) : null;
+        const progress = a.progress?.[i] ?? null;
+        return {
+          index: i,
+          task_type: task.type,
+          objective_kind: TASK_TYPE_NAMES.get(task.type) ?? null,
+          progress,
+          target,
+          progress_pct:
+            target != null && target > 0 && progress != null
+              ? Math.round((progress / target) * 10_000) / 100
+              : null,
+          values: task.values,
+          value_types: task.valueTypes,
+          value_labels: types.map(
+            (vt) => TASK_VALUE_TYPE_NAMES.get(vt) ?? null,
+          ),
+          planet_indices: types.flatMap((vt, j) =>
+            vt === TASK_VALUE_TYPE_PLANET && values[j] != null
+              ? [values[j]!]
+              : [],
+          ),
+        };
+      }),
       rewards: a.rewards?.length ? a.rewards : a.reward ? [a.reward] : [],
       expires_in_seconds: expiresInSeconds,
       expires_in: humanizeSeconds(expiresInSeconds),
@@ -933,6 +964,163 @@ export function buildActiveEvents(
       defense_hours_remaining: c.defense_hours_remaining ?? null,
     }));
 }
+
+/* ----------------------------- Stage 7 -------------------------------- */
+
+/**
+ * Stage 7, Part A: the explicit win-state orientation for a campaign kind.
+ *
+ * Verified against live data on 2026-06-11 — the type:0 lesson (never assume
+ * an enum or orientation) applied to defense direction:
+ *
+ * - liberation: planet.health counts DOWN; zero = liberated (long-verified).
+ * - defense: event.health ALSO counts DOWN under successful defense play —
+ *   observed live on Crimsica (index 78, 16k+ players defending: event
+ *   health fell 1,359,043 → 1,040,310 over 7.6h) and Bore Rock (index 124:
+ *   746,788 → 728,250). Depleting the event health to zero IS repelling the
+ *   attack; an event still near max_hp close to its deadline is nearly
+ *   LOST, not nearly won.
+ *
+ * Both kinds therefore share "raw_hp_to_zero". The function stays kind-keyed
+ * so a future kind with a different verified orientation gets its own enum
+ * value instead of silently inheriting this one.
+ */
+export function winCondition(kind: "liberation" | "defense"): WinCondition {
+  void kind; // both verified orientations coincide today — see above
+  return "raw_hp_to_zero";
+}
+
+/**
+ * Stage 7, Part A: distance to the win state, oriented so SMALLER = closer
+ * to the desired outcome regardless of campaign kind. Because both kinds'
+ * win state is the tracked health reaching zero (see winCondition), the
+ * distance equals the raw/event health itself — restated under an
+ * orientation-explicit name so the reader never has to know the sign
+ * convention to read it. Always ≥ 0; null when HP is unknown, never
+ * substituted.
+ */
+export function hpRemainingToObjective(rawHp: number | null): number | null {
+  if (rawHp == null || !Number.isFinite(rawHp)) return null;
+  return Math.max(0, rawHp);
+}
+
+/**
+ * Stage 7, Part B: the defense timing-vs-trajectory gap, co-located as
+ * numbers. Deterministic arithmetic over fields the payload already carries
+ * — NOT a success/failure prediction:
+ *
+ * - projected_hp_at_defense_end: raw_hp − hp_per_hour ×
+ *   defense_hours_remaining, a straight linear extrapolation of the one
+ *   signed rate (positive depletes) to the defense deadline. ≤ 0 means the
+ *   extrapolation reaches the win state inside the window; deliberately
+ *   unclamped so the arithmetic stays verifiable against the inputs.
+ * - resolution_within_defense_window: hours_to_resolution ≤
+ *   defense_hours_remaining — a comparison of two numbers already returned
+ *   side by side, nothing more.
+ *
+ * Both null when the rate is null (no projection possible — the same
+ * honesty as hours_to_resolution); the boolean is also null on a stalemate
+ * (rate 0), where no resolution projection exists to compare.
+ */
+export function defenseWindowProjection(args: {
+  rawHp: number | null;
+  hpPerHour: number | null;
+  defenseHoursRemaining: number | null;
+  hoursToResolution: number | null;
+}): DefenseWindowProjection {
+  const { rawHp, hpPerHour, defenseHoursRemaining, hoursToResolution } = args;
+  const windowKnown =
+    defenseHoursRemaining != null && Number.isFinite(defenseHoursRemaining);
+  return {
+    projected_hp_at_defense_end:
+      rawHp != null &&
+      Number.isFinite(rawHp) &&
+      hpPerHour != null &&
+      Number.isFinite(hpPerHour) &&
+      windowKnown
+        ? rawHp - hpPerHour * defenseHoursRemaining
+        : null,
+    resolution_within_defense_window:
+      hoursToResolution != null &&
+      Number.isFinite(hoursToResolution) &&
+      windowKnown
+        ? hoursToResolution <= defenseHoursRemaining
+        : null,
+  };
+}
+
+/**
+ * Stage 7, Part D: assignment task `type` → readable objective kind.
+ * Configurable map with the EVENT_MODIFIER_NAMES fail-safe: an unmapped
+ * value keeps its raw number and gets a NULL label — a label is never
+ * fabricated. Seeded ONLY with values confirmed against live Major Orders
+ * (2026-06-11):
+ *
+ * - 9 → "complete_operations": MO 2616794736, briefing "Complete the
+ *   required number of Operations on Omicron…", progress counting toward a
+ *   1,750,000 goal.
+ * - 13 → "hold_planet": MO 3257352995, briefing "Hold Crimsica…", goal 1
+ *   with progress 1 while the planet was held.
+ *
+ * Candidates awaiting live confirmation (community readings, NOT seeded):
+ * 2 extract, 3 eradicate, 11 liberate, 12 defend.
+ */
+export const TASK_TYPE_NAMES: ReadonlyMap<number, string> = new Map<
+  number,
+  string
+>([
+  [9, "complete_operations"],
+  [13, "hold_planet"],
+]);
+
+/**
+ * Stage 7, Part D: assignment task `valueTypes` entry → readable label.
+ * Same fail-safe as TASK_TYPE_NAMES — unknown values keep the raw number
+ * with a null label. Seeded only with live-confirmed values:
+ *
+ * - 3 → "goal" (TASK_VALUE_TYPE_GOAL — see its confirmation note).
+ * - 12 → "planet_index" (TASK_VALUE_TYPE_PLANET — drives the MO planet join
+ *   and invariant 5; long-confirmed).
+ *
+ * Values 1, 8, 9, 11 have been observed live with plausible community
+ * readings (e.g. 1 = faction id) but no payload-verifiable confirmation —
+ * they stay unmapped.
+ */
+export const TASK_VALUE_TYPE_NAMES: ReadonlyMap<number, string> = new Map<
+  number,
+  string
+>([
+  [TASK_VALUE_TYPE_GOAL, "goal"],
+  [TASK_VALUE_TYPE_PLANET, "planet_index"],
+]);
+
+/** Stage 7, Part A: the hp_per_hour sign convention, restated inline on
+ * every rate-bearing payload (the history tool's notes proved inline
+ * self-documentation is what makes the correct read possible). */
+export const RATE_SIGN_NOTE =
+  "hp_per_hour = (previous − current) health / hours elapsed, sampled by this server. Positive = health falling toward zero = progressing toward this campaign's win state; negative = health rising = losing ground. The SAME orientation holds for liberation AND defense campaigns — a successful defense depletes the event health to zero (verified against live defenses 2026-06-11); win_condition / hp_remaining_to_objective state the target explicitly. Null until two samples >60s apart exist.";
+
+/** Stage 7, Part A: direction label semantics — kind-aware since 2026-06-11. */
+export const DIRECTION_NOTE =
+  "Objective-relative rendering of the hp_per_hour sign: 'liberating' (liberation campaign) or 'repelling' (defense campaign) = positive rate, progressing toward the win state; 'losing' = negative rate, for both kinds; 'stalemate' = exactly 0; 'unknown' = no rate. Defenses previously reported 'liberating' on a positive rate, which misread as nearly-won on a nearly-lost defense — the label is now kind-aware; liberation labels are unchanged.";
+
+/** Stage 7, Part A: win_condition / hp_remaining_to_objective semantics. */
+export const WIN_CONDITION_NOTE =
+  "win_condition states what reaching the objective means for THIS campaign: raw_hp_to_zero = the tracked health (planet health on a liberation, event health on a defense) must reach ZERO. hp_remaining_to_objective is the distance to that win state, always oriented so smaller = closer to the desired outcome for both kinds (it equals raw_hp because health counts down; the field exists so no sign convention has to be known to read it). A defense still near max_hp as its window expires is therefore nearly LOST — orientation verified against live defenses, not assumed.";
+
+/** Stage 7, Part C: the liberation-% formula, stated inline (invariant 2:
+ * the value is cosmetic and never used in math — documentation only). */
+export const LIBERATION_PCT_NOTE =
+  "Cosmetic display value only: liberation_pct_display_only = (max_hp − raw_hp) / max_hp × 100. raw_hp is authoritative — all quantitative logic (rates, projections) uses raw_hp, never this field. On a defense it reads as the % of event health already depleted toward the win state, NOT how safe the planet is.";
+
+/** Stage 7, Part B: the defense window projection fields, documented as the
+ * deterministic comparisons they are — never a success/failure prediction. */
+export const DEFENSE_WINDOW_NOTE =
+  "Defense campaigns only. projected_hp_at_defense_end = raw_hp − hp_per_hour × defense_hours_remaining: a linear extrapolation of the current signed rate to the defense deadline (≤ 0 means the extrapolation reaches the win state inside the window; unclamped so the arithmetic is verifiable). resolution_within_defense_window = hours_to_resolution ≤ defense_hours_remaining: a deterministic comparison of two fields already in this payload — it co-locates the timing gap, it does NOT predict success or failure. Both null when no rate exists; the boolean is also null on a stalemate (no resolution projection to compare).";
+
+/** Stage 7, Part D: the Major Order objective decode, documented inline. */
+export const MO_OBJECTIVE_DECODE_NOTE =
+  "Decoded named fields ride alongside the raw arrays, never replacing them: target = the value whose value_types entry is 3 ('goal'; first such slot), progress = upstream per-objective progress, progress_pct = progress / target × 100 (null when the target is 0 or unknown — never a divide-by-zero), objective_kind / value_labels = readable labels only for enum values confirmed against live Major Orders. An unknown enum value keeps its raw number with a null label — a name is never fabricated. The raw values / value_types arrays remain authoritative, so every decoded field is verifiable against them.";
 
 /** Hazard pass-through: always an array — [] when upstream sends none. */
 export function selectHazards(

@@ -134,6 +134,32 @@ the project's definition of done:
   - **Prime directive pin**: every key in the brief payload (recursively) is
     checked against interpretive names (recommend/priority/rank/score/...).
 
+- Stage 7 (`stage7.test.ts`):
+  - **Direction regression across kinds**: positive rate → `repelling` on a
+    defense and `liberating` on a liberation (unchanged); negative → `losing`
+    for both; `directionFromRate` without a kind arg keeps the legacy
+    liberation labels. The sanctioned semantic change is the defense
+    positive-label ONLY.
+  - `winCondition`: both kinds → `raw_hp_to_zero` — pinned to the LIVE
+    verified orientation (2026-06-11, Crimsica/Bore Rock: event health falls
+    while a defense is won). `hpRemainingToObjective`: a defense at 97% event
+    HP reads as a LARGE distance (never nearly-complete); null HP → null.
+  - `defenseWindowProjection`: exact `raw_hp − rate × hours` arithmetic both
+    signs, unclamped through zero; the boolean is a pure
+    `hours_to_resolution ≤ defense_hours_remaining` comparison; both null on
+    a null rate; stalemate → projected = current HP, boolean null.
+  - Part C: `LIBERATION_PCT_NOTE` carries the exact formula; the VALUE of
+    `isolateLiberationPct` is unchanged (still display-only).
+  - Part D: the live Omicron/Crimsica objective shapes decode to
+    target/progress_pct/objective_kind/value_labels with the raw arrays
+    retained verbatim; unknown task_type → label null (never fabricated);
+    target 0/absent → progress_pct null; the label maps are pinned to
+    live-confirmed entries only.
+  - **End-to-end (KV stub, stage6 pattern)**: a Bore-Rock-shaped failing
+    defense through getCampaigns/getPlanet surfaces repelling + large
+    hp_remaining_to_objective + resolution_within_defense_window: false,
+    with the convention notes riding the payloads — the retired misread,
+    pinned.
 - Scheduled sampling (`scheduled.test.ts`):
   - The cron `scheduled` handler writes the IDENTICAL merged store a
     request-driven `get_war_status` poll writes (stores compared deep-equal

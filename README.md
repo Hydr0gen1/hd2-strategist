@@ -20,7 +20,7 @@ Planet health counts **down** toward resolution. The server samples health into 
 - **negative** → health rising → losing ground
 - `null` → not enough samples yet (see verification notes below)
 
-The projection uses the magnitude (`abs`); the `direction` flag is the sole carrier of liberating-vs-losing.
+The convention is identical for defense campaigns (the tracked health there is the **event** health, which depletes toward zero while a defense is being won — verified against live defenses on 2026-06-11). The projection uses the magnitude (`abs`); the `direction` flag is the sole carrier of progressing-vs-losing, with a kind-aware positive label: `liberating` on a liberation campaign, `repelling` on a defense. Every campaign also states its win-state orientation outright: `win_condition` (`raw_hp_to_zero` for both kinds) and `hp_remaining_to_objective` (always-positive distance to the win state, smaller = closer), so direction never has to be inferred from sign conventions. Defense campaigns additionally co-locate the timing gap as numbers: `projected_hp_at_defense_end` (linear extrapolation of the signed rate to the defense deadline) and `resolution_within_defense_window` (`hours_to_resolution ≤ defense_hours_remaining` — a deterministic comparison, not a success prediction).
 
 ## Tools
 
@@ -29,7 +29,7 @@ The projection uses the magnitude (`abs`); the `direction` flag is the sole carr
 | `get_war_brief` | Single-call digest: current Major Order joined with the live trajectory of exactly its target planets, per-faction front rollups, active events, and totals — a pre-joined assembly of the same facts the tools below return; no recommendation, ranking, or verdict |
 | `get_war_status` | War state, active fronts by faction, global stats, faction/sector rollups (counts and sums over fetched data) |
 | `get_campaigns` | All active campaigns, invariant-normalized, with Major Order membership (`is_major_order_target` / `major_order_id`). Optional AND-combined filters: `faction`, `major_order_only`, `has_rate`, `hpc_only` (`filtered_count` vs `total_count` states coverage; no args → all) |
-| `get_major_order` | Current MO: objectives, progress, rewards, time remaining |
+| `get_major_order` | Current MO: objectives, progress, rewards, time remaining. Objectives are decoded into named fields (`target`, `progress_pct`, `objective_kind`, `value_labels`) beside the untouched raw `values`/`value_types` arrays — labels only for live-confirmed enum values, never fabricated |
 | `get_planet` | Deep dive by `index` or `name`, with `hours_to_resolution` projection and waypoint neighbor context (`neighbors` / `neighbor_summary` / `frontline` adjacency fact) |
 | `get_dispatches` | In-fiction war news feed, newest first (`limit` optional, default 10 / cap 25) |
 | `get_patch_notes` | Steam news / patch notes, newest first, verbatim BBCode content (`limit` optional, default 5 / cap 10) |

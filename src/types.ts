@@ -108,7 +108,46 @@ export interface RawSteamNews {
 
 /** Normalized output types (what the MCP tools return). */
 
-export type Direction = "liberating" | "losing" | "stalemate" | "unknown";
+/** Objective-relative rendering of the hp_per_hour sign, per campaign kind
+ * (Stage 7). A positive rate (health falling toward zero — the win state for
+ * BOTH kinds; see WinCondition) reads "liberating" on a liberation campaign
+ * and "repelling" on a defense; a negative rate is "losing" for both.
+ * Liberation labels are unchanged from the original enum; "repelling"
+ * replaced "liberating" on defenses (2026-06-11) because a defense at high
+ * event HP labeled "liberating" misread as nearly-won when it was nearly
+ * lost (regression-tested in stage7.test.ts). */
+export type Direction =
+  | "liberating"
+  | "repelling"
+  | "losing"
+  | "stalemate"
+  | "unknown";
+
+/** Stage 7, Part A: what reaching the objective means for a campaign.
+ * Both current kinds deplete the tracked health to ZERO — for defenses this
+ * was VERIFIED live (Crimsica index 78 / Bore Rock index 124, 2026-06-11:
+ * event health observed falling under active defense play), never assumed.
+ * An enum rather than a bare constant so a future campaign kind with a
+ * different verified orientation gets its own value. */
+export type WinCondition = "raw_hp_to_zero";
+
+/** Stage 7, Part B: the defense timing-vs-trajectory gap as co-located
+ * numbers — emitted only on defense campaigns. Deterministic arithmetic
+ * over fields already in the payload (signed hp_per_hour,
+ * defense_hours_remaining, hours_to_resolution), NOT a success/failure
+ * prediction. Null when no rate exists — the same honesty as
+ * hours_to_resolution itself. */
+export interface DefenseWindowProjection {
+  /** raw_hp − hp_per_hour × defense_hours_remaining: linear extrapolation of
+   * the current signed rate to the defense deadline. ≤ 0 means the
+   * extrapolation reaches the win state inside the window; deliberately
+   * unclamped so the arithmetic stays verifiable. */
+  projected_hp_at_defense_end: number | null;
+  /** hours_to_resolution ≤ defense_hours_remaining — a comparison of two
+   * fields already returned side by side, nothing more. Null when either
+   * side is null (no rate, or stalemate). */
+  resolution_within_defense_window: boolean | null;
+}
 export type ProjectionStatus =
   | "projected"
   | "stalemate"
@@ -203,7 +242,16 @@ export interface EventModifier {
 export interface EnrichedCampaign
   extends NormalizedCampaign,
     Partial<DefenseTiming>,
+    Partial<DefenseWindowProjection>,
     EventModifier {
+  /** Stage 7, Part A: explicit win-state orientation for this campaign kind
+   * — see WinCondition. */
+  win_condition: WinCondition;
+  /** Stage 7, Part A: distance to the win state, oriented so SMALLER =
+   * closer to the desired outcome for BOTH kinds. Equals raw_hp (health
+   * counts down to zero); the field exists so the reader never has to know
+   * the sign convention. Null when HP is unknown. */
+  hp_remaining_to_objective: number | null;
   statistics: PlanetStatistics | null;
   biome: BiomeInfo | null;
   hazards: HazardInfo[];

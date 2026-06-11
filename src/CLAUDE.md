@@ -5,7 +5,7 @@ Module boundaries are strict; respect them when editing:
 | File | Role | Boundary rule |
 |------|------|---------------|
 | `invariants.ts` | The five domain invariants + `normalizeCampaign` | **Pure. Zero I/O, zero imports from client/tools/mcp.** External facts (rates, ages, MO planet set) arrive via `NormalizeContext`. |
-| `enrichment.ts` | Stage 1+2+4+5+6 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups), Stage 6 consumption helpers (MO shaping, freshness metadata, planet-name resolution, campaign filters, brief target/event assembly) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
+| `enrichment.ts` | Stage 1+2+4+5+6+7 fact pass-throughs: planet statistics subset, defense deadline timing, biome/hazards, dispatch/patch-note shaping, history deltas, live event/modifier decode (`EVENT_MODIFIER_NAMES`), Stage 5 joins/aggregates (waypoint neighbors, MO assignment map, history rate aggregates, global history points, signature shaping, faction/sector rollups), Stage 6 consumption helpers (MO shaping, freshness metadata, planet-name resolution, campaign filters, brief target/event assembly), Stage 7 objective framing (`winCondition` / `hpRemainingToObjective` / `defenseWindowProjection`, the MO objective decode maps `TASK_TYPE_NAMES`/`TASK_VALUE_TYPE_NAMES`, and the inline-convention note constants) | **Pure. Zero I/O.** Raw objects and the clock arrive from the handler layer. Facts and unit conversions only — never a judgment. |
 | `wiki.ts` | Stage 4 LORE source, pure half: wiki query plan (title candidates, one multi-title request), response shaping, extract cap, mandatory attribution | **Pure. Zero I/O. SEPARATE source** — never imports from or feeds into the live war-state pipeline; no live war number in any output. |
 | `wikiClient.ts` | Stage 4 LORE source, I/O half: helldivers.wiki.gg fetch (descriptive User-Agent) + long-TTL KV cache in the `wiki:` namespace with stale fallback | Deliberately separate from `client.ts`. Injectable fetch for tests. Never touches `raw:`/`samples:` keys. |
 | `sampling.ts` | Pure sample-store logic: the bounded planet ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants, and the Stage 5 accumulation layers (`foldSignatures`, `advanceGlobalSeries`) | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
@@ -44,10 +44,23 @@ Health counts DOWN toward resolution:
 
 One signed value, consumed in exactly two places: `projectResolution` takes
 its **magnitude** (`abs`, deliberately sign-blind) and `directionFromRate`
-takes its **sign** — `direction` is the SOLE carrier of liberating-vs-losing.
+takes its **sign** — `direction` is the SOLE carrier of progressing-vs-losing.
 Never derive direction from a second, independently computed quantity, and
 never let the convention drift between liberation and defense campaigns
-(defense samples `event.health`, same formula).
+(defense samples `event.health`, same formula — verified live 2026-06-11:
+event health DEPLETES toward zero while a defense is being won).
+
+Stage 7: the positive-rate LABEL is kind-aware — `liberating` on a
+liberation, `repelling` on a defense (sign semantics identical; the word
+changed because "liberating" on a high-HP defense misread as nearly-won).
+Every campaign also states the orientation outright: `win_condition`
+(`raw_hp_to_zero`, both kinds) + `hp_remaining_to_objective` (= raw_hp,
+smaller = closer), and the convention is restated inline on every
+rate-bearing payload via the `RATE_SIGN_NOTE`/`DIRECTION_NOTE` constants.
+Defense campaigns add `projected_hp_at_defense_end` /
+`resolution_within_defense_window` (`defenseWindowProjection`) — comparisons
+of co-located numbers from the SAME signed rate, never success predictions,
+both null without a rate.
 
 ## Stage 4 source-separation rule (live vs lore)
 

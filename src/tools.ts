@@ -26,12 +26,19 @@ import {
   buildSectorRollup,
   decayPerHour,
   decodeEventModifier,
+  DEFENSE_WINDOW_NOTE,
   defenseTiming,
+  defenseWindowProjection,
+  DIRECTION_NOTE,
   filterCampaigns,
   freshnessFrom,
   FRESHNESS_NOTE,
   historyRateAggregates,
+  hpRemainingToObjective,
+  LIBERATION_PCT_NOTE,
+  MO_OBJECTIVE_DECODE_NOTE,
   moPlanetAssignmentMap,
+  RATE_SIGN_NOTE,
   resolvePlanetName,
   selectBiome,
   selectHazards,
@@ -40,6 +47,8 @@ import {
   shapeMajorOrders,
   shapeObservedSignatures,
   shapePatchNotes,
+  WIN_CONDITION_NOTE,
+  winCondition,
 } from "./enrichment";
 import { planWikiQuery, shapeWikiResult } from "./wiki";
 import { fetchWikiQuery } from "./wikiClient";
@@ -176,6 +185,7 @@ async function loadNormalizedCampaigns(
       hpcTypes: HPC_CAMPAIGN_TYPES,
       moPlanetIndices,
     });
+    const timing = c.planet.event ? defenseTiming(c.planet.event, nowMs) : null;
     return {
       ...normalized,
       // Stage 3: unit conversion of the invariant-1 normalized regen (already
@@ -187,7 +197,22 @@ async function loadNormalizedCampaigns(
       // Stage 4: live event identity — raw enum + confirmed-map name only,
       // decoded from the live API's own event data (never the wiki).
       ...decodeEventModifier(c.planet.event),
-      ...(c.planet.event ? defenseTiming(c.planet.event, nowMs) : {}),
+      ...(timing ?? {}),
+      // Stage 7, Part A: objective-relative framing — the win-state target
+      // and the always-positive distance to it (smaller = closer), so the
+      // direction of progress never has to be inferred from sign conventions.
+      win_condition: winCondition(normalized.campaign_kind),
+      hp_remaining_to_objective: hpRemainingToObjective(normalized.raw_hp),
+      // Stage 7, Part B: the defense timing gap as co-located numbers —
+      // derived from the SAME signed rate and projection invariant 3 made.
+      ...(timing
+        ? defenseWindowProjection({
+            rawHp: normalized.raw_hp,
+            hpPerHour: normalized.hp_per_hour,
+            defenseHoursRemaining: timing.defense_hours_remaining,
+            hoursToResolution: normalized.hours_to_resolution,
+          })
+        : {}),
       // Stage 5: pure join against the MO task planet set — the same map
       // invariant 5 consumes; membership fact, not a priority score.
       is_major_order_target: moMap.has(c.planet.index),
@@ -298,7 +323,7 @@ export async function getWarStatus(env: Env): Promise<unknown> {
     },
     notes: {
       net_hp_per_hour:
-        "Per-front sum of the same signed per-campaign hp_per_hour values (positive = progressing toward resolution). Only planets with a known rate are summed — planets_with_rate vs planets_total states the coverage. Null means no planet on the front has a rate yet (e.g. cold start), not zero.",
+        "Per-front sum of the same signed per-campaign hp_per_hour values (positive = progressing toward the win state, for liberation AND defense alike — a successful defense depletes its event health toward zero). Only planets with a known rate are summed — planets_with_rate vs planets_total states the coverage. Null means no planet on the front has a rate yet (e.g. cold start), not zero.",
       faction_rollup:
         "Deterministic counts/sums per faction over data already fetched: planets owned (by currentOwner over the full planets list), active campaigns on that faction's front, the SAME Stage-3 net_hp_per_hour front aggregate echoed verbatim (null when the faction has no active front — e.g. Humans), and the sum of known per-campaign player counts (null when none known; campaigns_with_players vs campaigns_total states the coverage). Facts only — no ranking, no verdict.",
       sector_rollup:
@@ -336,10 +361,11 @@ export async function getCampaigns(
     ...(isFiltered ? { filters_applied: { ...filters } } : {}),
     campaigns: filtered,
     notes: {
-      liberation_pct_display_only:
-        "Cosmetic display value only. All quantitative logic must use raw_hp.",
-      hp_per_hour:
-        "Net signed rate sampled by this server: positive = progressing toward resolution, negative = losing ground. Null until two samples >60s apart exist.",
+      liberation_pct_display_only: LIBERATION_PCT_NOTE,
+      hp_per_hour: RATE_SIGN_NOTE,
+      direction: DIRECTION_NOTE,
+      win_condition: WIN_CONDITION_NOTE,
+      defense_window: DEFENSE_WINDOW_NOTE,
       mission_success_rate:
         "Derived per planet as mission_wins / (mission_wins + mission_losses) × 100. Null when no missions are recorded — never 0.",
       defense_hours_remaining:
@@ -377,7 +403,10 @@ export async function getMajorOrder(env: Env): Promise<unknown> {
   return {
     active: true,
     major_orders: shapeMajorOrders(assignments, Date.now()),
-    notes: { freshness: FRESHNESS_NOTE },
+    notes: {
+      objectives: MO_OBJECTIVE_DECODE_NOTE,
+      freshness: FRESHNESS_NOTE,
+    },
     ...freshness,
     ...(res.stale ? { stale: true } : {}),
   };
@@ -495,6 +524,10 @@ export async function getPlanet(
     );
   }
 
+  // Stage 7: defense timing computed once so the Part B window projection
+  // derives from the same clamped hours value the payload itself carries.
+  const timing = planet.event ? defenseTiming(planet.event, Date.now()) : null;
+
   return {
     planet_index: planet.index,
     planet_name: planet.name,
@@ -511,6 +544,10 @@ export async function getPlanet(
     // defense planet can never re-expose its cosmetic decay here.
     decay_per_hour: decayPerHour(normalized.regen_per_second),
     liberation_pct_display_only: normalized.liberation_pct_display_only,
+    // Stage 7, Part A: objective-relative framing — win-state target plus
+    // the always-positive distance to it (smaller = closer, both kinds).
+    win_condition: winCondition(normalized.campaign_kind),
+    hp_remaining_to_objective: hpRemainingToObjective(normalized.raw_hp),
     hours_to_resolution: normalized.hours_to_resolution,
     projection_status: normalized.status,
     direction: normalized.direction,
@@ -532,7 +569,17 @@ export async function getPlanet(
           end_time: planet.event.endTime,
         }
       : null,
-    ...(planet.event ? defenseTiming(planet.event, Date.now()) : {}),
+    ...(timing ?? {}),
+    // Stage 7, Part B: the timing-vs-trajectory gap as co-located numbers,
+    // from the SAME signed rate and projection already in this payload.
+    ...(timing
+      ? defenseWindowProjection({
+          rawHp: normalized.raw_hp,
+          hpPerHour: normalized.hp_per_hour,
+          defenseHoursRemaining: timing.defense_hours_remaining,
+          hoursToResolution: normalized.hours_to_resolution,
+        })
+      : {}),
     player_count: planet.statistics?.playerCount ?? null,
     statistics: selectPlanetStatistics(planet.statistics),
     biome: selectBiome(planet.biome),
@@ -548,6 +595,11 @@ export async function getPlanet(
       ),
     ),
     notes: {
+      hp_per_hour: RATE_SIGN_NOTE,
+      direction: DIRECTION_NOTE,
+      win_condition: WIN_CONDITION_NOTE,
+      liberation_pct_display_only: LIBERATION_PCT_NOTE,
+      defense_window: DEFENSE_WINDOW_NOTE,
       neighbors:
         "Upstream's own waypoints array for this planet, in upstream order — joined by index against the full planets list and the active campaign set, never symmetrized or rerouted (direction semantics are upstream's). A dangling index still counts in neighbor_summary.total with name/owner null, tallied under by_owner.unknown.",
       frontline:
@@ -681,7 +733,7 @@ export async function getPlanetHistory(
     },
     notes: {
       delta_health:
-        "Raw observed change per point: current − previous (negative = health depleting). hp_per_hour elsewhere uses the opposite orientation, (previous − current) / hours, positive = progressing toward resolution. Both are stated so the sign conventions are explicit.",
+        "Raw observed change per point: current − previous (negative = health depleting). hp_per_hour elsewhere uses the opposite orientation, (previous − current) / hours, positive = progressing toward resolution. Both are stated so the sign conventions are explicit. Both conventions apply to defense campaigns identically — the tracked health there is the EVENT health, which depletes toward zero while the defense is being won (verified live), so a falling series is progress for both kinds.",
       sampling:
         "Observed data points and deterministic deltas only — no smoothing, no forecast, no trend verdict. Sample timestamps use the Worker clock (upstream war time is game-epoch and not comparable).",
       rate_aggregates:
@@ -832,6 +884,9 @@ export async function getWarBrief(env: Env): Promise<unknown> {
         "Pre-joined assembly of the SAME normalized facts get_war_status, get_campaigns, and get_major_order return — every field is verifiable against those tools. No recommendation, priority ranking, or war-is-going-well/badly verdict is present by design; that reasoning belongs to the consumer.",
       major_order_targets:
         "The live trajectory of exactly the planets the current Major Order(s) name, in upstream assignment order. A target with no active campaign is included with its static planet state and has_active_campaign: false — campaign-derived fields are null there, never fabricated.",
+      hp_per_hour: RATE_SIGN_NOTE,
+      direction: DIRECTION_NOTE,
+      major_order_objectives: MO_OBJECTIVE_DECODE_NOTE,
       fronts:
         "Per-faction deterministic rollup (same as get_war_status faction_rollup): planets owned, active campaigns, the Stage-3 net_hp_per_hour aggregate echoed verbatim with coverage counts, and known player sums.",
       active_events:
