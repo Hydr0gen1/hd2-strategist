@@ -56,16 +56,51 @@ export interface GlobalSample {
   illuminate_kills: number | null;
 }
 
+/** Stage 8: one observed Major Order objective-progress sample. `progress`
+ * and `target` are the Stage-7-decoded values (upstream per-objective
+ * progress and the valueType-3 goal slot); missing upstream → null, never
+ * 0. `t` is the Worker clock, as everywhere. */
+export interface MoProgressSample {
+  t: number;
+  progress: number | null;
+  target: number | null;
+}
+
+/** Stage 8: a retained per-objective Major Order progress series, keyed by
+ * MO id + objective index (an MO can carry several objectives; each gets its
+ * own series — points are never mixed across MO ids or objectives).
+ * `task_type` is the raw upstream task type, stored so the read path can
+ * decode objective_kind with the current label map (a later-seeded label
+ * applies retroactively — the decode is never baked into the store). */
+export interface MoObjectiveSeries {
+  major_order_id: number;
+  objective_index: number;
+  task_type: number | null;
+  samples: MoProgressSample[];
+}
+
+/** Stage 8: one observation fed into advanceMoSeries by the poll path —
+ * the Stage-7 objective decode's progress/target for one MO objective. */
+export interface MoProgressObservation {
+  majorOrderId: number;
+  objectiveIndex: number;
+  taskType: number | null;
+  progress: number | null;
+  target: number | null;
+}
+
 export interface SampleStore {
   planets: Record<string, PlanetSampleSeries>;
   campaignsFirstSeen: Record<string, number>;
-  /** Stage 5 accumulation layers. OPTIONAL: absent on stores written before
-   * Stage 5 and omitted when empty, so older stores round-trip unchanged.
-   * Both ride the same single per-poll KV write in client.ts — never a
-   * second write — and always carry forward regardless of the planet
-   * series' carryForward semantics. */
+  /** Stage 5 (signatures/global) + Stage 8 (mo) accumulation layers.
+   * OPTIONAL: absent on stores written before the layer existed and omitted
+   * when empty, so older stores round-trip unchanged. All ride the same
+   * single per-poll KV write in client.ts — never a second write — and
+   * always carry forward regardless of the planet series' carryForward
+   * semantics. */
   signatures?: ObservedSignature[];
   global?: GlobalSample[];
+  mo?: MoObjectiveSeries[];
 }
 
 /** Minimum spacing between two health samples for a rate to be computed. */
@@ -93,6 +128,15 @@ export const MAX_SAMPLE_AGE_MS = 48 * 3_600_000;
  * global series reuses the planet-series discipline: 96 points / 48h. */
 export const MAX_SIGNATURES = 500;
 export const MAX_GLOBAL_SAMPLES = 96;
+
+/** Stage 8 bounds. Each MO objective series reuses the global-series
+ * discipline: 96 points / 48h. An MO carries a handful of objectives and at
+ * most a couple of MOs run at once, so the series-count cap is defensive
+ * (evicting the series with the oldest newest-sample beyond it). Worst case
+ * ~50 series × 96 points × ~45 B ≈ 0.2 MB on top of the existing store —
+ * still far under the 5 MB KV value limit (asserted in stage8.test.ts). */
+export const MAX_MO_SAMPLES = 96;
+export const MAX_MO_SERIES = 50;
 
 function finiteOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -184,6 +228,35 @@ function coerceGlobalEntry(entry: unknown): GlobalSample | undefined {
   };
 }
 
+/** Coerce one stored MO objective series; entries without finite series
+ * keys or any valid sample drop — rates of garbage rebuild, never throw. */
+function coerceMoEntry(entry: unknown): MoObjectiveSeries | undefined {
+  if (typeof entry !== "object" || entry === null) return undefined;
+  const e = entry as Record<string, unknown>;
+  const id = finiteOrNull(e.major_order_id);
+  const idx = finiteOrNull(e.objective_index);
+  if (id == null || idx == null || !Array.isArray(e.samples)) return undefined;
+  const samples: MoProgressSample[] = [];
+  for (const s of e.samples) {
+    if (typeof s !== "object" || s === null) continue;
+    const sample = s as Record<string, unknown>;
+    const t = finiteOrNull(sample.t);
+    if (t == null) continue;
+    samples.push({
+      t,
+      progress: numberOrNull(sample.progress),
+      target: numberOrNull(sample.target),
+    });
+  }
+  if (samples.length === 0) return undefined;
+  return {
+    major_order_id: id,
+    objective_index: idx,
+    task_type: numberOrNull(e.task_type),
+    samples,
+  };
+}
+
 /** Coerce a raw KV value (any historical shape, or garbage) to a SampleStore. */
 export function coerceStore(raw: unknown): SampleStore {
   const store: SampleStore = { planets: {}, campaignsFirstSeen: {} };
@@ -193,6 +266,7 @@ export function coerceStore(raw: unknown): SampleStore {
     campaignsFirstSeen?: unknown;
     signatures?: unknown;
     global?: unknown;
+    mo?: unknown;
   };
   if (typeof r.planets === "object" && r.planets !== null) {
     for (const [key, entry] of Object.entries(r.planets)) {
@@ -221,6 +295,13 @@ export function coerceStore(raw: unknown): SampleStore {
       .map(coerceGlobalEntry)
       .filter((g): g is GlobalSample => g !== undefined);
   }
+  // Stage 8 section: same presence rule — absent unless the stored value
+  // carried it, so pre-Stage-8 stores round-trip unchanged.
+  if (Array.isArray(r.mo)) {
+    store.mo = r.mo
+      .map(coerceMoEntry)
+      .filter((m): m is MoObjectiveSeries => m !== undefined);
+  }
   return store;
 }
 
@@ -234,12 +315,23 @@ export function evictSamples(
   samples: HealthSample[],
   nowMs: number,
 ): HealthSample[] {
+  return boundSeries(samples, nowMs, MAX_SAMPLES_PER_PLANET);
+}
+
+/** The shared append-path bound: age eviction, newest-survives guard, then
+ * the point cap. Generalized from the planet ring buffer so the Stage 8 MO
+ * series reuses the identical discipline instead of a parallel mechanism. */
+function boundSeries<T extends { t: number }>(
+  samples: T[],
+  nowMs: number,
+  maxPoints: number,
+): T[] {
   const cutoff = nowMs - MAX_SAMPLE_AGE_MS;
   let kept = samples.filter((s) => s.t >= cutoff);
   if (kept.length === 0 && samples.length > 0) {
     kept = [samples[samples.length - 1]!];
   }
-  return kept.slice(-MAX_SAMPLES_PER_PLANET);
+  return kept.slice(-maxPoints);
 }
 
 /**
@@ -399,4 +491,102 @@ export function advanceGlobalSeries(
   let kept = appended.filter((s) => s.t >= cutoff);
   if (kept.length === 0) kept = [appended[appended.length - 1]!];
   return kept.slice(-MAX_GLOBAL_SAMPLES);
+}
+
+/** Series identity: MO id + objective index, both finite numbers. */
+function moSeriesKey(majorOrderId: number, objectiveIndex: number): string {
+  return `${majorOrderId}:${objectiveIndex}`;
+}
+
+/**
+ * Stage 8: advance the per-objective Major Order progress series with the
+ * current poll cycle's observations. Same disciplines as the other
+ * accumulation layers, observation only — never a forecast:
+ *
+ * - one bounded series per {major_order_id, objective_index}; a sample
+ *   appends only when the tail is ≥ MIN_SAMPLE_INTERVAL_MS old (45s raw-cache
+ *   replays never double-sample), bounded by boundSeries (48h age + 96
+ *   points, newest survives — the planet/global discipline verbatim).
+ * - progress/target are recorded as finite numbers or null — a value missing
+ *   upstream is null at that point, never 0, never fabricated.
+ * - MO TURNOVER: a new MO id simply seeds new series; series NOT observed
+ *   this cycle (a prior MO after turnover, or every series while no MO is
+ *   active) are retained as historical record and age out by plain
+ *   MAX_SAMPLE_AGE_MS eviction — without the newest-survives guard, so a
+ *   fully-aged inactive series drops entirely. Points are never moved or
+ *   merged across series, so turnover cannot cross-contaminate.
+ * - no observations + no existing series → []; the store section therefore
+ *   stays absent until data first accrues (client.ts omits empty sections).
+ * - series count is capped at MAX_MO_SERIES (defensive — a few objectives ×
+ *   a couple of MOs in practice), evicting the oldest newest-sample first.
+ */
+export function advanceMoSeries(
+  existing: MoObjectiveSeries[] | undefined,
+  observed: MoProgressObservation[],
+  nowMs: number,
+): MoObjectiveSeries[] {
+  const byKey = new Map<string, MoObjectiveSeries>();
+  for (const series of existing ?? []) {
+    byKey.set(moSeriesKey(series.major_order_id, series.objective_index), series);
+  }
+
+  const seenThisCycle = new Set<string>();
+  for (const obs of observed) {
+    if (
+      !Number.isFinite(obs.majorOrderId) ||
+      !Number.isFinite(obs.objectiveIndex)
+    ) {
+      continue; // no usable series identity — never guess one
+    }
+    const key = moSeriesKey(obs.majorOrderId, obs.objectiveIndex);
+    if (seenThisCycle.has(key)) continue;
+    seenThisCycle.add(key);
+    const sample: MoProgressSample = {
+      t: nowMs,
+      progress: finiteOrNull(obs.progress),
+      target: finiteOrNull(obs.target),
+    };
+    const known = byKey.get(key);
+    const tail = known?.samples[known.samples.length - 1];
+    if (!known) {
+      byKey.set(key, {
+        major_order_id: obs.majorOrderId,
+        objective_index: obs.objectiveIndex,
+        task_type: finiteOrNull(obs.taskType),
+        samples: [sample],
+      });
+    } else if (!tail || nowMs - tail.t >= MIN_SAMPLE_INTERVAL_MS) {
+      byKey.set(key, {
+        ...known,
+        task_type: finiteOrNull(obs.taskType) ?? known.task_type,
+        samples: boundSeries([...known.samples, sample], nowMs, MAX_MO_SAMPLES),
+      });
+    }
+    // tail too recent → series untouched, same as the planet/global guard.
+  }
+
+  // Age-out pass for series not observed this cycle (prior-MO retention
+  // bound): plain age eviction; an emptied series drops.
+  const cutoff = nowMs - MAX_SAMPLE_AGE_MS;
+  let next: MoObjectiveSeries[] = [];
+  for (const [key, series] of byKey) {
+    if (seenThisCycle.has(key)) {
+      next.push(series);
+      continue;
+    }
+    const kept = series.samples.filter((s) => s.t >= cutoff);
+    if (kept.length === series.samples.length) next.push(series);
+    else if (kept.length > 0) next.push({ ...series, samples: kept });
+  }
+
+  if (next.length > MAX_MO_SERIES) {
+    next = next
+      .sort(
+        (a, b) =>
+          (b.samples[b.samples.length - 1]?.t ?? 0) -
+          (a.samples[a.samples.length - 1]?.t ?? 0),
+      )
+      .slice(0, MAX_MO_SERIES);
+  }
+  return next;
 }

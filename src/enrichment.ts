@@ -7,6 +7,8 @@
 import type {
   GlobalSample,
   HealthSample,
+  MoObjectiveSeries,
+  MoProgressObservation,
   ObservedSignature,
 } from "./sampling";
 import type {
@@ -24,6 +26,7 @@ import type {
   GlobalHistoryPoint,
   HazardInfo,
   HistoryRateAggregates,
+  MoHistorySeries,
   NeighborInfo,
   NeighborSummary,
   ObservedSignatureInfo,
@@ -33,6 +36,7 @@ import type {
   PlanetResolution,
   PlanetStatistics,
   RawAssignment,
+  RawAssignmentTask,
   RawBiome,
   RawDispatch,
   RawEvent,
@@ -361,6 +365,36 @@ export const TASK_VALUE_TYPE_PLANET = 12;
 export const TASK_VALUE_TYPE_GOAL = 3;
 
 /**
+ * Stage 7, Part D (extracted for Stage 8 reuse): the objective's goal
+ * quantity — the value in the first valueType-3 slot of the task's
+ * positional arrays. This is the ONE decode of the goal slot in the server;
+ * shapeMajorOrders (get_major_order / get_war_brief) and the Stage 8 MO
+ * progress sampler both call it, so the sampled `target` is by construction
+ * the same value the live MO payload shows. No goal slot / non-finite value
+ * → null, never fabricated.
+ */
+export function decodeObjectiveTarget(task: RawAssignmentTask): number | null {
+  const types = task.valueTypes ?? [];
+  const values = task.values ?? [];
+  const goalSlot = types.findIndex((vt) => vt === TASK_VALUE_TYPE_GOAL);
+  return goalSlot >= 0 ? finiteOrNull(values[goalSlot]) : null;
+}
+
+/**
+ * Stage 7, Part D (extracted for Stage 8 reuse): progress / target × 100,
+ * two decimals. Deterministic and divide-by-zero guarded: target 0, missing
+ * target, or missing progress → null — never a fabricated denominator.
+ */
+export function objectiveProgressPct(
+  progress: number | null,
+  target: number | null,
+): number | null {
+  return target != null && target > 0 && progress != null
+    ? Math.round((progress / target) * 10_000) / 100
+    : null;
+}
+
+/**
  * Stage 5: planet index → Major Order assignment id, from the same
  * tasks/valueTypes/values walk the MO planet set has always used. The
  * invariant-5 set is derived from this map's keys (new Set(map.keys())), so
@@ -683,10 +717,10 @@ export function shapeMajorOrders(assignments: RawAssignment[], nowMs: number) {
         // Stage 7, Part D: decode the positional arrays into named fields —
         // additive beside the raw arrays, which stay authoritative. Unknown
         // enum values keep their raw number with a null label (the
-        // EVENT_MODIFIER_NAMES fail-safe: never fabricate a name).
-        const goalSlot = types.findIndex((vt) => vt === TASK_VALUE_TYPE_GOAL);
-        const target =
-          goalSlot >= 0 ? finiteOrNull(values[goalSlot]) : null;
+        // EVENT_MODIFIER_NAMES fail-safe: never fabricate a name). The
+        // goal/pct decode is shared with the Stage 8 progress sampler —
+        // one source of truth (decodeObjectiveTarget / objectiveProgressPct).
+        const target = decodeObjectiveTarget(task);
         const progress = a.progress?.[i] ?? null;
         return {
           index: i,
@@ -694,10 +728,7 @@ export function shapeMajorOrders(assignments: RawAssignment[], nowMs: number) {
           objective_kind: TASK_TYPE_NAMES.get(task.type) ?? null,
           progress,
           target,
-          progress_pct:
-            target != null && target > 0 && progress != null
-              ? Math.round((progress / target) * 10_000) / 100
-              : null,
+          progress_pct: objectiveProgressPct(progress, target),
           values: task.values,
           value_types: task.valueTypes,
           value_labels: types.map(
@@ -1131,4 +1162,94 @@ export function selectHazards(
     name: typeof h?.name === "string" ? h.name : null,
     description: typeof h?.description === "string" ? h.description : null,
   }));
+}
+
+/* ----------------------------- Stage 8 -------------------------------- */
+
+/**
+ * Stage 8: the current poll cycle's Major Order progress observations, one
+ * per objective, from the SAME raw assignments every poll already fetches.
+ * progress is upstream's per-objective progress entry and target is the
+ * shared Stage 7 goal-slot decode (decodeObjectiveTarget) — never a second,
+ * independent decode of the positional arrays. An assignment without a
+ * finite id is skipped (no usable series identity); a missing progress or
+ * goal slot is null in the observation, never fabricated.
+ */
+export function moProgressObservations(
+  assignments: RawAssignment[],
+): MoProgressObservation[] {
+  const out: MoProgressObservation[] = [];
+  for (const a of assignments) {
+    if (typeof a.id !== "number" || !Number.isFinite(a.id)) continue;
+    (a.tasks ?? []).forEach((task, i) => {
+      out.push({
+        majorOrderId: a.id,
+        objectiveIndex: i,
+        taskType: finiteOrNull(task.type),
+        progress: finiteOrNull(a.progress?.[i]),
+        target: decodeObjectiveTarget(task),
+      });
+    });
+  }
+  return out;
+}
+
+/**
+ * Stage 8: shape one retained MO objective series for
+ * get_major_order_history — observed points with raw consecutive deltas,
+ * exactly the planet/global history pattern:
+ *
+ * - delta_progress = current − previous progress; null on the first point or
+ *   when either end's progress is null (missing is never treated as 0).
+ *   Negative deltas (an upstream progress reset) pass through as observed.
+ * - latest_progress / target echo the NEWEST sample; progress_pct reuses the
+ *   shared Stage 7 derivation (objectiveProgressPct — target 0/unknown →
+ *   null, never a divide-by-zero).
+ * - objective_kind decodes the stored raw task_type against TASK_TYPE_NAMES
+ *   at READ time (a later-confirmed label applies retroactively); an
+ *   unconfirmed type keeps its raw number with a null label.
+ * - fewer than 2 points → insufficient_history: true, span/deltas null —
+ *   the same honesty as the other history tools. No forecast, required
+ *   pace, or on-track verdict exists anywhere in this shape, by design.
+ */
+export function buildMoHistorySeries(
+  series: MoObjectiveSeries,
+  names: ReadonlyMap<number, string> = TASK_TYPE_NAMES,
+): MoHistorySeries {
+  const samples = series.samples;
+  const points = samples.map((s, i) => {
+    const prev = i > 0 ? samples[i - 1] : undefined;
+    return {
+      t: s.t,
+      observed_at: new Date(s.t).toISOString(),
+      progress: s.progress,
+      target: s.target,
+      delta_progress:
+        prev && s.progress != null && prev.progress != null
+          ? s.progress - prev.progress
+          : null,
+      delta_hours: prev ? (s.t - prev.t) / MS_PER_HOUR : null,
+    };
+  });
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const insufficient = samples.length < 2;
+  return {
+    major_order_id: series.major_order_id,
+    objective_index: series.objective_index,
+    task_type: series.task_type,
+    objective_kind:
+      series.task_type != null ? (names.get(series.task_type) ?? null) : null,
+    points: points.length,
+    samples: points,
+    latest_progress: last?.progress ?? null,
+    target: last?.target ?? null,
+    progress_pct: objectiveProgressPct(
+      last?.progress ?? null,
+      last?.target ?? null,
+    ),
+    samples_span_hours:
+      !insufficient && first && last ? (last.t - first.t) / MS_PER_HOUR : null,
+    insufficient_history: insufficient,
+  };
 }

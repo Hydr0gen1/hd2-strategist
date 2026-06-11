@@ -6,11 +6,14 @@
  */
 import {
   advanceGlobalSeries,
+  advanceMoSeries,
   advancePlanetSeries,
   coerceStore,
   foldSignatures,
   type GlobalSample,
   type HealthSample,
+  type MoObjectiveSeries,
+  type MoProgressObservation,
   type ObservedSignature,
   type SampleStore,
   type SignatureObservation,
@@ -192,12 +195,14 @@ async function readSampleStore(env: Env): Promise<SampleStore> {
  * lookup doesn't wipe every other planet's series and the campaign
  * first-seen ages.
  *
- * Stage 5: the accumulation layers (observed campaign signatures and the
- * global statistics series) ride this SAME single write — never a second
- * per-cycle KV put. Unlike planet series they ALWAYS carry forward,
- * regardless of carryForward: that flag's rebuild semantics apply to planet
- * series and campaign first-seen ages only. A call without `signatures` /
- * `globalStatistics` passes both layers through untouched.
+ * Stage 5/8: the accumulation layers (observed campaign signatures, the
+ * global statistics series, and the Major Order progress series) ride this
+ * SAME single write — never a second per-cycle KV put. Unlike planet series
+ * they ALWAYS carry forward, regardless of carryForward: that flag's rebuild
+ * semantics apply to planet series and campaign first-seen ages only. A call
+ * without `signatures` / `globalStatistics` passes those layers through
+ * untouched; the MO series additionally apply their age eviction on every
+ * write (that is how a prior MO's retained series eventually ages out).
  */
 export async function samplePlanetRates(
   env: Env,
@@ -207,6 +212,7 @@ export async function samplePlanetRates(
     carryForward?: boolean;
     signatures?: SignatureObservation[];
     globalStatistics?: RawStatistics | null;
+    moProgress?: MoProgressObservation[];
   } = {},
 ): Promise<Map<number, SampleOutput>> {
   const results = new Map<number, SampleOutput>();
@@ -234,6 +240,9 @@ export async function samplePlanetRates(
     nowMs,
   );
   if (global.length > 0) nextStore.global = global;
+  // Stage 8: MO progress series — same single write, same carry-forward.
+  const mo = advanceMoSeries(store.mo, opts.moProgress ?? [], nowMs);
+  if (mo.length > 0) nextStore.mo = mo;
 
   for (const input of inputs) {
     const idxKey = String(input.planetIndex);
@@ -311,4 +320,11 @@ export async function readObservedSignatures(
 export async function readGlobalSamples(env: Env): Promise<GlobalSample[]> {
   const store = await readSampleStore(env);
   return store.global ?? [];
+}
+
+/** Stage 8: read-only view of the retained Major Order progress series for
+ * get_major_order_history — one KV read, zero writes. */
+export async function readMoSeries(env: Env): Promise<MoObjectiveSeries[]> {
+  const store = await readSampleStore(env);
+  return store.mo ?? [];
 }

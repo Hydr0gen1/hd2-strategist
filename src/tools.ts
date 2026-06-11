@@ -1,5 +1,5 @@
 /**
- * The twelve MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The thirteen MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
@@ -9,6 +9,7 @@
 import {
   fetchUpstream,
   readGlobalSamples,
+  readMoSeries,
   readObservedSignatures,
   readPlanetSamples,
   samplePlanetRates,
@@ -22,6 +23,7 @@ import {
   buildGlobalHistoryPoints,
   buildHistoryPoints,
   buildMajorOrderTargets,
+  buildMoHistorySeries,
   buildNeighbors,
   buildSectorRollup,
   decayPerHour,
@@ -38,6 +40,7 @@ import {
   LIBERATION_PCT_NOTE,
   MO_OBJECTIVE_DECODE_NOTE,
   moPlanetAssignmentMap,
+  moProgressObservations,
   RATE_SIGN_NOTE,
   resolvePlanetName,
   selectBiome,
@@ -59,6 +62,8 @@ import {
 } from "./invariants";
 import {
   MAX_GLOBAL_SAMPLES,
+  MAX_MO_SAMPLES,
+  MAX_MO_SERIES,
   MAX_SAMPLE_AGE_MS,
   MAX_SAMPLES_PER_PLANET,
   MAX_SIGNATURES,
@@ -163,11 +168,13 @@ async function loadNormalizedCampaigns(
     ),
     nowMs,
     {
-      // Stage 5 accumulation layers — folded into the SAME single write.
+      // Stage 5/8 accumulation layers — folded into the SAME single write.
       // Global statistics are present only on the get_war_status path (the
-      // one place the war is fetched); signatures fold on every poll.
+      // one place the war is fetched); signatures and MO progress fold on
+      // every poll (assignments are always part of this fetch set).
       signatures: signatureObservationsFrom(raw),
       globalStatistics: warRes?.data?.statistics ?? null,
+      moProgress: moProgressObservations(assignmentsRes.data ?? []),
     },
   );
 
@@ -819,6 +826,103 @@ export async function getGlobalHistory(env: Env): Promise<unknown> {
       sampling:
         "A lean named subset of upstream war.statistics sampled over time on the Worker clock. A field missing upstream is null at that point, never 0; deltas are null when either end is null. Observed values and raw consecutive differences only — no smoothing, no forecast, no trend verdict.",
     },
+  };
+}
+
+/**
+ * Stage 8: the retained Major Order objective-progress series with raw
+ * observed deltas — one bounded series per {major_order_id, objective_index},
+ * sampled passively inside the existing single sample-store write on every
+ * campaign poll (and every cron tick). Read-only here: one assignments fetch
+ * (shared 45s cache, to know the active MO ids) + one KV read, ZERO sample-
+ * store writes. No args → every series of the currently active MO(s); a
+ * prior MO's series is retained until it ages out and stays queryable by
+ * major_order_id. Observed points and deterministic deltas only — never a
+ * forecast, required pace, or on-track/behind verdict; that judgment belongs
+ * to the conversation layer.
+ */
+export async function getMajorOrderHistory(
+  env: Env,
+  args: { major_order_id?: number; objective_index?: number },
+): Promise<unknown> {
+  const res = await fetchUpstream<RawAssignment[]>(env, "/api/v1/assignments");
+  const assignments = res.data ?? [];
+  const activeIds = assignments
+    .map((a) => a.id)
+    .filter((id): id is number => typeof id === "number" && Number.isFinite(id));
+
+  // Read-only: history never writes to the sample store.
+  const retained = await readMoSeries(env);
+  const retainedIds = [...new Set(retained.map((s) => s.major_order_id))];
+
+  const requestedId = args.major_order_id;
+  const wanted = retained.filter(
+    (s) =>
+      (requestedId != null
+        ? s.major_order_id === requestedId
+        : activeIds.includes(s.major_order_id)) &&
+      (args.objective_index == null ||
+        s.objective_index === args.objective_index),
+  );
+  const series = wanted
+    .sort(
+      (a, b) =>
+        a.major_order_id - b.major_order_id ||
+        a.objective_index - b.objective_index,
+    )
+    .map((s) => buildMoHistorySeries(s));
+
+  let note: string | undefined;
+  if (series.length === 0) {
+    if (requestedId != null) {
+      note = `No retained series for major_order_id ${requestedId}${args.objective_index != null ? ` / objective_index ${args.objective_index}` : ""}. Retained ids are listed in retained_major_order_ids; a Major Order's series exists only while this server sampled it and ages out ${MAX_SAMPLE_AGE_MS / 3_600_000}h after its last sample.`;
+    } else if (activeIds.length === 0) {
+      note =
+        "No active Major Order right now — there is no current-MO series to return (not an error). A prior MO's retained series (see retained_major_order_ids) can still be requested by major_order_id until it ages out.";
+    } else {
+      note =
+        "No progress samples retained for the active Major Order yet. Samples accrue whenever this server polls campaigns (get_war_status, get_campaigns, get_planet, get_war_brief, and the 10-minute cron) — a cold start is expected to be empty, not an error, and populates after two polls >60s apart.";
+    }
+  }
+
+  return {
+    active_major_order: activeIds.length > 0,
+    active_major_order_ids: activeIds,
+    retained_major_order_ids: retainedIds,
+    ...(requestedId != null
+      ? {
+          requested: {
+            major_order_id: requestedId,
+            ...(args.objective_index != null
+              ? { objective_index: args.objective_index }
+              : {}),
+          },
+        }
+      : {}),
+    series_count: series.length,
+    series,
+    ...(note ? { note } : {}),
+    retention: {
+      max_points_per_objective: MAX_MO_SAMPLES,
+      max_age_hours: MAX_SAMPLE_AGE_MS / 3_600_000,
+      max_series: MAX_MO_SERIES,
+      note: `Bounded like the planet/global series (oldest evicted first). On MO turnover the prior MO's series stops accruing and is retained as historical record until its samples age out; the combined store key carries a ${SAMPLES_KEY_TTL_SECONDS / 86_400}-day KV TTL refreshed on every poll.`,
+    },
+    notes: {
+      sampling:
+        "Observed Major Order objective progress sampled by this server on its poll cadence (request polls + the 10-minute cron), timestamped on the Worker clock. progress and target are the SAME Stage-7-decoded values get_major_order returns (target = the first valueType-3 'goal' slot) — one decode, so every sample is verifiable against the live MO payload. A value missing upstream is null at that point, never 0; a new sample appends only when the previous one is >60s old.",
+      deltas:
+        "delta_progress / delta_hours are raw differences between consecutive OBSERVATIONS — what was seen between two samples, never a projection. No forecast, completion estimate, required pace, or on-track/behind verdict exists anywhere in this payload by design: pace and completion judgment belong to the consumer, grounded on these observed points.",
+      progress_pct:
+        "latest_progress / target × 100, from the newest sample — deterministic; null when the target is 0 or unknown or progress is unknown (never a divide-by-zero, never a fabricated denominator).",
+      objective_kind:
+        "Decoded from the stored raw task_type only for enum values confirmed against live Major Orders (TASK_TYPE_NAMES); an unconfirmed type keeps its raw number with objective_kind null — a name is never fabricated.",
+      turnover:
+        "Series are keyed by major_order_id + objective_index, each objective tracked independently. When a Major Order is replaced, its series stop accruing but remain queryable by major_order_id until they age out; the new MO starts fresh series — points are never mixed across MO ids.",
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshnessFrom([res.fetchedAt], Date.now()),
+    ...(res.stale ? { stale: true } : {}),
   };
 }
 

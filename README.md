@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through twelve MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through thirteen MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -37,6 +37,7 @@ The convention is identical for defense campaigns (the tracked health there is t
 | `get_planet_wiki` | **Lore source (separate from live war state):** community wiki entry from helldivers.wiki.gg for a planet (`name`) or any topic (`title`, e.g. "Jet Brigade") — plain-text lead extract, canonical URL, mandatory attribution (CC BY-NC-SA 4.0). Never authoritative for current war state |
 | `get_observed_signatures` | Accumulated record of every distinct campaign signature tuple `{campaign_type, event_type, has_event, faction}` this server has observed, newest `last_seen` first — passive raw observation that captures rare states (special-faction events, defense campaign types) with timestamps |
 | `get_global_history` | Global war statistics time-series sampled by this server (player count, missions, deaths, kills): retained points + raw observed deltas — observed values, never a forecast. Accrues on `get_war_status` polls |
+| `get_major_order_history` | Observed Major Order objective-progress time-series: one bounded series per objective (`major_order_id` + `objective_index`) with per-point `delta_progress`/`delta_hours`, latest progress/target, and `progress_pct` — observed samples and deltas only, never a forecast, required pace, or on-track verdict. No args → the active MO(s); a recently ended MO stays queryable by `major_order_id` until it ages out |
 | `resolve_planet` | Resolve a loose planet name (`query`) to the canonical planet: exact → punctuation/space-normalized → fuzzy. Near-misses and ties return ranked candidates (`score` = edit distance) with `matched: false` — never a silent substitution |
 
 ### Freshness metadata (Stage 6)
@@ -104,7 +105,7 @@ The rate needs **two calls separated by more than 60 seconds of wall-clock time*
 
 The same timing governs `get_planet_history`: it returns the samples accumulated by polling (`get_campaigns` / `get_war_status` / `get_planet` calls), so on a cold start it correctly reports an empty series with `insufficient_history: true` — populate it with two polls >60s apart.
 
-`get_global_history` follows the same rule, with one narrowing: global statistics are sampled only when the war state is fetched (`get_war_status` polls — and every cron tick, see below), so locally populate it with two `get_war_status` calls >60s apart. `get_observed_signatures` accumulates on every campaign poll and is expected to be empty on a cold start. Both tools are read-only:
+`get_global_history` follows the same rule, with one narrowing: global statistics are sampled only when the war state is fetched (`get_war_status` polls — and every cron tick, see below), so locally populate it with two `get_war_status` calls >60s apart. `get_major_order_history` follows the same rule too — MO objective progress is sampled on every campaign poll (assignments are part of that fetch set), so a cold start correctly reports empty series with `insufficient_history: true`, populating after two polls >60s apart. `get_observed_signatures` accumulates on every campaign poll and is expected to be empty on a cold start. All three tools are read-only:
 
 ```bash
 curl -s localhost:8787/mcp -H 'content-type: application/json' \
@@ -112,11 +113,14 @@ curl -s localhost:8787/mcp -H 'content-type: application/json' \
 
 curl -s localhost:8787/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_global_history","arguments":{}}}'
+
+curl -s localhost:8787/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_major_order_history","arguments":{}}}'
 ```
 
 ### Background sampling (Cron Trigger)
 
-A Cloudflare Cron Trigger (`[triggers]` in `wrangler.toml`) fires the Worker's `scheduled` handler **every 10 minutes** and drives exactly the same sampling path a request-driven poll does: the same cache/fetch logic, the same 60s minimum sample interval, and the same single merged `samples:planets` write (planet series + observed signatures + global statistics — global stats are sampled on every tick because the war fetch is joined). The accumulation layers behind `get_planet_history`, `get_global_history`, and `get_observed_signatures` therefore advance continuously on the deployed Worker, independent of user calls. It introduces no new data, fields, or interpretation — it only runs the existing sampler on a schedule.
+A Cloudflare Cron Trigger (`[triggers]` in `wrangler.toml`) fires the Worker's `scheduled` handler **every 10 minutes** and drives exactly the same sampling path a request-driven poll does: the same cache/fetch logic, the same 60s minimum sample interval, and the same single merged `samples:planets` write (planet series + observed signatures + global statistics + Major Order progress series — global stats are sampled on every tick because the war fetch is joined). The accumulation layers behind `get_planet_history`, `get_global_history`, `get_major_order_history`, and `get_observed_signatures` therefore advance continuously on the deployed Worker, independent of user calls. It introduces no new data, fields, or interpretation — it only runs the existing sampler on a schedule.
 
 - **Cadence & KV write budget:** the KV free tier allows ~1,000 writes/day, and a tick costs ~4 KV writes — the single merged store write **plus** up to three `raw:` cache refreshes (the 45s response cache is always expired between ticks). At `*/10` that is 144 runs × 4 ≈ 576 writes/day, comfortably under the ceiling with headroom for user traffic; a 2-min cadence would be ~2,880/day (≈3× over budget — KV writes then fail silently and the sampler stalls for the rest of the UTC day). Faster sampling also *shortens* the visible history window: the 96-point ring buffer spans 16h at `*/10` but only ~3h at `*/2`. Re-check the full budget before ever tightening the cadence.
 - **UTC:** Cloudflare cron always evaluates in UTC. Irrelevant for a fixed-interval poll, but any future time-of-day schedule must account for it.
@@ -142,7 +146,7 @@ src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
 src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode)
 src/wiki.ts        Pure wiki lore logic (query plan, response shaping, attribution) — separate source
 src/wikiClient.ts  Wiki fetch + long-TTL KV cache (`wiki:` namespace) — separate from client.ts
-src/tools.ts       The twelve tool implementations
+src/tools.ts       The thirteen tool implementations
 src/types.ts       Raw upstream + normalized types
 ```
 
