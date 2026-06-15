@@ -317,6 +317,27 @@ export interface PlanetHistoryPoint {
   delta_hours: number | null;
 }
 
+/** Stage 12: one observed point in a planet's UNBOUNDED D1 archive series.
+ * Carries everything get_planet_history's point does, plus the signed
+ * hp_per_hour stored at sample time and the campaign context — observed values
+ * and raw consecutive deltas only, never a projection or trend. */
+export interface PlanetArchivePoint {
+  /** Raw HP at sample time; null when absent upstream at that tick. */
+  health: number | null;
+  max_health: number | null;
+  /** The signed rate computed for that tick (null while stabilizing). */
+  hp_per_hour: number | null;
+  campaign_id: number | null;
+  campaign_kind: string | null;
+  faction: string | null;
+  /** Worker-clock ms epoch, exactly as sampled. */
+  t: number;
+  observed_at: string;
+  /** current − previous health; null on the first point or across a null. */
+  delta_health: number | null;
+  delta_hours: number | null;
+}
+
 /** Stage 4: get_planet_wiki payload — LORE source (helldivers.wiki.gg),
  * physically separate from all live war-state output. Carries mandatory
  * attribution on every outcome and never any live war number. */
@@ -797,6 +818,11 @@ export type CrossCheckBlock =
 /** Worker environment bindings. */
 export interface Env {
   WAR_CACHE?: KVNamespace;
+  /** Stage 12: the append-only D1 history archive. Optional like WAR_CACHE —
+   * the archive write is best-effort (a missing binding degrades to "this tick
+   * was not archived", never an error), and the live KV path never touches it.
+   * The archive read tools surface a clear message when it is unconfigured. */
+  HISTORY_DB?: D1Database;
   SUPER_CLIENT?: string;
   SUPER_CONTACT?: string;
 }

@@ -5,6 +5,11 @@
  * deterministic unit conversion — never a judgment.
  */
 import type {
+  GlobalArchiveRow,
+  MoArchiveRow,
+  PlanetArchiveRow,
+} from "./archive";
+import type {
   GlobalSample,
   HealthSample,
   MoObjectiveSeries,
@@ -28,6 +33,7 @@ import type {
   HazardInfo,
   HistoryRateAggregates,
   MoHistorySeries,
+  PlanetArchivePoint,
   NeighborInfo,
   NeighborSummary,
   ObservedSignatureInfo,
@@ -1262,6 +1268,106 @@ export function buildMoHistorySeries(
       !insufficient && first && last ? (last.t - first.t) / MS_PER_HOUR : null,
     insufficient_history: insufficient,
   };
+}
+
+/* ----------------------------- Stage 12 ------------------------------- */
+
+/**
+ * Stage 12: observed history points from a planet's UNBOUNDED D1 archive
+ * (oldest → newest). Each point after the first carries raw consecutive deltas
+ * from its predecessor; delta_health is null when either end's health is null
+ * (a missing upstream value is never treated as 0). The stored signed
+ * hp_per_hour and campaign context ride each point verbatim. Deterministic
+ * differences only — no smoothing, no forecast, no trend label (the same
+ * honesty discipline as get_planet_history, over the long series instead of
+ * the recent KV window).
+ */
+export function buildPlanetArchivePoints(
+  rows: PlanetArchiveRow[],
+): PlanetArchivePoint[] {
+  return rows.map((r, i) => {
+    const prev = i > 0 ? rows[i - 1] : undefined;
+    return {
+      health: r.health,
+      max_health: r.max_health,
+      hp_per_hour: r.hp_per_hour,
+      campaign_id: r.campaign_id,
+      campaign_kind: r.campaign_kind,
+      faction: r.faction,
+      t: r.sampled_at,
+      observed_at: new Date(r.sampled_at).toISOString(),
+      delta_health:
+        prev && r.health != null && prev.health != null
+          ? r.health - prev.health
+          : null,
+      delta_hours: prev ? (r.sampled_at - prev.sampled_at) / MS_PER_HOUR : null,
+    };
+  });
+}
+
+/**
+ * Stage 12: observed history points from the global D1 archive. The archive
+ * rows carry exactly the GlobalSample field set (under `sampled_at`), so this
+ * maps them onto the in-memory shape and reuses buildGlobalHistoryPoints — one
+ * delta derivation, never a parallel path. Same null-propagating, observed-only
+ * discipline.
+ */
+export function buildGlobalArchivePoints(
+  rows: GlobalArchiveRow[],
+): GlobalHistoryPoint[] {
+  return buildGlobalHistoryPoints(
+    rows.map((r) => ({
+      t: r.sampled_at,
+      player_count: r.player_count,
+      missions_won: r.missions_won,
+      missions_lost: r.missions_lost,
+      deaths: r.deaths,
+      terminid_kills: r.terminid_kills,
+      automaton_kills: r.automaton_kills,
+      illuminate_kills: r.illuminate_kills,
+      impact_multiplier: r.impact_multiplier,
+      active_campaign_count: r.active_campaign_count,
+    })),
+  );
+}
+
+/**
+ * Stage 12: group flat MO archive rows into per-objective series (keyed by
+ * major_order_id + objective_index, rows already time-ordered by the query but
+ * re-sorted defensively) and shape each through buildMoHistorySeries — the SAME
+ * observed-deltas builder get_major_order_history uses, so the archive view is
+ * verifiable against the live view. The archive does not store task_type, so
+ * objective_kind is null here (the live history tool decodes it from the KV
+ * series); everything else — progress/target, deltas, progress_pct,
+ * insufficient_history — is identical. No forecast or pace verdict, ever.
+ */
+export function buildMoArchiveSeries(rows: MoArchiveRow[]): MoHistorySeries[] {
+  const byKey = new Map<string, MoObjectiveSeries>();
+  for (const r of rows) {
+    const key = `${r.major_order_id}:${r.objective_index}`;
+    let series = byKey.get(key);
+    if (!series) {
+      series = {
+        major_order_id: r.major_order_id,
+        objective_index: r.objective_index,
+        task_type: null,
+        samples: [],
+      };
+      byKey.set(key, series);
+    }
+    series.samples.push({ t: r.sampled_at, progress: r.progress, target: r.target });
+  }
+  return [...byKey.values()]
+    .map((s) => ({
+      ...s,
+      samples: [...s.samples].sort((a, b) => a.t - b.t),
+    }))
+    .sort(
+      (a, b) =>
+        a.major_order_id - b.major_order_id ||
+        a.objective_index - b.objective_index,
+    )
+    .map((s) => buildMoHistorySeries(s));
 }
 
 /* ----------------------------- Stage 9 -------------------------------- */

@@ -3,17 +3,21 @@
  * tools/list, and tools/call (plus ping and client notifications).
  * Hand-rolled — no SDK — to stay within the Workers free-tier CPU budget.
  */
+import { ArchiveError } from "./archive";
 import { UpstreamError } from "./client";
 import {
   ToolError,
   getCampaigns,
   getDispatches,
+  getGlobalArchive,
   getGlobalHistory,
   getMajorOrder,
+  getMajorOrderArchive,
   getMajorOrderHistory,
   getObservedSignatures,
   getPatchNotes,
   getPlanet,
+  getPlanetArchive,
   getPlanetHistory,
   getPlanetWiki,
   getSourceCrossCheck,
@@ -217,6 +221,77 @@ const TOOL_DEFINITIONS = [
       "Normalization-faithfulness health check: every active campaign and Major Order objective cross-checked against the raw ArrowHead payloads (the same upstream wrapper's /raw endpoints — same host, auth, and cache; not a second provider). Returns deterministic tallies (agreements, unexpected disagreements, expected invariant transforms, uncheckable fields) plus the specific divergent fields with BOTH values and the difference. Pure observation: a disagreement is surfaced, never resolved — no side is ranked correct. Expected transforms (defense decay force-nulled, liberation % recomputed) are classified as documented invariant behavior, never mismatches. Degrades to a reasoned unavailable section when /raw cannot be fetched.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
+  {
+    name: "get_planet_archive",
+    description:
+      "Long-range observed health time-series for one planet (by index or name) from the UNBOUNDED D1 archive — the durable, multi-day/week counterpart to get_planet_history's recent in-memory window. Returns archived data points with per-point delta_health / delta_hours between consecutive samples, plus the signed hp_per_hour and campaign context stored at each tick. Observed values and deterministic deltas only — no forecasts or trend labels. Defaults to the last 7 days, capped at 1000 rows. Empty/sparse series (insufficient_history: true) is expected on a cold archive or for an out-of-window planet. For live rate/ETA/projection, use the live tools — this is history, not current state.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        index: { type: "number", description: "Planet index (e.g. 175)" },
+        name: {
+          type: "string",
+          description: "Planet name, case-insensitive (e.g. \"Grand Errant\")",
+        },
+        since_hours: {
+          type: "number",
+          description:
+            "Look-back window in hours (default 168 = 7 days). Only samples newer than this are returned.",
+        },
+        limit: {
+          type: "number",
+          description: "Max rows to return (default and cap 1000), oldest-first within the window.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_global_archive",
+    description:
+      "Long-range global war-statistics time-series from the UNBOUNDED D1 archive (player count, impact_multiplier, active_campaign_count, missions won/lost, deaths, per-faction kills): the durable counterpart to get_global_history, the view that answers impact-multiplier-vs-population and the daily population cycle over days/weeks rather than hours. Returns archived points with raw observed deltas between consecutive samples. Observed values and deterministic differences only — never a forecast, correlation, or trend verdict. Defaults to the last 7 days, capped at 1000 rows. Empty series (insufficient_history: true) is expected on a cold archive.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since_hours: {
+          type: "number",
+          description: "Look-back window in hours (default 168 = 7 days).",
+        },
+        limit: {
+          type: "number",
+          description: "Max rows to return (default and cap 1000), oldest-first within the window.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_major_order_archive",
+    description:
+      "Long-range Major Order objective-progress time-series from the UNBOUNDED D1 archive: the durable counterpart to get_major_order_history, grounding MO pace across a whole order rather than the recent window. One series per objective (keyed by major_order_id + objective_index) with per-point delta_progress / delta_hours, latest progress/target, and deterministic progress_pct. Observed samples and raw deltas only — never a forecast, completion estimate, required pace, or on-track/behind verdict. Optional major_order_id / objective_index narrow the query. Defaults to the last 7 days, capped at 1000 rows. objective_kind is null here (the raw task type is not archived); use get_major_order_history for the decoded label.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        major_order_id: {
+          type: "number",
+          description: "Narrow to one Major Order id (any MO ever sampled into the archive).",
+        },
+        objective_index: {
+          type: "number",
+          description: "Narrow to one objective index within the Major Order.",
+        },
+        since_hours: {
+          type: "number",
+          description: "Look-back window in hours (default 168 = 7 days).",
+        },
+        limit: {
+          type: "number",
+          description: "Max rows to return (default and cap 1000), oldest-first within the window.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 interface JsonRpcRequest {
@@ -316,6 +391,40 @@ async function dispatchTool(
       return toolText(await getGlobalHistory(env));
     case "get_source_crosscheck":
       return toolText(await getSourceCrossCheck(env));
+    case "get_planet_archive":
+      return toolText(
+        await getPlanetArchive(env, {
+          index: typeof args.index === "number" ? args.index : undefined,
+          name: typeof args.name === "string" ? args.name : undefined,
+          since_hours:
+            typeof args.since_hours === "number" ? args.since_hours : undefined,
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+        }),
+      );
+    case "get_global_archive":
+      return toolText(
+        await getGlobalArchive(env, {
+          since_hours:
+            typeof args.since_hours === "number" ? args.since_hours : undefined,
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+        }),
+      );
+    case "get_major_order_archive":
+      return toolText(
+        await getMajorOrderArchive(env, {
+          major_order_id:
+            typeof args.major_order_id === "number"
+              ? args.major_order_id
+              : undefined,
+          objective_index:
+            typeof args.objective_index === "number"
+              ? args.objective_index
+              : undefined,
+          since_hours:
+            typeof args.since_hours === "number" ? args.since_hours : undefined,
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+        }),
+      );
     case "get_major_order_history":
       return toolText(
         await getMajorOrderHistory(env, {
@@ -391,7 +500,8 @@ export async function handleMcpRequest(
         if (
           err instanceof ToolError ||
           err instanceof UpstreamError ||
-          err instanceof WikiError
+          err instanceof WikiError ||
+          err instanceof ArchiveError
         ) {
           return rpcResult(id, toolText({ error: err.message }, true));
         }
