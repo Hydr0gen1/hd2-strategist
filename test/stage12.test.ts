@@ -172,6 +172,8 @@ class FakeD1 {
 
   async all(sql: string, v: unknown[]): Promise<{ results: unknown[] }> {
     this.lastSelectSql = sql;
+    // Mirror the real queries: ORDER BY sampled_at DESC + LIMIT selects the
+    // NEWEST `limit` rows; archive.ts re-sorts ascending for presentation.
     if (sql.includes("FROM planet_samples")) {
       const [planetIndex, sinceMs, limit] = v as number[];
       return {
@@ -179,7 +181,7 @@ class FakeD1 {
           .filter(
             (r) => r.planet_index === planetIndex && r.sampled_at >= sinceMs!,
           )
-          .sort((a, b) => a.sampled_at - b.sampled_at)
+          .sort((a, b) => b.sampled_at - a.sampled_at)
           .slice(0, limit),
       };
     }
@@ -189,7 +191,7 @@ class FakeD1 {
       return {
         results: this.global_samples
           .filter((r) => r.sampled_at >= sinceMs)
-          .sort((a, b) => a.sampled_at - b.sampled_at)
+          .sort((a, b) => b.sampled_at - a.sampled_at)
           .slice(0, limit),
       };
     }
@@ -211,7 +213,7 @@ class FakeD1 {
               (moId == null || r.major_order_id === moId) &&
               (objIdx == null || r.objective_index === objIdx),
           )
-          .sort((a, b) => a.sampled_at - b.sampled_at)
+          .sort((a, b) => b.sampled_at - a.sampled_at)
           .slice(0, limit),
       };
     }
@@ -718,9 +720,14 @@ describe("readPlanetArchive / readGlobalArchive / readMoArchive", () => {
       NOW + 4 * HOUR_MS,
     ]);
 
-    // limit caps the row count (oldest-first within the window).
+    // limit caps the row count to the NEWEST rows (not the oldest), still
+    // presented ascending — a busy window never drops its most recent points.
     const capped = await readPlanetArchive(env, 175, NOW - HOUR_MS, 2);
     expect(capped).toHaveLength(2);
+    expect(capped.map((r) => r.sampled_at)).toEqual([
+      NOW + 3 * HOUR_MS,
+      NOW + 4 * HOUR_MS,
+    ]);
 
     // PARAMETERIZED: values are bound (placeholders), never interpolated.
     expect(d1.lastSelectSql).toContain("WHERE planet_index = ? AND sampled_at >= ?");
@@ -749,6 +756,31 @@ describe("readPlanetArchive / readGlobalArchive / readMoArchive", () => {
     expect(rows.map((r) => r.player_count)).toEqual([40_000, 40_001, 40_002]);
     expect(d1.lastSelectSql).toContain("sampled_at >= ?");
     expect(d1.lastSelectSql).not.toMatch(/LIMIT \d/);
+  });
+
+  it("a capped window returns the NEWEST rows, not the oldest (re-sorted ascending)", async () => {
+    const d1 = new FakeD1();
+    // 5 in-window samples; with limit 2 the cap must keep the latest two.
+    for (let i = 0; i < 5; i++) {
+      d1.global_samples.push({
+        sampled_at: NOW + i * HOUR_MS,
+        player_count: 40_000 + i,
+        impact_multiplier: 1.5,
+        active_campaign_count: 10,
+        missions_won: 1,
+        missions_lost: 1,
+        deaths: 1,
+        terminid_kills: 1,
+        automaton_kills: 1,
+        illuminate_kills: 1,
+      });
+    }
+    const rows = await readGlobalArchive(envWith(null, d1), NOW - HOUR_MS, 2);
+    expect(rows.map((r) => r.sampled_at)).toEqual([
+      NOW + 3 * HOUR_MS,
+      NOW + 4 * HOUR_MS,
+    ]); // newest two, ascending — the most recent points are never dropped
+    expect(rows.map((r) => r.player_count)).toEqual([40_003, 40_004]);
   });
 
   it("MO archive narrows by major_order_id / objective_index via bound params", async () => {

@@ -268,7 +268,9 @@ async function runArchiveQuery<T>(
   }
 }
 
-/** Long-range planet samples ordered oldest → newest, within the window. */
+/** Long-range planet samples within the window — the NEWEST `limit` rows when
+ * capped (selected DESC, then re-sorted ascending for presentation), so a
+ * busy window never silently drops its most recent points. */
 export async function readPlanetArchive(
   env: Env,
   planetIndex: number,
@@ -276,47 +278,51 @@ export async function readPlanetArchive(
   limit: number,
 ): Promise<PlanetArchiveRow[]> {
   const db = requireDb(env);
-  return runArchiveQuery<PlanetArchiveRow>(
+  const rows = await runArchiveQuery<PlanetArchiveRow>(
     db
       .prepare(
         `SELECT planet_index, sampled_at, health, max_health, hp_per_hour, campaign_id, campaign_kind, faction
            FROM planet_samples
           WHERE planet_index = ? AND sampled_at >= ?
-          ORDER BY sampled_at ASC
+          ORDER BY sampled_at DESC
           LIMIT ?`,
       )
       .bind(planetIndex, sinceMs, limit),
     "planet archive",
   );
+  return rows.sort((a, b) => a.sampled_at - b.sampled_at);
 }
 
-/** Long-range global war-statistics samples ordered oldest → newest. */
+/** Long-range global war-statistics samples — the NEWEST `limit` rows when
+ * capped, re-sorted ascending for presentation. */
 export async function readGlobalArchive(
   env: Env,
   sinceMs: number,
   limit: number,
 ): Promise<GlobalArchiveRow[]> {
   const db = requireDb(env);
-  return runArchiveQuery<GlobalArchiveRow>(
+  const rows = await runArchiveQuery<GlobalArchiveRow>(
     db
       .prepare(
         `SELECT sampled_at, player_count, impact_multiplier, active_campaign_count,
                 missions_won, missions_lost, deaths, terminid_kills, automaton_kills, illuminate_kills
            FROM global_samples
           WHERE sampled_at >= ?
-          ORDER BY sampled_at ASC
+          ORDER BY sampled_at DESC
           LIMIT ?`,
       )
       .bind(sinceMs, limit),
     "global archive",
   );
+  return rows.sort((a, b) => a.sampled_at - b.sampled_at);
 }
 
 /**
- * Long-range Major Order objective-progress samples ordered oldest → newest,
- * optionally narrowed to one MO id and/or one objective index. Returns flat
- * rows; the tool groups them into per-objective series. The query stays
- * parameterized regardless of which optional filters are present.
+ * Long-range Major Order objective-progress samples, optionally narrowed to one
+ * MO id and/or one objective index. Returns the NEWEST `limit` rows when capped
+ * (DESC + LIMIT across all matching objectives), re-sorted ascending; the tool
+ * then groups them into per-objective series. The query stays parameterized
+ * regardless of which optional filters are present.
  */
 export async function readMoArchive(
   env: Env,
@@ -336,18 +342,19 @@ export async function readMoArchive(
     binds.push(filters.objectiveIndex);
   }
   binds.push(limit);
-  return runArchiveQuery<MoArchiveRow>(
+  const rows = await runArchiveQuery<MoArchiveRow>(
     db
       .prepare(
         `SELECT major_order_id, objective_index, sampled_at, progress, target
            FROM mo_progress_samples
           WHERE ${where.join(" AND ")}
-          ORDER BY sampled_at ASC
+          ORDER BY sampled_at DESC
           LIMIT ?`,
       )
       .bind(...binds),
     "major order archive",
   );
+  return rows.sort((a, b) => a.sampled_at - b.sampled_at);
 }
 
 /** Clamp a caller-supplied row limit into [1, ARCHIVE_MAX_LIMIT]. */
