@@ -630,6 +630,37 @@ describe("samplePlanetRates → D1 archive (KV path unchanged)", () => {
     expect(results.get(175)!.hpPerHour).toBeNull();
     expect(kv.puts).toHaveLength(1);
   });
+
+  it("a FAILED KV write → NOT archived (no over-sampling against a stale store)", async () => {
+    const kv = fakeKv();
+    kv.put = async () => {
+      throw new Error("KV write budget exhausted");
+    };
+    const d1 = new FakeD1();
+    const results = await samplePlanetRates(envWith(kv, d1), INPUTS, NOW, {
+      globalStatistics: stats(),
+      signatures: [
+        { campaign_type: 0, event_type: null, has_event: false, faction: "Terminids" },
+      ],
+    });
+    // Primary result still computed; the ring buffer simply did not persist.
+    expect(results.get(175)).toBeDefined();
+    // Because KV did not commit, the archive is NOT written — the next poll
+    // re-reads the old store and would re-seed this same observation.
+    expect(d1.batchCalls).toBe(0);
+    expect(d1.planet_samples).toHaveLength(0);
+    expect(d1.global_samples).toHaveLength(0);
+    expect(d1.observed_signatures).toHaveLength(0);
+  });
+
+  it("no KV binding at all → no archiving (the ring buffer never advanced)", async () => {
+    const d1 = new FakeD1();
+    await samplePlanetRates(envWith(null, d1), INPUTS, NOW, {
+      globalStatistics: stats(),
+    });
+    expect(d1.batchCalls).toBe(0);
+    expect(d1.planet_samples).toHaveLength(0);
+  });
 });
 
 /* ====================================================================== *

@@ -334,6 +334,13 @@ export async function samplePlanetRates(
     });
   }
 
+  // Track whether the KV ring buffer actually persisted this tick. The D1
+  // archive must ride a COMMITTED KV sample: if the KV write is skipped (no
+  // binding) or fails (a transient KV error / exhausted write budget), the
+  // next poll re-reads an empty/old store and re-seeds the SAME observation as
+  // "fresh", so archiving now would accumulate duplicate/over-sampled rows that
+  // no longer correspond to the ring buffer. Gate the archive on the put.
+  let kvCommitted = false;
   if (env.WAR_CACHE) {
     try {
       await env.WAR_CACHE.put(SAMPLES_KEY, JSON.stringify(nextStore), {
@@ -343,18 +350,20 @@ export async function samplePlanetRates(
         // evaporates after a month.
         expirationTtl: SAMPLES_KEY_TTL_SECONDS,
       });
+      kvCommitted = true;
     } catch {
-      // Best-effort persistence; next request reseeds.
+      // Best-effort persistence; next request reseeds. kvCommitted stays false
+      // so this tick is NOT archived (the ring buffer did not advance).
     }
   }
 
-  // Stage 12: immediately after the (unchanged) KV write, append this tick to
-  // the D1 archive — best-effort and failure-isolated (archiveSampleTick wraps
-  // its own batch in try/catch and swallows). KV stays the source of truth for
-  // all live logic; D1 is the durable long-term record only. A tick that
-  // committed nothing new to KV (a within-60s replay) yields empty sections,
-  // so the archive never gains duplicate rows.
-  if (env.HISTORY_DB) {
+  // Stage 12: only when the KV write above actually committed, append this tick
+  // to the D1 archive — best-effort and failure-isolated (archiveSampleTick
+  // wraps its own batch in try/catch and swallows). KV stays the source of
+  // truth for all live logic; D1 is the durable long-term record only. A tick
+  // that committed nothing new to KV (a within-60s replay) yields empty
+  // sections, so the archive never gains duplicate rows.
+  if (env.HISTORY_DB && kvCommitted) {
     // Belt-and-suspenders isolation: archiveSampleTick already swallows its own
     // batch failures, and the row-assembly below cannot realistically throw,
     // but the whole archive step is wrapped so it can NEVER affect the KV write

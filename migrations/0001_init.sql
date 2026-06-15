@@ -55,6 +55,15 @@ CREATE TABLE IF NOT EXISTS mo_progress_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_mo_progress_order_obj_time
   ON mo_progress_samples (major_order_id, objective_index, sampled_at);
+-- The composite index above serves filtered reads (a specific MO id /
+-- objective). The DEFAULT get_major_order_archive read is a time-range scan
+-- with no key constraint (WHERE sampled_at >= ? ORDER BY sampled_at), and
+-- filtering by major_order_id alone still leaves objective_index unconstrained
+-- — neither can use the composite. This sampled_at-leading index serves those
+-- default time-ordered scans so the unbounded table never falls back to a full
+-- scan + sort as it grows.
+CREATE INDEX IF NOT EXISTS idx_mo_progress_time
+  ON mo_progress_samples (sampled_at);
 
 -- Observed campaign signatures (Stage 5 equivalent, now durable).
 CREATE TABLE IF NOT EXISTS observed_signatures (
