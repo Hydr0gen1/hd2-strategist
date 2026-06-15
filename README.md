@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through fourteen MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through seventeen MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -40,6 +40,18 @@ The convention is identical for defense campaigns (the tracked health there is t
 | `get_major_order_history` | Observed Major Order objective-progress time-series: one bounded series per objective (`major_order_id` + `objective_index`) with per-point `delta_progress`/`delta_hours`, latest progress/target, and `progress_pct` — observed samples and deltas only, never a forecast, required pace, or on-track verdict. No args → the active MO(s); a recently ended MO stays queryable by `major_order_id` until it ages out |
 | `resolve_planet` | Resolve a loose planet name (`query`) to the canonical planet: exact → punctuation/space-normalized → fuzzy. Near-misses and ties return ranked candidates (`score` = edit distance) with `matched: false` — never a silent substitution |
 | `get_source_crosscheck` | Normalization-faithfulness health check: every active campaign and Major Order objective cross-checked against the raw ArrowHead payloads (the same wrapper's `/raw` endpoints — same host, auth, and cache, not a second provider). Tallies agreements / unexpected disagreements / expected invariant transforms / uncheckable fields, plus the specific divergent fields with BOTH values and the diff. Disagreements are surfaced, never resolved — no side is ranked correct |
+| `get_planet_archive` | **Long-range (D1 archive):** the unbounded counterpart to `get_planet_history` — a planet's observed health series read from the durable D1 store (`index` or `name`, optional `since_hours` default 168 / `limit` cap 1000), with per-point `delta_health`/`delta_hours` and the stored signed `hp_per_hour`. Observed points and deltas only, never a forecast |
+| `get_global_archive` | **Long-range (D1 archive):** the unbounded counterpart to `get_global_history` — global war statistics over days/weeks (player count, `impact_multiplier`, `active_campaign_count`, missions, deaths, kills) with raw observed deltas. The view that answers impact-multiplier-vs-population and the daily population cycle; no correlation or model, ever |
+| `get_major_order_archive` | **Long-range (D1 archive):** the unbounded counterpart to `get_major_order_history` — Major Order objective progress across a whole order, one series per objective with `delta_progress`/`delta_hours` and `progress_pct`. Optional `major_order_id`/`objective_index`. Observed samples and deltas only, never a forecast, required pace, or verdict (`objective_kind` is `null` here — the raw task type is not archived; use `get_major_order_history` for the label) |
+
+### Two stores: KV (recent, fast) + D1 (unbounded archive) — Stage 12
+
+History lives in **two stores with different jobs, never one replacing the other**:
+
+- **KV ring buffer (`samples:planets`)** — the fast recent-window cache. Every live calculation (`hp_per_hour`, the dual ETAs, divergence) reads *only* the recent samples from KV. Bounded to ~96 points/planet (~16h at the `*/10` cadence). This path is unchanged and remains the **source of truth for all live logic**.
+- **D1 archive (`HISTORY_DB`)** — an **append-only, effectively unbounded** long-term record (Cloudflare D1 free tier: 5 GB / 5 M writes-month; at ~5,900 rows/day that lasts decades). On each sample tick, *in addition to* the existing KV write, the tick's observations are inserted into D1 in a single batched write. Nothing reads D1 for live logic; it is read only by the three `*_archive` tools above when someone wants the long view.
+
+The two never conflict because they serve different time ranges (last ~16h vs. forever) and are never reconciled. The D1 write is **best-effort and failure-isolated** — if D1 is briefly unavailable a tick is simply not archived; the KV write and the primary response are never affected. The same 60s minimum-sample interval that gates the KV write gates the D1 write, so the archive never accrues duplicate rows.
 
 ### Freshness metadata (Stage 6)
 
@@ -59,15 +71,34 @@ npm install
 # 1. Create the KV namespace and paste the printed id into wrangler.toml
 npx wrangler kv namespace create WAR_CACHE
 
-# 2. Set the upstream API courtesy headers (never committed to the repo)
+# 2. Create the D1 archive DB and paste the printed database_id into wrangler.toml
+#    (replaces the REPLACE_WITH_D1_DATABASE_ID placeholder in [[d1_databases]])
+npx wrangler d1 create hd2-strategist-history
+
+# 3. Apply the schema (migrations/0001_init.sql) — BOTH local and remote.
+#    The --remote migration is a PREREQUISITE of deploy (see the warning below).
+npx wrangler d1 migrations apply hd2-strategist-history --local    # for local dev
+npx wrangler d1 migrations apply hd2-strategist-history --remote   # for production
+
+# 4. Set the upstream API courtesy headers (never committed to the repo)
 npx wrangler secret put SUPER_CLIENT    # e.g. your-app-name or domain
 npx wrangler secret put SUPER_CONTACT   # e.g. your email or Discord handle
 
-# 3. Deploy
+# 5. Deploy
 npx wrangler deploy
 ```
 
 Cloudflare auth comes from `wrangler login` locally, or a `CLOUDFLARE_API_TOKEN` repo secret in CI.
+
+> **⚠️ Deploy has a database-setup prerequisite (new in Stage 12).** Unlike earlier
+> stages, you must create the D1 database, paste its id into `wrangler.toml`, and
+> **apply `wrangler d1 migrations apply hd2-strategist-history --remote`** *before*
+> `wrangler deploy`. If a deploy shows the `*_archive` tools erroring while the
+> KV-backed tools work fine, the remote migration was almost certainly not applied
+> (it was run `--local` only). The archive starts empty and fills one tick at a
+> time — same cold-start honesty as every history feature; within a day
+> `get_global_archive` holds multi-hour trends, within a week genuine multi-day
+> patterns. After deploy, toggle the connector so the three new tools appear.
 
 ## Connecting an MCP client
 
@@ -141,14 +172,18 @@ After a deploy, verify it end-to-end by leaving the server idle and checking tha
 ```
 src/index.ts       Worker entry — routes POST / and /mcp; `scheduled` cron entry
 src/mcp.ts         JSON-RPC 2.0: initialize, tools/list, tools/call
-src/client.ts      Upstream fetch + KV cache (raw responses) + rate sampling
+src/client.ts      Upstream fetch + KV cache (raw responses) + rate sampling; triggers the D1 archive write
+src/archive.ts     D1 history archive I/O — best-effort batched write + the long-range read queries (Stage 12)
 src/invariants.ts  Pure normalization — the five invariants, no I/O
 src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
-src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode)
+src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode, archive points)
 src/wiki.ts        Pure wiki lore logic (query plan, response shaping, attribution) — separate source
 src/wikiClient.ts  Wiki fetch + long-TTL KV cache (`wiki:` namespace) — separate from client.ts
-src/tools.ts       The fourteen tool implementations
+src/tools.ts       The seventeen tool implementations
 src/types.ts       Raw upstream + normalized types
+migrations/        D1 schema migrations (0001_init.sql) applied via `wrangler d1 migrations apply`
 ```
 
 Raw upstream responses are cached in KV (`WAR_CACHE`) for ~45s; on upstream 429/5xx/timeouts the server falls back to a stale copy (marked `stale: true`) and only errors — with a structured MCP error — when no copy exists. Normalization runs **after** the cache read, so invariant changes never require cache invalidation.
+
+**Two history stores (Stage 12).** KV (`WAR_CACHE`, `samples:planets`) holds the bounded recent ring buffer and is the source of truth for all live logic. D1 (`HISTORY_DB`) is the append-only unbounded archive: on each sample tick, immediately after the KV write, the same observations are inserted into D1 in one batched, best-effort, failure-isolated write (a D1 outage degrades to "this tick wasn't archived", never an error). The `*_archive` tools read D1 for the long view; nothing else does. The two stores serve different time ranges and are never reconciled.

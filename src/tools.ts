@@ -1,11 +1,20 @@
 /**
- * The fourteen MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The seventeen MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
  * get_planet_wiki, uses its own separate source pipeline (wiki.ts +
  * wikiClient.ts) — lore never flows into a live war-state field.
  */
+import {
+  ARCHIVE_DEFAULT_SINCE_HOURS,
+  ARCHIVE_MAX_LIMIT,
+  clampLimit,
+  readGlobalArchive,
+  readMoArchive,
+  readPlanetArchive,
+  sinceCutoffMs,
+} from "./archive";
 import {
   fetchUpstream,
   readGlobalSamples,
@@ -22,11 +31,14 @@ import {
   buildDefenseEtaBlock,
   buildEtaBlock,
   buildFactionRollup,
+  buildGlobalArchivePoints,
   buildGlobalHistoryPoints,
   buildHistoryPoints,
   buildMajorOrderTargets,
+  buildMoArchiveSeries,
   buildMoHistorySeries,
   buildNeighbors,
+  buildPlanetArchivePoints,
   buildSectorRollup,
   decayPerHour,
   decodeEventModifier,
@@ -123,24 +135,38 @@ function signatureObservationsFrom(
 ): SignatureObservation[] {
   return raw.map((c) => {
     const event = c.planet.event;
-    const faction =
-      campaignKind(c) === "defense"
-        ? (typeof event?.faction === "string" ? event.faction : null)
-        : typeof c.planet.currentOwner === "string"
-          ? c.planet.currentOwner
-          : null;
     return {
       campaign_type: typeof c.type === "number" ? c.type : null,
       event_type:
         typeof event?.eventType === "number" ? event.eventType : null,
       has_event: Boolean(event),
-      faction,
+      faction: campaignFaction(c),
     };
   });
 }
 
+/** The campaign's tracked faction — the event's attacker on a defense, the
+ * planet's current owner otherwise. The SAME derivation normalizeCampaign and
+ * the signature tuples use, so the archived faction stays verifiable. */
+function campaignFaction(c: RawCampaign): string | null {
+  const event = c.planet.event;
+  if (campaignKind(c) === "defense") {
+    return typeof event?.faction === "string" ? event.faction : null;
+  }
+  return typeof c.planet.currentOwner === "string"
+    ? c.planet.currentOwner
+    : null;
+}
+
 function trackableHealth(planet: RawPlanet): number | null {
   const h = planet.event ? planet.event.health : planet.health;
+  return typeof h === "number" && Number.isFinite(h) ? h : null;
+}
+
+/** The tracked health's ceiling: event.maxHealth on a defense, planet.maxHealth
+ * otherwise (mirrors trackableHealth). Stage 12 archive context only. */
+function trackableMaxHealth(planet: RawPlanet): number | null {
+  const h = planet.event ? planet.event.maxHealth : planet.maxHealth;
   return typeof h === "number" && Number.isFinite(h) ? h : null;
 }
 
@@ -249,6 +275,12 @@ async function loadNormalizedCampaigns(
         planetIndex: c.planet.index,
         health: trackableHealth(c.planet),
         campaignId: c.id,
+        // Stage 12 archive context — pass-through only; the KV rate path
+        // ignores these. kind/faction use the same derivations the normalized
+        // payload and signature tuples use, so archived rows stay verifiable.
+        maxHealth: trackableMaxHealth(c.planet),
+        campaignKind: campaignKind(c),
+        faction: campaignFaction(c),
       }),
     ),
     nowMs,
@@ -664,6 +696,15 @@ export async function getPlanet(
           planetIndex: planet.index,
           health: trackableHealth(planet),
           campaignId: null,
+          // Archive context for a quiet-planet probe: no active campaign, so
+          // campaign_kind stays null; max_health and the owner faction are
+          // still observable facts worth archiving.
+          maxHealth: trackableMaxHealth(planet),
+          campaignKind: null,
+          faction:
+            typeof planet.currentOwner === "string"
+              ? planet.currentOwner
+              : null,
         },
       ],
       nowMs,
@@ -1376,5 +1417,210 @@ export async function getSourceCrossCheck(env: Env): Promise<unknown> {
     },
     ...freshnessFrom([planetsRes.fetchedAt, ...bundle.fetchedAts], Date.now()),
     ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
+  };
+}
+
+/* ------------------------------------------------------------------------
+ * Stage 12: the D1 archive tools — the long-range counterpart to the KV
+ * history tools. The KV history tools (get_planet_history /
+ * get_global_history / get_major_order_history) stay the fast recent-window
+ * view and are UNCHANGED; these read the unbounded D1 archive instead. Same
+ * honesty discipline throughout: observed points and raw consecutive deltas
+ * only — insufficient_history below two points, null deltas at series start,
+ * NO forecast, NO trend verdict. KV remains the source of truth for all live
+ * logic; the archive serves a different (longer) time range and the two never
+ * reconcile.
+ * ---------------------------------------------------------------------- */
+
+const ARCHIVE_RETENTION_NOTE =
+  "The D1 archive is append-only and effectively unbounded (Cloudflare D1 free tier: 5 GB) — it is the long-term counterpart to the KV history tools' bounded recent window. Rows accrue one per sample tick (request polls + the 10-minute cron); a within-60s replay never duplicates a row.";
+
+const ARCHIVE_SAMPLING_NOTE =
+  "Observed data points and deterministic consecutive deltas only — no smoothing, no forecast, no trend verdict. Sample timestamps use the Worker clock (upstream war time is game-epoch and not comparable). These are the SAME observations the KV history tools serve, persisted durably; the two views can differ only by time range, never by interpretation.";
+
+/**
+ * Stage 12: a planet's UNBOUNDED observed health series from the D1 archive —
+ * the long-range counterpart to get_planet_history's recent KV window. Resolves
+ * the planet by index or name (one planets fetch, shared cache), then reads the
+ * archive within the requested window (default last 7 days), capped at
+ * ARCHIVE_MAX_LIMIT rows. Observed points + raw deltas only, never a forecast.
+ */
+export async function getPlanetArchive(
+  env: Env,
+  args: { index?: number; name?: string; since_hours?: number; limit?: number },
+): Promise<unknown> {
+  assertPlanetArgs(args);
+
+  const [planetsRes, campaignsRes] = await Promise.all([
+    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+    fetchUpstream<RawCampaign[]>(env, "/api/v1/campaigns"),
+  ]);
+  const planets = planetsRes.data ?? [];
+  const planet = resolvePlanet(
+    planets,
+    args,
+    (campaignsRes.data ?? []).map((c) => ({
+      name: c.planet.name,
+      index: c.planet.index,
+    })),
+  );
+
+  const nowMs = Date.now();
+  const limit = clampLimit(args.limit);
+  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
+  const rows = await readPlanetArchive(env, planet.index, sinceMs, limit);
+  const points = buildPlanetArchivePoints(rows);
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+
+  return {
+    planet_index: planet.index,
+    planet_name: planet.name,
+    source: "d1_archive",
+    since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    limit,
+    max_limit: ARCHIVE_MAX_LIMIT,
+    truncated: rows.length === limit,
+    points: points.length,
+    window_hours:
+      first && last && rows.length >= 2
+        ? (last.sampled_at - first.sampled_at) / 3_600_000
+        : null,
+    samples: points,
+    insufficient_history: points.length < 2,
+    ...(points.length < 2
+      ? {
+          note:
+            points.length === 0
+              ? "No archived samples for this planet in the requested window. The archive fills one tick at a time once the server is polling (and after the D1 migration is applied) — a cold start, a too-narrow since_hours, or a planet never in an active campaign is expected to be empty, not an error."
+              : "Only one archived sample in the window; deltas need at least two samples >60s apart. Widen since_hours or wait for more ticks.",
+        }
+      : {}),
+    notes: {
+      delta_health:
+        "Raw observed change per point: current − previous health (negative = health depleting). hp_per_hour stored on each point uses the opposite orientation, (previous − current) / hours, positive = progressing toward resolution. Both conventions apply to defense campaigns identically (the tracked health is the EVENT health, which depletes toward zero while the defense is won).",
+      hp_per_hour: RATE_SIGN_NOTE,
+      sampling: ARCHIVE_SAMPLING_NOTE,
+      retention: ARCHIVE_RETENTION_NOTE,
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshnessFrom([planetsRes.fetchedAt, campaignsRes.fetchedAt], nowMs),
+    ...(planetsRes.stale || campaignsRes.stale ? { stale: true } : {}),
+  };
+}
+
+/**
+ * Stage 12: the UNBOUNDED global war-statistics series from the D1 archive —
+ * the long-range counterpart to get_global_history. This is the view that
+ * answers the impact-multiplier-vs-population question over days, not hours.
+ * Observed points + raw deltas only; any relationship between the curves is the
+ * consumer's to read off — the server computes no correlation or model.
+ */
+export async function getGlobalArchive(
+  env: Env,
+  args: { since_hours?: number; limit?: number },
+): Promise<unknown> {
+  const nowMs = Date.now();
+  const limit = clampLimit(args.limit);
+  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
+  const rows = await readGlobalArchive(env, sinceMs, limit);
+  const points = buildGlobalArchivePoints(rows);
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+
+  return {
+    source: "d1_archive",
+    since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    limit,
+    max_limit: ARCHIVE_MAX_LIMIT,
+    truncated: rows.length === limit,
+    points: points.length,
+    window_hours:
+      first && last && rows.length >= 2
+        ? (last.sampled_at - first.sampled_at) / 3_600_000
+        : null,
+    samples: points,
+    insufficient_history: points.length < 2,
+    ...(points.length < 2
+      ? {
+          note:
+            points.length === 0
+              ? "No archived global samples in the requested window. Global samples accrue only on get_war_status / get_war_brief polls and the cron (the paths that fetch the war state) — a cold start or too-narrow since_hours is expected to be empty, not an error."
+              : "Only one archived global sample in the window; deltas need at least two samples >60s apart.",
+        }
+      : {}),
+    notes: {
+      sampling: ARCHIVE_SAMPLING_NOTE,
+      impact_multiplier:
+        "The raw upstream war.impactMultiplier observed at sample time, with active_campaign_count co-sampled beside it. Over a multi-day window the daily population cycle and the multiplier relationship become legible — but any correlation, model, or prediction relating them is for the consumer to read off the curves; the server computes none.",
+      retention: ARCHIVE_RETENTION_NOTE,
+    },
+    queried_at: new Date(nowMs).toISOString(),
+  };
+}
+
+/**
+ * Stage 12: the UNBOUNDED Major Order objective-progress series from the D1
+ * archive — the long-range counterpart to get_major_order_history. Grounds MO
+ * pace across a whole order rather than the recent KV window. Optional
+ * major_order_id / objective_index narrow the query. Observed points + raw
+ * deltas only — never a forecast, required pace, or on-track/behind verdict.
+ */
+export async function getMajorOrderArchive(
+  env: Env,
+  args: {
+    major_order_id?: number;
+    objective_index?: number;
+    since_hours?: number;
+    limit?: number;
+  },
+): Promise<unknown> {
+  const nowMs = Date.now();
+  const limit = clampLimit(args.limit);
+  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
+  const rows = await readMoArchive(env, sinceMs, limit, {
+    majorOrderId: args.major_order_id,
+    objectiveIndex: args.objective_index,
+  });
+  const series = buildMoArchiveSeries(rows);
+  const retainedIds = [...new Set(rows.map((r) => r.major_order_id))];
+
+  return {
+    source: "d1_archive",
+    since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    limit,
+    max_limit: ARCHIVE_MAX_LIMIT,
+    truncated: rows.length === limit,
+    ...(args.major_order_id != null || args.objective_index != null
+      ? {
+          requested: {
+            ...(args.major_order_id != null
+              ? { major_order_id: args.major_order_id }
+              : {}),
+            ...(args.objective_index != null
+              ? { objective_index: args.objective_index }
+              : {}),
+          },
+        }
+      : {}),
+    archived_major_order_ids: retainedIds,
+    series_count: series.length,
+    series,
+    ...(series.length === 0
+      ? {
+          note: "No archived Major Order progress in the requested window. Samples accrue whenever the server polls campaigns (request polls + the 10-minute cron); a cold start, a too-narrow since_hours, or a major_order_id never sampled is expected to be empty, not an error.",
+        }
+      : {}),
+    notes: {
+      sampling: ARCHIVE_SAMPLING_NOTE,
+      deltas:
+        "delta_progress / delta_hours are raw differences between consecutive OBSERVATIONS — never a projection. No forecast, completion estimate, required pace, or on-track/behind verdict exists anywhere in this payload by design; pace judgment belongs to the consumer, grounded on these observed points.",
+      progress_pct:
+        "latest_progress / target × 100, from the newest archived sample — deterministic; null when the target is 0 or unknown or progress is unknown.",
+      objective_kind:
+        "Always null in the archive: the D1 schema does not store the raw task_type, so the objective-kind label is not decoded here. get_major_order_history (the recent KV view) carries it. progress/target are identical between the two.",
+      retention: ARCHIVE_RETENTION_NOTE,
+    },
+    queried_at: new Date(nowMs).toISOString(),
   };
 }

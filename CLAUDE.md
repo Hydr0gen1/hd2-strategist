@@ -3,7 +3,7 @@
 Headless MCP server on a single Cloudflare Worker. It fronts the Helldivers 2
 community API (`api.helldivers2.dev`) as a **correctness layer**: it normalizes
 raw war data to strip known deceptive/cosmetic fields and exposes exactly
-fourteen MCP tools. There is no frontend and no upstream app — the Worker IS
+seventeen MCP tools. There is no frontend and no upstream app — the Worker IS
 the app.
 
 ## Commands
@@ -20,20 +20,39 @@ Local dev secrets go in `.dev.vars` (gitignored): `SUPER_CLIENT`, `SUPER_CONTACT
 ## Map
 
 ```
-src/   Worker source — see src/CLAUDE.md for the domain invariants (read it
-       before touching anything in src/)
-test/  Unit tests — see test/CLAUDE.md for required coverage
-wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
+src/         Worker source — see src/CLAUDE.md for the domain invariants (read
+             it before touching anything in src/)
+test/        Unit tests — see test/CLAUDE.md for required coverage
+migrations/  D1 schema (0001_init.sql) — applied via `wrangler d1 migrations apply`
+wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets here.
 ```
 
 ## Hard rules (project-wide)
 
-- **Exactly fourteen tools**: `get_war_brief`, `get_war_status`,
+- **Exactly seventeen tools**: `get_war_brief`, `get_war_status`,
   `get_campaigns`, `get_major_order`, `get_planet`, `get_dispatches`,
   `get_patch_notes`, `get_planet_history`, `get_planet_wiki`,
   `get_observed_signatures`, `get_global_history`,
-  `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`.
-  Do not add tools or rename them.
+  `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`,
+  and the Stage 12 D1 archive trio `get_planet_archive`,
+  `get_global_archive`, `get_major_order_archive`. Do not add tools or
+  rename them.
+- **Two history stores, never reconciled** (Stage 12): KV
+  (`samples:planets`) is the bounded recent ring buffer and the SOURCE OF
+  TRUTH for all live logic (`hp_per_hour`, the dual ETAs, divergence read
+  ONLY the recent KV samples). D1 (`HISTORY_DB`, `src/archive.ts`) is the
+  append-only unbounded archive, read ONLY by the three `*_archive` tools.
+  The D1 write rides immediately after the existing KV write, is BATCHED
+  (one `db.batch` per tick, never a per-row await loop), gated by the SAME
+  60s interval (no duplicate rows), and BEST-EFFORT / FAILURE-ISOLATED (its
+  own try/catch swallows — a D1 outage degrades to "tick not archived",
+  never an error and never touching the KV write or the response). Never
+  add reconciliation logic between the two stores; never let D1 feed live
+  logic; never change the KV/rate path to accommodate D1. Parameterized SQL
+  ONLY — every value via `.bind()`. The archive tools enrich, never
+  conclude: observed points + raw deltas, `insufficient_history` below two
+  rows, no forecast/pace/trend verdict (same prime directive as the KV
+  history tools).
 - **Cross-checks surface, never resolve** (Stage 10): the raw-source
   cross-check layer (`src/crosscheck.ts`, the wrapper's `/raw` endpoints —
   same host/auth/cache, NOT a second provider) presents the normalized
@@ -50,7 +69,9 @@ wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
 - **KV write budget**: one KV read + one KV write per poll cycle is the
   ceiling. The Stage 5/8 accumulation layers (observed campaign signatures,
   global statistics series, Major Order progress series) fold into the
-  existing `samples:planets` write — never a second per-cycle write.
+  existing `samples:planets` write — never a second per-cycle write. (The
+  Stage 12 D1 archive write is a separate store, not a KV write, so it does
+  not count against this budget; it is one batched D1 call per tick.)
 - **Two sources, never mixed**: everything except `get_planet_wiki` is live
   war state from `api.helldivers2.dev`; `get_planet_wiki` is community LORE
   from `helldivers.wiki.gg` (own pipeline `src/wiki.ts` + `src/wikiClient.ts`,
@@ -60,8 +81,10 @@ wrangler.toml  KV binding WAR_CACHE only. NEVER put secrets here.
 - **Secrets**: `SUPER_CLIENT` / `SUPER_CONTACT` come from `wrangler secret put`
   and are read from `env`. Never hardcode them, never commit them, never add
   them to `wrangler.toml`.
-- **Out of scope by design**: no UI, no D1/SQLite, no Docker, no auth on the
-  MCP endpoint (single-user URL connection; auth is a noted future extension).
+- **Out of scope by design**: no UI, no Docker, no auth on the MCP endpoint
+  (single-user URL connection; auth is a noted future extension). (D1/SQLite
+  WAS out of scope pre-Stage-12; it is now the unbounded history archive —
+  but ONLY as the append-only archive described above, never for live logic.)
 - **Free-tier CPU budget (~10ms)**: normalization stays plain object
   transforms, O(n) over the campaign list. No SDK dependencies in the Worker;
   the MCP JSON-RPC layer in `src/mcp.ts` is deliberately hand-rolled.

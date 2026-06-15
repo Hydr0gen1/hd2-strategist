@@ -9,6 +9,22 @@ binding = "WAR_CACHE"
 # Replace with the id printed by: wrangler kv namespace create WAR_CACHE
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
+# Stage 12: the unbounded D1 history archive — an append-only long-term record
+# that lives ALONGSIDE the KV ring buffer above (it never replaces it). KV
+# stays the fast recent-window source of truth for all live logic; D1 holds the
+# full history, read only by the archive tools. Create the database once and
+# paste its id below (same flow as the KV id):
+#   npx wrangler d1 create hd2-strategist-history   # prints database_id
+# then apply the schema (see migrations/0001_init.sql):
+#   npx wrangler d1 migrations apply hd2-strategist-history --local   # dev
+#   npx wrangler d1 migrations apply hd2-strategist-history --remote  # prod
+# The --remote migration is a PREREQUISITE of `wrangler deploy` — without it the
+# archive tools will error while the KV-backed tools keep working.
+[[d1_databases]]
+binding = "HISTORY_DB"
+database_name = "hd2-strategist-history"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
 # Background sampling schedule. Cloudflare cron always evaluates in UTC —
 # irrelevant for a fixed-interval poll, but any future time-of-day schedule
 # must account for it.

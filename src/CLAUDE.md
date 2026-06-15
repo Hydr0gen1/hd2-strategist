@@ -9,9 +9,10 @@ Module boundaries are strict; respect them when editing:
 | `wiki.ts` | Stage 4 LORE source, pure half: wiki query plan (title candidates, one multi-title request), response shaping, extract cap, mandatory attribution | **Pure. Zero I/O. SEPARATE source** — never imports from or feeds into the live war-state pipeline; no live war number in any output. |
 | `wikiClient.ts` | Stage 4 LORE source, I/O half: helldivers.wiki.gg fetch (descriptive User-Agent) + long-TTL KV cache in the `wiki:` namespace with stale fallback | Deliberately separate from `client.ts`. Injectable fetch for tests. Never touches `raw:`/`samples:` keys. |
 | `sampling.ts` | Pure sample-store logic: the bounded planet ring buffer (`advancePlanetSeries`), legacy-shape coercion, eviction, retention constants, the Stage 5 accumulation layers (`foldSignatures`, `advanceGlobalSeries`), and the Stage 8 Major Order progress series (`advanceMoSeries`) | **Pure. Zero I/O.** The store travels in/out via client.ts. Implements the rate formula verbatim; the sign convention is DEFINED in client.ts. |
-| `client.ts` | Upstream fetch + KV cache + rate sampling | Owns the `hp_per_hour` sign convention (comment block) and all KV access. |
+| `client.ts` | Upstream fetch + KV cache + rate sampling; triggers the Stage 12 D1 archive write after the KV write | Owns the `hp_per_hour` sign convention (comment block) and all KV access. The D1 write is delegated to `archive.ts` and is best-effort — it NEVER alters the KV write, the rate path, or the return value. |
+| `archive.ts` | Stage 12 D1 history archive I/O: the best-effort batched per-tick write (`archiveSampleTick`) and the long-range read queries (`readPlanetArchive` / `readGlobalArchive` / `readMoArchive`) behind the three `*_archive` tools | **The D1 analog of client.ts (I/O).** APPEND-ONLY archive that lives ALONGSIDE the KV ring buffer, never replacing it — D1 is read ONLY by the archive tools, NEVER by live logic. Write is one `db.batch` per tick (never a per-row loop), gated by the SAME 60s interval as the KV write (no duplicate rows), wrapped in its own try/catch that swallows (a D1 outage degrades to "tick not archived", never an error). Parameterized SQL ONLY — every value via `.bind()`. The pure row→point delta builders live in `enrichment.ts`. |
 | `crosscheck.ts` | Stage 10 raw-source cross-check: normalized fields verified against the raw ArrowHead payloads from the wrapper's `/raw` endpoints (paths + field mappings verified live 2026-06-11; `RAW_FACTION_NAMES` enum map live-verified, fail-safe null on unknown values) | **Pure. Zero I/O.** SURFACE, NEVER RESOLVE: every check presents both values + the diff; no side is picked, averaged, or ranked correct (key-name pinned). The only classification is `expected_transform: true` for documented invariant transforms (defense decay nulled, liberation % recomputed). Absent counterparts → `agrees: null` + reason, never a false mismatch; float tolerance relative 1e-6. |
-| `tools.ts` | The fourteen tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. Stage 6: `get_war_brief` is pure assembly of facts the other tools return (never a recommendation/ranking); `resolve_planet` and the shared name resolution never silently substitute a planet — near-misses surface ranked candidates. Stage 8: `get_major_order_history` is read-only observed data — no forecast, required pace, or on-track verdict, ever. Stage 10: the `/raw` fetches ride `fetchUpstream` (same headers/cache/stale-fallback — never a parallel fetch stack) via best-effort `tryFetchRaw`; a `/raw` failure degrades `cross_check` to a reasoned null, never blocks the primary response, and adds ZERO sample-store writes. |
+| `tools.ts` | The seventeen tool implementations | Orchestration only: fetch → assemble context → call pure normalization/shaping. Stage 12: the three `*_archive` tools read the D1 archive (`archive.ts`) and shape it through the pure builders in `enrichment.ts` — same prime-directive honesty as the KV history tools (observed points + deltas, `insufficient_history` below two rows, no forecast/pace/verdict); they NEVER read D1 for anything live and the live tools NEVER read the archive. Stage 6: `get_war_brief` is pure assembly of facts the other tools return (never a recommendation/ranking); `resolve_planet` and the shared name resolution never silently substitute a planet — near-misses surface ranked candidates. Stage 8: `get_major_order_history` is read-only observed data — no forecast, required pace, or on-track verdict, ever. Stage 10: the `/raw` fetches ride `fetchUpstream` (same headers/cache/stale-fallback — never a parallel fetch stack) via best-effort `tryFetchRaw`; a `/raw` failure degrades `cross_check` to a reasoned null, never blocks the primary response, and adds ZERO sample-store writes. |
 | `mcp.ts` | JSON-RPC 2.0 protocol | No domain logic. Domain errors become `isError` tool results, never raw exceptions. |
 | `types.ts` | Raw upstream + normalized types | Types only. |
 | `index.ts` | Entry/routing + cron entry | POST `/` or `/mcp` only; the `scheduled` handler (Cron Trigger, always UTC) delegates to `runScheduledSample` in tools.ts — the request path's own loader and store write, never a fork; failures are swallowed (no user watches a cron tick). |
@@ -167,6 +168,37 @@ samples stay last-write-wins on the single key, and an upstream failure
 during a tick is swallowed (next tick retries). The cadence-vs-KV-write-
 budget rationale lives in the comment next to the cron line — re-check it
 before tightening the schedule.
+
+## Stage 12 D1 archive rule (two stores, never reconciled)
+
+The KV ring buffer above is FROZEN — the rate formula, the ring buffer, the
+ETAs, the invariants are unchanged, and KV remains the source of truth for all
+live logic. Stage 12 adds D1 (`HISTORY_DB`, `src/archive.ts`) as a SECOND store
+with a different job: an append-only, effectively unbounded history archive read
+ONLY by the three `*_archive` tools. The two never conflict because they serve
+different time ranges (KV: last ~16h, fast; D1: forever, on disk) and there is
+NO reconciliation logic between them.
+
+The write rides inside `samplePlanetRates` (client.ts) IMMEDIATELY AFTER the
+existing single KV put, never altering it. It archives ONLY the observations
+that were just committed to KV as NEW this tick — the determination is reused
+(a committed sample's newest timestamp equals the tick clock), never recomputed
+— so the SAME 60s `MIN_SAMPLE_INTERVAL_MS` that gates the KV write gates the D1
+write: a within-60s replay commits nothing and archives nothing (no duplicate
+rows). All of a tick's rows (planet/global/MO + the signature UPSERT) go out in
+ONE `db.batch` (never a per-row await loop), wrapped in `archiveSampleTick`'s own
+try/catch that logs and swallows — D1 being briefly unavailable degrades to "we
+missed archiving this tick", NEVER a broken KV write or response. Parameterized
+SQL ONLY (every value via `.bind()`). The pure row→point delta builders
+(`buildPlanetArchivePoints` / `buildGlobalArchivePoints` / `buildMoArchiveSeries`)
+live in enrichment.ts and reuse the existing history-delta derivations, so the
+archive view is verifiable against the live history view. Same prime directive:
+observed points + raw deltas, `insufficient_history` below two rows, NO forecast,
+required pace, or trend verdict. The archive does not store `task_type`, so MO
+`objective_kind` is null there (the KV history tool carries it). Deploy has a
+DATABASE-SETUP PREREQUISITE: `wrangler d1 create` + paste id + `migrations apply
+--remote` BEFORE `wrangler deploy` (see README) — if the archive tools error
+while KV tools work, the remote migration was not applied.
 
 ## Stage 6 consumption rules
 

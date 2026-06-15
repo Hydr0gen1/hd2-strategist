@@ -16,6 +16,14 @@ against the same KV stub with every `raw:` cache entry pre-seeded FRESH and
 zero upstream fetch volume beyond the shared cache (the stub is restored in
 `afterEach`; it forbids the network, it never simulates it).
 
+A fourth sanctioned exception (stage12.test.ts): a small in-memory D1 stub
+(`FakeD1`) — same spirit as the KV stub. It stores rows per table and executes
+the four archive INSERTs (incl. the signature UPSERT) and the three archive
+SELECTs, recording every `db.batch` call (proving the single-batch-per-tick
+budget) and the SELECT SQL (proving values are bound, never interpolated). No
+network, no real SQLite. The KV stub still proves the KV write budget is
+UNCHANGED by Stage 12 (the D1 write is a separate store).
+
 ## Coverage that must never regress
 
 Each of these maps to a spec requirement; removing or weakening one breaks
@@ -292,6 +300,33 @@ the project's definition of done:
     excluded from disagreements and lists divergent fields with planet
     context + both values + diff; **the raw fetch adds ZERO sample-store
     writes** — still exactly one `samples:planets` put per poll.
+
+- Stage 12 (`stage12.test.ts`) — the D1 archive ALONGSIDE the unchanged KV path:
+  - Pure builders: `buildPlanetArchivePoints` (first point null deltas, exact
+    consecutive diffs, null health → null delta never 0, stored signed
+    `hp_per_hour` carried), `buildGlobalArchivePoints` (reuses the global
+    history delta derivation over archive rows), `buildMoArchiveSeries` (groups
+    flat rows per objective, exact `delta_progress`, `objective_kind` null
+    because `task_type` is not archived, `insufficient_history` below two).
+  - `archiveSampleTick`: no binding → no-op; empty tick → no batch; all four
+    sections insert in ONE batch; the signature UPSERT seeds `first_seen` then
+    a later observation PRESERVES `first_seen` and bumps `last_seen` /
+    `sample_count`; a forced D1 error is SWALLOWED, never thrown.
+  - **Write path through `samplePlanetRates` (KV stub + D1 stub):** a fresh
+    tick writes BOTH the single unchanged `samples:planets` KV put AND the D1
+    archive rows (planet/global/MO + signature) in ONE `db.batch`; a later
+    tick archives the computed signed rate; **interval gating** — a within-60s
+    replay inserts NO duplicate D1 rows and performs no batch; **failure
+    isolation** — D1 down still yields a normal result AND the KV write; no D1
+    binding → KV path behaves exactly as before (one put, no throw).
+  - Read path: `readPlanetArchive`/`readGlobalArchive`/`readMoArchive` return
+    rows time-ordered, scoped (planet / MO id / objective), honoring
+    `since`/`limit`, with **parameterized SQL pinned** (placeholders present,
+    no interpolated values). Handlers (`getPlanetArchive` over a seeded raw
+    cache + D1 stub; `getGlobalArchive`/`getMajorOrderArchive`): time-ordered
+    points with correct deltas, `insufficient_history` on a cold archive with a
+    non-error note, zero KV writes, and a **prime-directive key-name pin** (no
+    forecast/on_track/required_pace/verdict/recommend/priority/rank key).
 
 ## Conventions
 

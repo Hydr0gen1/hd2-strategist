@@ -5,6 +5,15 @@
  * AFTER the cache read, so logic changes never require cache invalidation.
  */
 import {
+  archiveSampleTick,
+  signatureKeyString,
+  type ArchiveTick,
+  type GlobalArchiveRow,
+  type MoArchiveRow,
+  type PlanetArchiveRow,
+  type SignatureArchiveRow,
+} from "./archive";
+import {
   advanceGlobalSeries,
   advanceMoSeries,
   advancePlanetSeries,
@@ -160,6 +169,13 @@ export interface SampleInput {
   /** Current trackable health: planet.health, or event.health for defense. */
   health: number | null;
   campaignId: number | null;
+  /** Stage 12 archive-only context — pass-through metadata for the D1 row this
+   * tick produces. These NEVER affect the KV rate path (it ignores them); they
+   * only enrich the append-only archive. Optional so existing call sites and
+   * the single-planet probe keep working when they can't supply them. */
+  maxHealth?: number | null;
+  campaignKind?: string | null;
+  faction?: string | null;
 }
 
 export interface SampleOutput {
@@ -258,6 +274,13 @@ export async function samplePlanetRates(
   const mo = advanceMoSeries(store.mo, opts.moProgress ?? [], nowMs);
   if (mo.length > 0) nextStore.mo = mo;
 
+  // Stage 12: archive rows for ONLY the observations newly committed to KV
+  // this tick (a new sample was appended). A within-60s replay appends nothing
+  // and therefore produces no archive rows — the same gate as the KV write, so
+  // the D1 archive never accrues duplicate rows. Built only when a D1 binding
+  // exists (cheap to skip otherwise).
+  const archivePlanetRows: PlanetArchiveRow[] = [];
+
   for (const input of inputs) {
     const idxKey = String(input.planetIndex);
 
@@ -274,6 +297,26 @@ export async function samplePlanetRates(
     } else if (opts.carryForward) {
       // Legacy parity: a null-health observation drops the entry.
       delete nextStore.planets[idxKey];
+    }
+
+    // Committed iff a sample was appended with this tick's timestamp (a fresh
+    // seed or a >60s append) — the same determination the KV ring buffer made,
+    // reused here, never recomputed.
+    const newest = advanced.series?.samples[advanced.series.samples.length - 1];
+    if (env.HISTORY_DB && newest && newest.t === nowMs) {
+      archivePlanetRows.push({
+        planet_index: input.planetIndex,
+        sampled_at: nowMs,
+        health: newest.h,
+        max_health:
+          input.maxHealth != null && Number.isFinite(input.maxHealth)
+            ? input.maxHealth
+            : null,
+        hp_per_hour: hpPerHour,
+        campaign_id: input.campaignId,
+        campaign_kind: input.campaignKind ?? null,
+        faction: input.faction ?? null,
+      });
     }
 
     let campaignAgeMs: number | null = null;
@@ -305,7 +348,119 @@ export async function samplePlanetRates(
     }
   }
 
+  // Stage 12: immediately after the (unchanged) KV write, append this tick to
+  // the D1 archive — best-effort and failure-isolated (archiveSampleTick wraps
+  // its own batch in try/catch and swallows). KV stays the source of truth for
+  // all live logic; D1 is the durable long-term record only. A tick that
+  // committed nothing new to KV (a within-60s replay) yields empty sections,
+  // so the archive never gains duplicate rows.
+  if (env.HISTORY_DB) {
+    // Belt-and-suspenders isolation: archiveSampleTick already swallows its own
+    // batch failures, and the row-assembly below cannot realistically throw,
+    // but the whole archive step is wrapped so it can NEVER affect the KV write
+    // or the returned rates. Best-effort archival, fully isolated.
+    try {
+      await archiveSampleTick(
+        env,
+        buildArchiveTick(
+          archivePlanetRows,
+          global,
+          mo,
+          opts.signatures ?? [],
+          nowMs,
+        ),
+      );
+    } catch (err) {
+      console.warn(
+        `D1 archive step skipped (KV unaffected): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   return results;
+}
+
+/**
+ * Stage 12: assemble the D1 archive payload for one tick from state already
+ * computed by samplePlanetRates — ONLY the observations committed to KV as NEW
+ * this tick (a section's tail timestamp equals the tick clock). A within-60s
+ * replay commits nothing, so every section is empty and the archive gains no
+ * duplicate rows. Pure shaping — no I/O.
+ */
+function buildArchiveTick(
+  planetRows: PlanetArchiveRow[],
+  global: GlobalSample[],
+  mo: MoObjectiveSeries[],
+  signatures: SignatureObservation[],
+  nowMs: number,
+): ArchiveTick {
+  // Global sample committed iff the series gained a point at this tick.
+  const globalTail = global[global.length - 1];
+  const globalCommitted = globalTail != null && globalTail.t === nowMs;
+  const globalRow: GlobalArchiveRow | null =
+    globalCommitted && globalTail
+      ? {
+          sampled_at: nowMs,
+          player_count: globalTail.player_count,
+          impact_multiplier: globalTail.impact_multiplier ?? null,
+          active_campaign_count: globalTail.active_campaign_count ?? null,
+          missions_won: globalTail.missions_won,
+          missions_lost: globalTail.missions_lost,
+          deaths: globalTail.deaths,
+          terminid_kills: globalTail.terminid_kills,
+          automaton_kills: globalTail.automaton_kills,
+          illuminate_kills: globalTail.illuminate_kills,
+        }
+      : null;
+
+  // MO rows: one per series that gained a sample at this tick (a series carried
+  // forward unchanged keeps an older tail and is skipped).
+  const moRows: MoArchiveRow[] = [];
+  for (const series of mo) {
+    const tail = series.samples[series.samples.length - 1];
+    if (tail && tail.t === nowMs) {
+      moRows.push({
+        major_order_id: series.major_order_id,
+        objective_index: series.objective_index,
+        sampled_at: nowMs,
+        progress: tail.progress,
+        target: tail.target,
+      });
+    }
+  }
+
+  // Signatures are upserted only on a fresh tick (one that committed at least
+  // one new KV sample), so 45s cache replays never inflate sample_count — the
+  // same discipline foldSignatures applies to the KV record. Deduped by
+  // signature key within the cycle (many campaigns share one signature).
+  const tickIsFresh =
+    planetRows.length > 0 || globalCommitted || moRows.length > 0;
+  const signatureRows: SignatureArchiveRow[] = [];
+  if (tickIsFresh && signatures.length > 0) {
+    const seen = new Set<string>();
+    for (const sig of signatures) {
+      const key = signatureKeyString(sig);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      signatureRows.push({
+        signature: key,
+        campaign_type: sig.campaign_type,
+        event_type: sig.event_type,
+        has_event: sig.has_event ? 1 : 0,
+        faction: sig.faction,
+        seen_at: nowMs,
+      });
+    }
+  }
+
+  return {
+    planets: planetRows,
+    global: globalRow,
+    mo: moRows,
+    signatures: signatureRows,
+  };
 }
 
 /** KV TTL for the combined sample/accumulation store key. */
