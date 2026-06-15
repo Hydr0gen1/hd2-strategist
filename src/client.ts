@@ -8,9 +8,9 @@ import {
   archiveSampleTick,
   signatureKeyString,
   type ArchiveTick,
-  type GlobalArchiveRow,
-  type MoArchiveRow,
-  type PlanetArchiveRow,
+  type GlobalArchiveWriteRow,
+  type MoArchiveWriteRow,
+  type PlanetArchiveWriteRow,
   type SignatureArchiveRow,
 } from "./archive";
 import {
@@ -19,6 +19,7 @@ import {
   advancePlanetSeries,
   coerceStore,
   foldSignatures,
+  MIN_SAMPLE_INTERVAL_MS,
   type GlobalSample,
   type HealthSample,
   type MoObjectiveSeries,
@@ -37,7 +38,7 @@ const STALE_KEEP_TTL_SECONDS = 600;
 const FETCH_TIMEOUT_MS = 8_000;
 const SAMPLES_KEY = "samples:planets";
 
-export { MIN_SAMPLE_INTERVAL_MS } from "./sampling";
+export { MIN_SAMPLE_INTERVAL_MS };
 
 export class UpstreamError extends Error {
   constructor(
@@ -279,10 +280,15 @@ export async function samplePlanetRates(
   // and therefore produces no archive rows — the same gate as the KV write, so
   // the D1 archive never accrues duplicate rows. Built only when a D1 binding
   // exists (cheap to skip otherwise).
-  const archivePlanetRows: PlanetArchiveRow[] = [];
+  const archivePlanetRows: PlanetArchiveWriteRow[] = [];
 
   for (const input of inputs) {
     const idxKey = String(input.planetIndex);
+
+    // The predecessor timestamp (the OLD series tail) is read BEFORE the append
+    // — it is the dedup anchor two overlapping polls share (both read the same
+    // old store), so the D1 unique index collapses their concurrent inserts.
+    const prevT = store.planets[idxKey]?.samples.at(-1)?.t;
 
     const advanced = advancePlanetSeries(
       store.planets[idxKey],
@@ -316,6 +322,7 @@ export async function samplePlanetRates(
         campaign_id: input.campaignId,
         campaign_kind: input.campaignKind ?? null,
         faction: input.faction ?? null,
+        tick_anchor: tickAnchor(prevT, nowMs),
       });
     }
 
@@ -373,6 +380,7 @@ export async function samplePlanetRates(
         env,
         buildArchiveTick(
           archivePlanetRows,
+          store,
           global,
           mo,
           opts.signatures ?? [],
@@ -392,14 +400,32 @@ export async function samplePlanetRates(
 }
 
 /**
+ * Stage 12: the dedup anchor for one append-only archive row. For an append it
+ * is the predecessor KV sample's timestamp (`prevT`) — two overlapping polls
+ * read the SAME old store, so they compute the SAME anchor and the D1 unique
+ * index collapses their concurrent inserts. A seed has no predecessor, so it
+ * anchors on a NEGATIVE 60s bucket of `nowMs` (disjoint from any positive
+ * prevT), which dedups same-window seed races while keeping a genuine later
+ * re-seed (a different bucket) distinct. Legit consecutive samples follow
+ * different predecessors, so they always get distinct anchors.
+ */
+function tickAnchor(prevT: number | undefined, nowMs: number): number {
+  if (prevT != null) return prevT;
+  return -(Math.floor(nowMs / MIN_SAMPLE_INTERVAL_MS) + 1);
+}
+
+/**
  * Stage 12: assemble the D1 archive payload for one tick from state already
  * computed by samplePlanetRates — ONLY the observations committed to KV as NEW
  * this tick (a section's tail timestamp equals the tick clock). A within-60s
  * replay commits nothing, so every section is empty and the archive gains no
- * duplicate rows. Pure shaping — no I/O.
+ * duplicate rows (the tick_anchor unique index is the atomic backstop against
+ * concurrent overlapping polls). `store` is the OLD (pre-advance) store, read
+ * for each series' predecessor anchor. Pure shaping — no I/O.
  */
 function buildArchiveTick(
-  planetRows: PlanetArchiveRow[],
+  planetRows: PlanetArchiveWriteRow[],
+  store: SampleStore,
   global: GlobalSample[],
   mo: MoObjectiveSeries[],
   signatures: SignatureObservation[],
@@ -408,7 +434,7 @@ function buildArchiveTick(
   // Global sample committed iff the series gained a point at this tick.
   const globalTail = global[global.length - 1];
   const globalCommitted = globalTail != null && globalTail.t === nowMs;
-  const globalRow: GlobalArchiveRow | null =
+  const globalRow: GlobalArchiveWriteRow | null =
     globalCommitted && globalTail
       ? {
           sampled_at: nowMs,
@@ -421,12 +447,22 @@ function buildArchiveTick(
           terminid_kills: globalTail.terminid_kills,
           automaton_kills: globalTail.automaton_kills,
           illuminate_kills: globalTail.illuminate_kills,
+          tick_anchor: tickAnchor(
+            store.global?.[store.global.length - 1]?.t,
+            nowMs,
+          ),
         }
       : null;
 
   // MO rows: one per series that gained a sample at this tick (a series carried
-  // forward unchanged keeps an older tail and is skipped).
-  const moRows: MoArchiveRow[] = [];
+  // forward unchanged keeps an older tail and is skipped). Each anchors on its
+  // OWN predecessor (the matching old series' tail).
+  const oldMoTail = new Map<string, number>();
+  for (const s of store.mo ?? []) {
+    const t = s.samples[s.samples.length - 1]?.t;
+    if (t != null) oldMoTail.set(`${s.major_order_id}:${s.objective_index}`, t);
+  }
+  const moRows: MoArchiveWriteRow[] = [];
   for (const series of mo) {
     const tail = series.samples[series.samples.length - 1];
     if (tail && tail.t === nowMs) {
@@ -436,6 +472,10 @@ function buildArchiveTick(
         sampled_at: nowMs,
         progress: tail.progress,
         target: tail.target,
+        tick_anchor: tickAnchor(
+          oldMoTail.get(`${series.major_order_id}:${series.objective_index}`),
+          nowMs,
+        ),
       });
     }
   }

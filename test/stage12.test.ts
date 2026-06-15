@@ -94,6 +94,10 @@ class FakeD1 {
   batchCalls = 0;
   failBatch = false;
   lastSelectSql = "";
+  // Unique-index emulation for INSERT OR IGNORE: a conflicting key no-ops.
+  private planetKeys = new Set<string>();
+  private globalKeys = new Set<string>();
+  private moKeys = new Set<string>();
 
   prepare(sql: string): FakePrepared {
     return new FakePrepared(this, sql, []);
@@ -107,7 +111,12 @@ class FakeD1 {
   }
 
   execInsert(sql: string, v: unknown[]): void {
+    const orIgnore = sql.includes("INSERT OR IGNORE");
     if (sql.includes("INTO planet_samples")) {
+      const tickAnchor = v[8] as number;
+      const key = `${v[0]}:${tickAnchor}`;
+      if (orIgnore && this.planetKeys.has(key)) return; // unique index no-op
+      this.planetKeys.add(key);
       this.planet_samples.push({
         planet_index: v[0] as number,
         sampled_at: v[1] as number,
@@ -119,6 +128,10 @@ class FakeD1 {
         faction: v[7] as string | null,
       });
     } else if (sql.includes("INTO global_samples")) {
+      const tickAnchor = v[10] as number;
+      const key = `${tickAnchor}`;
+      if (orIgnore && this.globalKeys.has(key)) return;
+      this.globalKeys.add(key);
       this.global_samples.push({
         sampled_at: v[0] as number,
         player_count: v[1] as number | null,
@@ -132,6 +145,10 @@ class FakeD1 {
         illuminate_kills: v[9] as number | null,
       });
     } else if (sql.includes("INTO mo_progress_samples")) {
+      const tickAnchor = v[5] as number;
+      const key = `${v[0]}:${v[1]}:${tickAnchor}`;
+      if (orIgnore && this.moKeys.has(key)) return;
+      this.moKeys.add(key);
       this.mo_progress_samples.push({
         major_order_id: v[0] as number,
         objective_index: v[1] as number,
@@ -375,6 +392,7 @@ describe("archiveSampleTick", () => {
             campaign_id: null,
             campaign_kind: null,
             faction: null,
+            tick_anchor: NOW - HOUR_MS,
           },
         ],
         global: null,
@@ -408,6 +426,7 @@ describe("archiveSampleTick", () => {
           campaign_id: 42,
           campaign_kind: "liberation",
           faction: "Terminids",
+          tick_anchor: NOW - HOUR_MS,
         },
       ],
       global: {
@@ -421,6 +440,7 @@ describe("archiveSampleTick", () => {
         terminid_kills: 1,
         automaton_kills: 2,
         illuminate_kills: 3,
+        tick_anchor: NOW - HOUR_MS,
       },
       mo: [
         {
@@ -429,6 +449,7 @@ describe("archiveSampleTick", () => {
           sampled_at: NOW,
           progress: 1,
           target: 10,
+          tick_anchor: NOW - HOUR_MS,
         },
       ],
       signatures: [
@@ -499,6 +520,7 @@ describe("archiveSampleTick", () => {
             campaign_id: null,
             campaign_kind: null,
             faction: null,
+            tick_anchor: NOW - HOUR_MS,
           },
         ],
         global: null,
@@ -506,6 +528,37 @@ describe("archiveSampleTick", () => {
         signatures: [],
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it("CONCURRENT OVERLAP: two ticks sharing a tick_anchor insert only ONE row", async () => {
+    const d1 = new FakeD1();
+    const row = {
+      planet_index: 175,
+      sampled_at: NOW,
+      health: 600_000,
+      max_health: 1_000_000,
+      hp_per_hour: 50_000,
+      campaign_id: 42,
+      campaign_kind: "liberation",
+      faction: "Terminids",
+      tick_anchor: NOW - 2 * HOUR_MS, // the shared predecessor both polls read
+    };
+    // Two overlapping polls both committed to KV (last-write-wins) and both
+    // reach D1 with the same predecessor anchor; the unique index drops one.
+    await archiveSampleTick(envWith(null, d1), {
+      planets: [row],
+      global: null,
+      mo: [],
+      signatures: [],
+    });
+    await archiveSampleTick(envWith(null, d1), {
+      planets: [{ ...row, sampled_at: NOW + 3_000 }], // ~3s later, same anchor
+      global: null,
+      mo: [],
+      signatures: [],
+    });
+    expect(d1.planet_samples).toHaveLength(1); // de-duplicated, not two rows
+    expect(d1.planet_samples[0]!.sampled_at).toBe(NOW); // first writer wins
   });
 });
 
@@ -588,6 +641,35 @@ describe("samplePlanetRates → D1 archive (KV path unchanged)", () => {
     expect(d1.planet_samples[0]!.hp_per_hour).toBeNull(); // seed
     expect(d1.planet_samples[1]!.hp_per_hour).not.toBeNull(); // computed
     expect(d1.planet_samples[1]!.hp_per_hour!).toBeGreaterThan(0); // depleting
+  });
+
+  it("OVERLAPPING POLLS: two polls that read the same predecessor archive ONCE", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    // Establish a predecessor sample at NOW (the tail both racers will read).
+    await samplePlanetRates(envWith(kv, d1), INPUTS, NOW);
+    const afterSeed = kv.store.get("samples:planets")!; // tail = NOW
+    expect(d1.planet_samples).toHaveLength(1); // the seed
+
+    // Poll A (>60s later) reads tail=NOW, appends, commits KV (tail → NOW+2m).
+    await samplePlanetRates(
+      envWith(kv, d1),
+      [{ ...INPUTS[0]!, health: 550_000 }],
+      NOW + 2 * MIN_SAMPLE_INTERVAL_MS,
+    );
+    expect(d1.planet_samples).toHaveLength(2); // seed + A's append (anchor=NOW)
+
+    // Poll B overlapped A: it read the SAME old store (tail=NOW) before A's put
+    // was visible. Simulate by restoring the pre-A store, then sampling again.
+    kv.store.set("samples:planets", afterSeed);
+    await samplePlanetRates(
+      envWith(kv, d1),
+      [{ ...INPUTS[0]!, health: 549_000 }],
+      NOW + 2 * MIN_SAMPLE_INTERVAL_MS + 3_000, // ~3s after A, SAME predecessor
+    );
+    // B shares A's predecessor anchor (NOW), so the D1 unique index drops it:
+    // no sub-minute duplicate despite both committing to KV.
+    expect(d1.planet_samples).toHaveLength(2);
   });
 
   it("INTERVAL GATING: a within-60s replay inserts NO duplicate D1 rows", async () => {

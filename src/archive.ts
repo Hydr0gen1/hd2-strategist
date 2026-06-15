@@ -87,14 +87,31 @@ export interface SignatureArchiveRow {
   seen_at: number;
 }
 
+/** A `tick_anchor` rides every append-only write row: the predecessor KV
+ * sample's timestamp this row follows (or a negative 60s bucket of sampled_at
+ * for a seed). Two overlapping polls read the SAME old KV store, so they
+ * compute the SAME anchor; the UNIQUE index makes the second INSERT OR IGNORE a
+ * no-op (atomic, race-proof de-duplication). The read path never selects it, so
+ * the returned row shapes (PlanetArchiveRow etc.) stay clean. */
+export interface PlanetArchiveWriteRow extends PlanetArchiveRow {
+  tick_anchor: number;
+}
+export interface GlobalArchiveWriteRow extends GlobalArchiveRow {
+  tick_anchor: number;
+}
+export interface MoArchiveWriteRow extends MoArchiveRow {
+  tick_anchor: number;
+}
+
 /** One sample tick's archive payload — exactly the observations that were just
  * committed to KV as NEW this cycle. The caller (client.ts) gates each section
  * by the SAME 60s interval that governs the KV write, so a within-60s replay
- * produces an empty tick and inserts nothing. */
+ * produces an empty tick and inserts nothing; the tick_anchor unique index is
+ * the second, atomic line of defense against concurrent overlapping polls. */
 export interface ArchiveTick {
-  planets: PlanetArchiveRow[];
-  global: GlobalArchiveRow | null;
-  mo: MoArchiveRow[];
+  planets: PlanetArchiveWriteRow[];
+  global: GlobalArchiveWriteRow | null;
+  mo: MoArchiveWriteRow[];
   signatures: SignatureArchiveRow[];
 }
 
@@ -136,10 +153,12 @@ export async function archiveSampleTick(
     const batch: D1PreparedStatement[] = [];
 
     if (tick.planets.length > 0) {
+      // INSERT OR IGNORE + the (planet_index, tick_anchor) unique index: a
+      // concurrent overlapping poll that shares the predecessor anchor no-ops.
       const stmt = db.prepare(
-        `INSERT INTO planet_samples
-           (planet_index, sampled_at, health, max_health, hp_per_hour, campaign_id, campaign_kind, faction)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO planet_samples
+           (planet_index, sampled_at, health, max_health, hp_per_hour, campaign_id, campaign_kind, faction, tick_anchor)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const r of tick.planets) {
         batch.push(
@@ -152,6 +171,7 @@ export async function archiveSampleTick(
             r.campaign_id,
             r.campaign_kind,
             r.faction,
+            r.tick_anchor,
           ),
         );
       }
@@ -162,10 +182,10 @@ export async function archiveSampleTick(
       batch.push(
         db
           .prepare(
-            `INSERT INTO global_samples
+            `INSERT OR IGNORE INTO global_samples
                (sampled_at, player_count, impact_multiplier, active_campaign_count,
-                missions_won, missions_lost, deaths, terminid_kills, automaton_kills, illuminate_kills)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                missions_won, missions_lost, deaths, terminid_kills, automaton_kills, illuminate_kills, tick_anchor)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .bind(
             g.sampled_at,
@@ -178,15 +198,16 @@ export async function archiveSampleTick(
             g.terminid_kills,
             g.automaton_kills,
             g.illuminate_kills,
+            g.tick_anchor,
           ),
       );
     }
 
     if (tick.mo.length > 0) {
       const stmt = db.prepare(
-        `INSERT INTO mo_progress_samples
-           (major_order_id, objective_index, sampled_at, progress, target)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO mo_progress_samples
+           (major_order_id, objective_index, sampled_at, progress, target, tick_anchor)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       );
       for (const r of tick.mo) {
         batch.push(
@@ -196,6 +217,7 @@ export async function archiveSampleTick(
             r.sampled_at,
             r.progress,
             r.target,
+            r.tick_anchor,
           ),
         );
       }

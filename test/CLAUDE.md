@@ -311,18 +311,28 @@ the project's definition of done:
   - `archiveSampleTick`: no binding → no-op; empty tick → no batch; all four
     sections insert in ONE batch; the signature UPSERT seeds `first_seen` then
     a later observation PRESERVES `first_seen` and bumps `last_seen` /
-    `sample_count`; a forced D1 error is SWALLOWED, never thrown.
+    `sample_count`; a forced D1 error is SWALLOWED, never thrown; **concurrent
+    overlap** — two ticks sharing a `tick_anchor` insert only ONE row (the
+    unique index `INSERT OR IGNORE` no-ops the second; first writer wins). The
+    `FakeD1` stub emulates the unique index per append-only table.
   - **Write path through `samplePlanetRates` (KV stub + D1 stub):** a fresh
     tick writes BOTH the single unchanged `samples:planets` KV put AND the D1
     archive rows (planet/global/MO + signature) in ONE `db.batch`; a later
     tick archives the computed signed rate; **interval gating** — a within-60s
-    replay inserts NO duplicate D1 rows and performs no batch; **failure
-    isolation** — D1 down still yields a normal result AND the KV write; no D1
-    binding → KV path behaves exactly as before (one put, no throw).
+    replay inserts NO duplicate D1 rows and performs no batch; **overlapping
+    polls** — two polls that read the same predecessor tail (the second
+    simulated by restoring the pre-A store) archive ONCE, not twice (shared
+    `tick_anchor` → unique-index drop); **failure isolation** — D1 down still
+    yields a normal result AND the KV write; **KV-commit gate** — a FAILED KV
+    put (or no KV binding) means the tick is NOT archived (no over-sampling
+    against a stale store); no D1 binding → KV path behaves exactly as before
+    (one put, no throw).
   - Read path: `readPlanetArchive`/`readGlobalArchive`/`readMoArchive` return
-    rows time-ordered, scoped (planet / MO id / objective), honoring
+    rows time-ordered ascending, scoped (planet / MO id / objective), honoring
     `since`/`limit`, with **parameterized SQL pinned** (placeholders present,
-    no interpolated values). Handlers (`getPlanetArchive` over a seeded raw
+    no interpolated values); a CAPPED window returns the NEWEST `limit` rows
+    (DESC + LIMIT, re-sorted ascending), never the oldest. Handlers
+    (`getPlanetArchive` over a seeded raw
     cache + D1 stub; `getGlobalArchive`/`getMajorOrderArchive`): time-ordered
     points with correct deltas, `insufficient_history` on a cold archive with a
     non-error note, zero KV writes, and a **prime-directive key-name pin** (no

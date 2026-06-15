@@ -180,16 +180,34 @@ different time ranges (KV: last ~16h, fast; D1: forever, on disk) and there is
 NO reconciliation logic between them.
 
 The write rides inside `samplePlanetRates` (client.ts) IMMEDIATELY AFTER the
-existing single KV put, never altering it. It archives ONLY the observations
-that were just committed to KV as NEW this tick — the determination is reused
-(a committed sample's newest timestamp equals the tick clock), never recomputed
-— so the SAME 60s `MIN_SAMPLE_INTERVAL_MS` that gates the KV write gates the D1
-write: a within-60s replay commits nothing and archives nothing (no duplicate
-rows). All of a tick's rows (planet/global/MO + the signature UPSERT) go out in
-ONE `db.batch` (never a per-row await loop), wrapped in `archiveSampleTick`'s own
+existing single KV put, never altering it, and ONLY when that put actually
+COMMITTED (a `kvCommitted` flag) — a failed or absent KV write means the ring
+buffer did not advance, so archiving would over-sample against a store the next
+poll re-reads as fresh. It archives ONLY the observations just committed to KV
+as NEW this tick — the determination is reused (a committed sample's newest
+timestamp equals the tick clock), never recomputed — so the SAME 60s
+`MIN_SAMPLE_INTERVAL_MS` that gates the KV write gates the D1 write: a within-60s
+replay commits nothing and archives nothing.
+
+The no-duplicate guarantee survives CONCURRENT overlapping polls (a cron tick +
+a request poll racing after the 60s interval) too, where the in-memory guard
+alone cannot help — both invocations read the same old KV store before either
+put lands, so both build rows. The atomic backstop is a `tick_anchor` on every
+append-only row + a UNIQUE index: the anchor is the PREDECESSOR KV sample's
+timestamp (which both racers share, having read the same old tail), so the
+second `INSERT OR IGNORE` no-ops at the DB level. Seeds (no predecessor) anchor
+on a negative 60s bucket of the clock (disjoint from positive predecessor
+timestamps; `tickAnchor()` in client.ts). Legit consecutive samples follow
+DIFFERENT predecessors → distinct anchors → never collapsed.
+
+All of a tick's rows (planet/global/MO + the signature UPSERT) go out in ONE
+`db.batch` (never a per-row await loop), wrapped in `archiveSampleTick`'s own
 try/catch that logs and swallows — D1 being briefly unavailable degrades to "we
 missed archiving this tick", NEVER a broken KV write or response. Parameterized
-SQL ONLY (every value via `.bind()`). The pure row→point delta builders
+SQL ONLY (every value via `.bind()`). Reads ORDER BY `sampled_at DESC` + LIMIT
+then re-sort ascending, so a capped window returns the NEWEST rows (never the
+oldest) — important because the default 168h window already holds ~1008 cron
+samples. The pure row→point delta builders
 (`buildPlanetArchivePoints` / `buildGlobalArchivePoints` / `buildMoArchiveSeries`)
 live in enrichment.ts and reuse the existing history-delta derivations, so the
 archive view is verifiable against the live history view. Same prime directive:

@@ -42,11 +42,19 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   TRUTH for all live logic (`hp_per_hour`, the dual ETAs, divergence read
   ONLY the recent KV samples). D1 (`HISTORY_DB`, `src/archive.ts`) is the
   append-only unbounded archive, read ONLY by the three `*_archive` tools.
-  The D1 write rides immediately after the existing KV write, is BATCHED
-  (one `db.batch` per tick, never a per-row await loop), gated by the SAME
-  60s interval (no duplicate rows), and BEST-EFFORT / FAILURE-ISOLATED (its
-  own try/catch swallows — a D1 outage degrades to "tick not archived",
-  never an error and never touching the KV write or the response). Never
+  The D1 write rides immediately after the existing KV write (and ONLY when
+  the KV put actually committed — a failed/absent KV write is not archived,
+  so the archive never drifts ahead of the ring buffer), is BATCHED (one
+  `db.batch` per tick, never a per-row await loop), gated by the SAME 60s
+  interval, and BEST-EFFORT / FAILURE-ISOLATED (its own try/catch swallows
+  — a D1 outage degrades to "tick not archived", never an error and never
+  touching the KV write or the response). The no-duplicate guarantee holds
+  even under concurrent overlapping polls (cron + request) via an ATOMIC
+  DB gate: every append-only row carries a `tick_anchor` (its predecessor
+  KV sample's timestamp — which both racers share because they read the
+  same old store) and a UNIQUE index makes the second `INSERT OR IGNORE` a
+  no-op. Reads ORDER BY `sampled_at DESC` + LIMIT then re-sort ascending,
+  so a capped window keeps the NEWEST rows, never the oldest. Never
   add reconciliation logic between the two stores; never let D1 feed live
   logic; never change the KV/rate path to accommodate D1. Parameterized SQL
   ONLY — every value via `.bind()`. The archive tools enrich, never
