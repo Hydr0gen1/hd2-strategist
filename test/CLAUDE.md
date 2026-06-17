@@ -338,6 +338,35 @@ the project's definition of done:
     non-error note, zero KV writes, and a **prime-directive key-name pin** (no
     forecast/on_track/required_pace/verdict/recommend/priority/rank key).
 
+- Fabel features (`stage13.test.ts`) — additive facts over the existing,
+  unchanged pipeline:
+  - Feature 1: `buildInboundNeighbors` inverts observed waypoints (sorted, no
+    dangling); existing outbound `buildNeighbors` is byte-unchanged;
+    `buildAdjacencySummary` counts inbound ∪ outbound and sets
+    `borders_super_earth` only from a Human neighbor. `buildSupplyGraph`:
+    default = active-campaign subgraph + one-hop; `active_only` narrows to
+    active planets; `full` spans the galaxy; edges are observed waypoints ONLY
+    (no implied reverse), dangling targets never become nodes/edges.
+  - Feature 2: `buildGambitOrigins` resolves the attacker(s) of a defense from
+    inverted attack pairs, joins `is_major_order_target`, sorts by index, and
+    carries NO viability/verdict key (pinned).
+  - Feature 3: `perPlayerRates` — the Basquine-VIII validation checkpoint
+    (gross ≈ +71k, ≈2.35k per 1k, sign positive); defense nulls gross with
+    `defense_decay_nulled_invariant_1` (net still present); zero players nulls
+    the per-player fields with `no_players` (no divide-by-zero); missing rate →
+    `no_current_rate`.
+  - Feature 4: `selectRegions` passes raw fields through faithfully, detects a
+    City via upstream `size`, coerces the literal `"null"` description, and
+    reports `regions_available: false` with nothing fabricated on an absent
+    array.
+  - Handlers (KV stub, stage6 pattern): `get_planet` surfaces all four
+    features cache-served with a **prime-directive key-name pin** over the whole
+    payload; `get_supply_graph` returns the active-campaign subgraph with one
+    `samples:planets` put and resolves a root by name / `full`.
+  - Feature 5: `get_planet` serves the durable `snapshot:planets` (`stale:
+    true`) when every live fetch fails; the snapshot is refreshed only on a
+    genuine upstream fetch (a cache hit writes none).
+
 ## Conventions
 
 - Build fixtures with the `makeCampaign` / `makeEvent` / `ctx` helpers in

@@ -63,6 +63,11 @@ export interface UpstreamResult<T> {
    * (the cache record's stored timestamp — NOT when this request ran).
    * Stage 6 freshness metadata derives from it. */
   fetchedAt: number;
+  /** Feature 5: true when this result came from KV (a fresh-cache hit OR a
+   * stale fallback) rather than a NEW network fetch. The warm-cache snapshot is
+   * refreshed only on a genuine network fetch (cached: false), so it never adds
+   * a KV write on a plain cache hit. */
+  cached: boolean;
 }
 
 async function readCache(
@@ -92,7 +97,12 @@ export async function fetchUpstream<T>(
   const cached = await readCache(env, key);
   const now = Date.now();
   if (cached && now - cached.fetchedAt < CACHE_TTL_SECONDS * 1000) {
-    return { data: cached.body as T, stale: false, fetchedAt: cached.fetchedAt };
+    return {
+      data: cached.body as T,
+      stale: false,
+      fetchedAt: cached.fetchedAt,
+      cached: true,
+    };
   }
 
   let response: Response;
@@ -108,7 +118,12 @@ export async function fetchUpstream<T>(
     });
   } catch (err) {
     if (cached) {
-      return { data: cached.body as T, stale: true, fetchedAt: cached.fetchedAt };
+      return {
+        data: cached.body as T,
+        stale: true,
+        fetchedAt: cached.fetchedAt,
+        cached: true,
+      };
     }
     throw new UpstreamError(
       `Upstream request to ${path} failed (${err instanceof Error ? err.message : "network error"}) and no cached copy is available.`,
@@ -117,7 +132,12 @@ export async function fetchUpstream<T>(
 
   if (!response.ok) {
     if (cached) {
-      return { data: cached.body as T, stale: true, fetchedAt: cached.fetchedAt };
+      return {
+        data: cached.body as T,
+        stale: true,
+        fetchedAt: cached.fetchedAt,
+        cached: true,
+      };
     }
     const reason =
       response.status === 429
@@ -141,7 +161,68 @@ export async function fetchUpstream<T>(
       // Cache write failures must never break a successful upstream read.
     }
   }
-  return { data: body, stale: false, fetchedAt: now };
+  return { data: body, stale: false, fetchedAt: now, cached: false };
+}
+
+/* ------------------------------------------------------------------------
+ * Feature 5: warm bulk-planet snapshot.
+ *
+ * A durable, long-TTL copy of the full /api/v1/planets list, refreshed on
+ * every genuine upstream fetch of that list (never on a plain cache hit, so it
+ * adds no KV write to the hot path). It exists ONLY as a fallback: when a live
+ * planets fetch cannot complete AND the short-lived raw: cache has already
+ * evaporated, adjacency/ownership/HP context lookups (get_planet,
+ * get_supply_graph) read this snapshot instead of hard-failing.
+ *
+ * FENCE: this snapshot feeds context lookups ONLY. It MUST NOT backfill the
+ * history/global-stats archive (it is read by no sampling path), so the known
+ * 18145 / 0.07364573 global-stats sentinel can never be enshrined through it.
+ * ---------------------------------------------------------------------- */
+
+const BULK_PLANETS_KEY = "snapshot:planets";
+/** 7 days — long enough to ride out a sustained outage, short enough that a
+ * truly abandoned snapshot still evaporates. */
+export const BULK_SNAPSHOT_TTL_SECONDS = 7 * 86_400;
+
+interface BulkSnapshotEnvelope {
+  fetchedAt: number;
+  body: unknown;
+}
+
+/** Best-effort durable write of the bulk planets snapshot. Never throws — a
+ * snapshot-cache failure must never break the live response it rode in on. */
+export async function cacheBulkPlanets(
+  env: Env,
+  planets: unknown,
+  fetchedAt: number,
+): Promise<void> {
+  if (!env.WAR_CACHE) return;
+  try {
+    await env.WAR_CACHE.put(
+      BULK_PLANETS_KEY,
+      JSON.stringify({ fetchedAt, body: planets } satisfies BulkSnapshotEnvelope),
+      { expirationTtl: BULK_SNAPSHOT_TTL_SECONDS },
+    );
+  } catch {
+    // Snapshot persistence is best-effort; the next fetch retries.
+  }
+}
+
+/** Read the most recent durable bulk planets snapshot, or null when none. */
+export async function readBulkPlanetsSnapshot<T>(
+  env: Env,
+): Promise<{ data: T; fetchedAt: number } | null> {
+  if (!env.WAR_CACHE) return null;
+  try {
+    const env_ = await env.WAR_CACHE.get<BulkSnapshotEnvelope>(
+      BULK_PLANETS_KEY,
+      "json",
+    );
+    if (!env_ || typeof env_.fetchedAt !== "number") return null;
+    return { data: env_.body as T, fetchedAt: env_.fetchedAt };
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------------------

@@ -18,6 +18,7 @@ import type {
   ObservedSignature,
 } from "./sampling";
 import type {
+  AdjacencySummary,
   BiomeInfo,
   CampaignFilters,
   DefenseTiming,
@@ -29,13 +30,18 @@ import type {
   FactionRollup,
   FreshnessMeta,
   FrontRateAggregate,
+  GambitOrigin,
   GlobalHistoryPoint,
   HazardInfo,
   HistoryRateAggregates,
   MoHistorySeries,
+  PerPlayerRates,
   PlanetArchivePoint,
   NeighborInfo,
   NeighborSummary,
+  RegionInfo,
+  SupplyGraphEdge,
+  SupplyGraphNode,
   ObservedSignatureInfo,
   PatchNoteInfo,
   PlanetCandidate,
@@ -497,6 +503,314 @@ export function buildNeighbors(
       with_active_campaign: withCampaign,
     },
     frontline,
+  };
+}
+
+/**
+ * Feature 1: a planet's INBOUND neighbors — every planet whose own waypoints
+ * array names THIS planet's index. Purely the inversion of observed upstream
+ * edges over the single consistent planet snapshot — no symmetrization beyond
+ * what is observed, no routing. Same joined shape as buildNeighbors' outbound
+ * set; a planet whose waypoints list this index is always a real planet (we
+ * iterate the snapshot), so there are no dangling entries here. Sorted by
+ * index for a deterministic payload.
+ */
+export function buildInboundNeighbors(
+  planet: RawPlanet,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
+): NeighborInfo[] {
+  const inbound: NeighborInfo[] = [];
+  for (const p of planetByIndex.values()) {
+    const waypoints = Array.isArray(p.waypoints) ? p.waypoints : [];
+    if (!waypoints.includes(planet.index)) continue;
+    const kind = campaignKindByPlanetIndex.get(p.index) ?? null;
+    inbound.push({
+      index: p.index,
+      name: typeof p.name === "string" ? p.name : null,
+      owner: typeof p.currentOwner === "string" ? p.currentOwner : null,
+      has_active_campaign: kind != null,
+      campaign_kind: kind,
+    });
+  }
+  inbound.sort((a, b) => a.index - b.index);
+  return inbound;
+}
+
+/**
+ * Feature 1: deterministic adjacency counts over the COMBINED inbound ∪
+ * outbound neighbor sets. `borders_super_earth` is true iff at least one
+ * distinct neighbor is owned by "Humans" — an adjacency fact in the spirit of
+ * `frontline`, NOT a liberation-eligibility claim. `super_earth_neighbors`
+ * lists those Human-owned neighbor indices (deduped, sorted).
+ */
+export function buildAdjacencySummary(
+  outbound: NeighborInfo[],
+  inbound: NeighborInfo[],
+): AdjacencySummary {
+  const superEarth = new Set<number>();
+  for (const n of [...outbound, ...inbound]) {
+    if (n.owner === "Humans") superEarth.add(n.index);
+  }
+  const super_earth_neighbors = [...superEarth].sort((a, b) => a - b);
+  return {
+    outbound: outbound.length,
+    inbound: inbound.length,
+    super_earth_neighbors,
+    borders_super_earth: super_earth_neighbors.length > 0,
+  };
+}
+
+/** Feature 1: does this planet border a Human-owned planet over its FULL-galaxy
+ * adjacency (inbound ∪ outbound)? The same fact AdjacencySummary carries,
+ * computed per supply-graph node. Pure lookup over precomputed adjacency. */
+function bordersSuperEarth(
+  index: number,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  reverseAdjacency: ReadonlyMap<number, number[]>,
+): boolean {
+  const planet = planetByIndex.get(index);
+  const outbound =
+    planet && Array.isArray(planet.waypoints) ? planet.waypoints : [];
+  const inbound = reverseAdjacency.get(index) ?? [];
+  for (const n of [...outbound, ...inbound]) {
+    if (planetByIndex.get(n)?.currentOwner === "Humans") return true;
+  }
+  return false;
+}
+
+/**
+ * Feature 1: the supply-line subgraph. Pure graph construction over the single
+ * planet snapshot — emits ONLY observed edges (a planet's own waypoints,
+ * tagged observed: true), never an implied reverse edge. Node selection:
+ *
+ * - full: the whole galaxy.
+ * - rootIndex set: BFS outward (inbound + outbound) from that planet to depth.
+ * - default (no root): every active-campaign planet plus its neighbors to
+ *   depth — the strategically relevant slice, payload-bounded.
+ *
+ * `activeOnly` then narrows nodes to active-campaign planets. Each node carries
+ * borders_super_earth over its FULL-galaxy adjacency (not just the subgraph),
+ * matching get_planet. Dangling waypoint targets (no matching planet) are never
+ * promoted to nodes and never emitted as edges.
+ */
+export function buildSupplyGraph(
+  planets: RawPlanet[],
+  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
+  opts: {
+    rootIndex?: number | null;
+    depth: number;
+    activeOnly: boolean;
+    full: boolean;
+  },
+): { nodes: SupplyGraphNode[]; edges: SupplyGraphEdge[] } {
+  const planetByIndex = new Map<number, RawPlanet>(
+    planets.map((p) => [p.index, p]),
+  );
+  // Reverse adjacency once: index → planets whose waypoints name it.
+  const reverseAdjacency = new Map<number, number[]>();
+  for (const p of planets) {
+    const waypoints = Array.isArray(p.waypoints) ? p.waypoints : [];
+    for (const w of waypoints) {
+      const list = reverseAdjacency.get(w);
+      if (list) list.push(p.index);
+      else reverseAdjacency.set(w, [p.index]);
+    }
+  }
+
+  const nodeSet = new Set<number>();
+  if (opts.full) {
+    for (const p of planets) nodeSet.add(p.index);
+  } else {
+    const seeds =
+      opts.rootIndex != null && planetByIndex.has(opts.rootIndex)
+        ? [opts.rootIndex]
+        : planets
+            .filter((p) => campaignKindByPlanetIndex.has(p.index))
+            .map((p) => p.index);
+    let frontier = new Set<number>(seeds);
+    for (const s of seeds) nodeSet.add(s);
+    for (let d = 0; d < opts.depth && frontier.size > 0; d++) {
+      const next = new Set<number>();
+      for (const idx of frontier) {
+        const planet = planetByIndex.get(idx);
+        const outbound =
+          planet && Array.isArray(planet.waypoints) ? planet.waypoints : [];
+        const inbound = reverseAdjacency.get(idx) ?? [];
+        for (const n of [...outbound, ...inbound]) {
+          if (!planetByIndex.has(n) || nodeSet.has(n)) continue;
+          nodeSet.add(n);
+          next.add(n);
+        }
+      }
+      frontier = next;
+    }
+  }
+
+  if (opts.activeOnly) {
+    for (const idx of [...nodeSet]) {
+      if (!campaignKindByPlanetIndex.has(idx)) nodeSet.delete(idx);
+    }
+  }
+
+  const sorted = [...nodeSet].sort((a, b) => a - b);
+  const nodes: SupplyGraphNode[] = sorted.map((idx) => {
+    const planet = planetByIndex.get(idx)!;
+    const kind = campaignKindByPlanetIndex.get(idx) ?? null;
+    return {
+      index: idx,
+      name: typeof planet.name === "string" ? planet.name : null,
+      owner: typeof planet.currentOwner === "string" ? planet.currentOwner : null,
+      has_active_campaign: kind != null,
+      campaign_kind: kind,
+      borders_super_earth: bordersSuperEarth(idx, planetByIndex, reverseAdjacency),
+    };
+  });
+
+  const edges: SupplyGraphEdge[] = [];
+  for (const idx of sorted) {
+    const planet = planetByIndex.get(idx)!;
+    const waypoints = Array.isArray(planet.waypoints) ? planet.waypoints : [];
+    for (const w of [...waypoints].sort((a, b) => a - b)) {
+      if (nodeSet.has(w)) edges.push({ from: idx, to: w, observed: true });
+    }
+  }
+  return { nodes, edges };
+}
+
+/**
+ * Feature 2: the attack origin(s) of a defense — every planet whose outbound
+ * `attacking` array names THIS planet's index (the inversion of the observed
+ * source→target attack pairs over the single snapshot). Each origin surfaces
+ * its raw state plus a pure is_major_order_target membership join — never a
+ * priority/timing verdict. Sorted by index. Empty when no attack resolves.
+ */
+export function buildGambitOrigins(
+  planet: RawPlanet,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
+  moPlanetIndices: ReadonlySet<number>,
+): GambitOrigin[] {
+  const origins: GambitOrigin[] = [];
+  for (const p of planetByIndex.values()) {
+    const attacking = Array.isArray(p.attacking) ? p.attacking : [];
+    if (!attacking.includes(planet.index)) continue;
+    const kind = campaignKindByPlanetIndex.get(p.index) ?? null;
+    origins.push({
+      index: p.index,
+      name: typeof p.name === "string" ? p.name : null,
+      owner: typeof p.currentOwner === "string" ? p.currentOwner : null,
+      has_active_campaign: kind != null,
+      campaign_kind: kind,
+      raw_hp:
+        typeof p.health === "number" && Number.isFinite(p.health)
+          ? p.health
+          : null,
+      is_major_order_target: moPlanetIndices.has(p.index),
+    });
+  }
+  origins.sort((a, b) => a.index - b.index);
+  return origins;
+}
+
+/**
+ * Feature 3: per-player effective rates, all CONSUMING the one signed
+ * hp_per_hour (and decay_per_hour, itself the invariant-1 normalized regen ×
+ * 3600) — nothing is recomputed. Sign convention is preserved exactly:
+ * gross_depletion_per_hour = hp_per_hour + decay_per_hour (player depletion =
+ * net progress + regen the players also had to overcome). Defenses null the
+ * gross fields (decay is force-nulled by invariant 1 — gross is uncomputable,
+ * never reached around). Zero/unknown players null the per-player fields
+ * rather than divide. Every null carries a machine-readable reason.
+ */
+export function perPlayerRates(args: {
+  hpPerHour: number | null;
+  decayPerHour: number | null;
+  campaignKind: "liberation" | "defense";
+  playerCount: number | null;
+}): PerPlayerRates {
+  const { hpPerHour, decayPerHour, campaignKind, playerCount } = args;
+  const hasPlayers =
+    playerCount != null && Number.isFinite(playerCount) && playerCount > 0;
+  const per1k = hasPlayers ? playerCount! / 1000 : null;
+
+  const net_hp_per_hour_per_1k_players =
+    hpPerHour != null && per1k != null ? hpPerHour / per1k : null;
+
+  // gross = player depletion before regen — liberation only (invariant 1
+  // force-nulls defense decay, so gross is uncomputable on a defense).
+  let gross_depletion_per_hour: number | null = null;
+  let grossReason: string | undefined;
+  if (campaignKind === "defense") {
+    grossReason = "defense_decay_nulled_invariant_1";
+  } else if (hpPerHour == null) {
+    grossReason = "no_current_rate";
+  } else if (decayPerHour == null) {
+    grossReason = "decay_unknown";
+  } else {
+    gross_depletion_per_hour = hpPerHour + decayPerHour;
+  }
+
+  const gross_depletion_per_1k_players =
+    gross_depletion_per_hour != null && per1k != null
+      ? gross_depletion_per_hour / per1k
+      : null;
+
+  // A single dominant reason for any null: no players first (it nulls the
+  // most), then the gross-specific reason.
+  let reason: string | undefined;
+  if (!hasPlayers) reason = "no_players";
+  else if (grossReason) reason = grossReason;
+
+  return {
+    net_hp_per_hour_per_1k_players,
+    gross_depletion_per_hour,
+    gross_depletion_per_1k_players,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+/**
+ * Feature 4: faithful passthrough of a planet's raw per-region/city array.
+ * Maps ONLY the fields upstream actually carries (verified live 2026-06-17) —
+ * no derived liberation-contribution math (that is not a deterministic
+ * transform of fields we hold, so it stays in conversation). `regions_available`
+ * is false when upstream has no usable region array; `has_city_region` keys off
+ * upstream's own `size === "City"` classification, never a biome inference. The
+ * literal string "null" some descriptions carry is coerced to null.
+ */
+export function selectRegions(
+  regions: RawPlanet["regions"],
+): {
+  regions: RegionInfo[];
+  regions_available: boolean;
+  has_city_region: boolean;
+} {
+  if (!Array.isArray(regions) || regions.length === 0) {
+    return { regions: [], regions_available: false, has_city_region: false };
+  }
+  const mapped = regions.map((r): RegionInfo => {
+    const description =
+      typeof r.description === "string" && r.description !== "null"
+        ? r.description
+        : null;
+    return {
+      id: finiteOrNull(r.id),
+      name: typeof r.name === "string" ? r.name : null,
+      description,
+      health: finiteOrNull(r.health),
+      max_health: finiteOrNull(r.maxHealth),
+      size: typeof r.size === "string" ? r.size : null,
+      regen_per_second: finiteOrNull(r.regenPerSecond),
+      availability_factor: finiteOrNull(r.availabilityFactor),
+      is_available: typeof r.isAvailable === "boolean" ? r.isAvailable : null,
+      players: finiteOrNull(r.players),
+    };
+  });
+  return {
+    regions: mapped,
+    regions_available: true,
+    has_city_region: mapped.some((r) => r.size === "City"),
   };
 }
 
@@ -1164,6 +1478,26 @@ export const LIBERATION_PCT_NOTE =
  * deterministic comparisons they are — never a success/failure prediction. */
 export const DEFENSE_WINDOW_NOTE =
   "Defense campaigns only. projected_hp_at_defense_end = raw_hp − hp_per_hour × defense_hours_remaining: a linear extrapolation of the current signed rate to the defense deadline (≤ 0 means the extrapolation reaches the win state inside the window; unclamped so the arithmetic is verifiable). resolution_within_defense_window = hours_to_resolution ≤ defense_hours_remaining: a deterministic comparison of two fields already in this payload — it co-locates the timing gap, it does NOT predict success or failure. Both null when no rate exists; the boolean is also null on a stalemate (no resolution projection to compare).";
+
+/** Feature 1: inbound adjacency + the supply-graph view, documented inline. */
+export const INBOUND_NEIGHBORS_NOTE =
+  "inbound_neighbors inverts observed upstream waypoints: every planet whose own waypoints array names THIS planet, joined the same way as neighbors (outbound). Pure edge inversion over one consistent snapshot — never symmetrized or rerouted. adjacency_summary counts the combined inbound ∪ outbound sets; super_earth_neighbors lists adjacent Human-owned planet indices and borders_super_earth is true when any exists — an adjacency fact like frontline, NOT a 'can be liberated' claim (campaign-launch eligibility is a game rule this server does not model).";
+
+/** Feature 2: the defense gambit origin, documented inline. */
+export const GAMBIT_ORIGIN_NOTE =
+  "Defense campaigns only. gambit_origin (or gambit_origins, when several attacks target this planet) is the planet whose attack targets this defense — resolved by inverting the observed source→target attack pairs (a planet's outbound `attacking` array). It surfaces the origin's raw state plus is_major_order_target (a pure membership join, not a priority score). There is deliberately NO gambit_viable / timing verdict: whether clearing the origin in time is feasible is the consumer's call. gambit_origin null with a reason means no attack origin could be resolved from raw.";
+
+/** Feature 3: the per-player effective rates, documented inline. */
+export const PER_PLAYER_RATES_NOTE =
+  "All consume the single signed hp_per_hour (never recomputed). net_hp_per_hour_per_1k_players = hp_per_hour / (player_count / 1000). gross_depletion_per_hour = hp_per_hour + decay_per_hour = the raw player depletion before regen — LIBERATION campaigns only (invariant 1 force-nulls defense decay, so gross is uncomputable on a defense → null with reason defense_decay_nulled_invariant_1). gross_depletion_per_1k_players is that per 1k players. Zero/unknown players → per-player fields null with reason no_players (never a divide-by-zero). Low player counts are reported as-is (noisy), never smoothed.";
+
+/** Feature 4: the per-region/city passthrough, documented inline. */
+export const REGIONS_NOTE =
+  "regions is a faithful passthrough of upstream's per-region/city sub-objective array (health, size, players, availability, …) — present when regions_available is true. has_city_region keys off upstream's own size === 'City' classification, never a biome inference. No derived 'capturing this region yields X% liberation' contribution is computed — that is not a deterministic transform of fields held here, so it stays in conversation.";
+
+/** Feature 5: stale bulk-snapshot fallback semantics, documented inline. */
+export const SUPPLY_GRAPH_NOTE =
+  "Observed supply edges over the live planet snapshot: nodes are planets, edges are a planet's own waypoints (observed: true) — implied reverse edges are never synthesized. Default (no args) is the active-campaign subgraph (every active-campaign planet plus its one-hop inbound+outbound neighbors); full: true returns the whole galaxy. borders_super_earth on each node is the same adjacency fact get_planet carries. stale: true means this was served from the most recent cached bulk snapshot because a live fetch could not complete.";
 
 /** Stage 7, Part D: the Major Order objective decode, documented inline. */
 export const MO_OBJECTIVE_DECODE_NOTE =

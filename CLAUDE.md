@@ -29,14 +29,29 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
 
 ## Hard rules (project-wide)
 
-- **Exactly seventeen tools**: `get_war_brief`, `get_war_status`,
-  `get_campaigns`, `get_major_order`, `get_planet`, `get_dispatches`,
-  `get_patch_notes`, `get_planet_history`, `get_planet_wiki`,
-  `get_observed_signatures`, `get_global_history`,
+- **Exactly eighteen tools**: `get_war_brief`, `get_war_status`,
+  `get_campaigns`, `get_major_order`, `get_planet`, `get_supply_graph`,
+  `get_dispatches`, `get_patch_notes`, `get_planet_history`,
+  `get_planet_wiki`, `get_observed_signatures`, `get_global_history`,
   `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`,
   and the Stage 12 D1 archive trio `get_planet_archive`,
   `get_global_archive`, `get_major_order_archive`. Do not add tools or
-  rename them.
+  rename them. (`get_supply_graph` was the eighteenth, added by the Fabel
+  supply-graph/gambit pass; the count was seventeen before it.)
+- **Fabel additive-fact rule** (supply graph, gambit, per-player rates,
+  regions, warm cache): every new field is a raw upstream value or a
+  deterministic transform of values already in the payload — never a verdict.
+  Names state facts (`borders_super_earth`, `gambit_origin`), never
+  judgments (`can_liberate`, `gambit_viable`). The five invariants are
+  frozen — new code CONSUMES the single signed `hp_per_hour` and the
+  invariant-1 nulled decay, never recomputing a rate or reaching around a
+  suppressed field. `inbound_neighbors` is the pure inversion of observed
+  waypoints (no symmetrization/routing); `gambit_origin` inverts the observed
+  source→target attack pairs; `per_player_rates` divide-guard zero players;
+  `regions` is a faithful passthrough with NO derived liberation-contribution
+  math; the warm `snapshot:planets` cache feeds adjacency/ownership/HP context
+  lookups ONLY (get_planet / get_supply_graph fallback) and MUST NOT backfill
+  the history/global-stats archive.
 - **Two history stores, never reconciled** (Stage 12): KV
   (`samples:planets`) is the bounded recent ring buffer and the SOURCE OF
   TRUTH for all live logic (`hp_per_hour`, the dual ETAs, divergence read

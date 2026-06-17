@@ -21,6 +21,7 @@ import {
   getPlanetHistory,
   getPlanetWiki,
   getSourceCrossCheck,
+  getSupplyGraph,
   getWarBrief,
   getWarStatus,
   resolvePlanetTool,
@@ -94,6 +95,34 @@ const TOOL_DEFINITIONS = [
         name: {
           type: "string",
           description: "Planet name, case-insensitive (e.g. \"Grand Errant\")",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_supply_graph",
+    description:
+      "Supply-line graph over observed waypoint edges. Default (no args): the active-campaign subgraph — every active-campaign planet plus its one-hop inbound+outbound neighbors. full: true returns the whole galaxy; root (index or name) + depth (default 1, cap 3) walks outward from one planet; active_only narrows nodes to active-campaign planets. Returns compact nodes (index, name, owner, has_active_campaign, campaign_kind, borders_super_earth) and directed edges (from, to, observed: true — only edges upstream actually lists; implied reverse edges are never synthesized), plus node_count/edge_count. Serves the most recent cached bulk snapshot (stale: true) when a live fetch cannot complete.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        root: {
+          type: ["number", "string"],
+          description:
+            "Optional root planet (index number or name) to walk outward from. Omit for the active-campaign subgraph.",
+        },
+        depth: {
+          type: "number",
+          description: "Hops to expand from the seed set (default 1, cap 3).",
+        },
+        active_only: {
+          type: "boolean",
+          description: "Narrow nodes to active-campaign planets only.",
+        },
+        full: {
+          type: "boolean",
+          description: "Return the whole galaxy instead of a subgraph.",
         },
       },
       additionalProperties: false,
@@ -357,6 +386,21 @@ async function dispatchTool(
         await getPlanet(env, {
           index: typeof args.index === "number" ? args.index : undefined,
           name: typeof args.name === "string" ? args.name : undefined,
+        }),
+      );
+    case "get_supply_graph":
+      return toolText(
+        await getSupplyGraph(env, {
+          root:
+            typeof args.root === "number" || typeof args.root === "string"
+              ? args.root
+              : undefined,
+          depth: typeof args.depth === "number" ? args.depth : undefined,
+          active_only:
+            typeof args.active_only === "boolean"
+              ? args.active_only
+              : undefined,
+          full: typeof args.full === "boolean" ? args.full : undefined,
         }),
       );
     case "get_dispatches":

@@ -33,6 +33,26 @@ export interface RawEvent {
   campaignId: number;
 }
 
+/** Fabel feature 4: one raw per-planet region/city sub-objective as upstream
+ * (api.helldivers2.dev /api/v1/planets) returns it — verified live 2026-06-17.
+ * Only the fields we pass through are typed; all optional because the array is
+ * absent on most planets and individual fields can be missing. `size` is
+ * upstream's own region classification ("City", …) — the only thing that
+ * distinguishes a city, never inferred from biome. */
+export interface RawRegion {
+  id?: number | null;
+  hash?: number | null;
+  name?: string | null;
+  description?: string | null;
+  health?: number | null;
+  maxHealth?: number | null;
+  size?: string | null;
+  regenPerSecond?: number | null;
+  availabilityFactor?: number | null;
+  isAvailable?: boolean | null;
+  players?: number | null;
+}
+
 export interface RawPlanet {
   index: number;
   name: string;
@@ -44,8 +64,14 @@ export interface RawPlanet {
   currentOwner: string;
   regenPerSecond: number;
   event: RawEvent | null;
+  /** Outbound attack targets: planet indices THIS planet is the source of an
+   * attack toward (verified live 2026-06-17: equals the raw status
+   * planetAttacks {source,target} pairs with source = this index). Inverting
+   * it yields a defense's attack origin — Fabel feature 2. */
   attacking: number[];
   waypoints: number[];
+  /** Fabel feature 4: per-region/city sub-objectives; absent on most planets. */
+  regions?: RawRegion[] | null;
   statistics?: RawStatistics | null;
   biome?: RawBiome | null;
   hazards?: RawHazard[] | null;
@@ -814,6 +840,86 @@ export type CrossCheckBlock =
       detail?: string;
       note: string;
     };
+
+/* ----------------------- Fabel feature outputs ------------------------ */
+
+/** Feature 1: deterministic counts over a planet's combined adjacency
+ * (inbound ∪ outbound). `super_earth_neighbors` lists the indices of adjacent
+ * Human-owned planets; `borders_super_earth` is the same adjacency fact in the
+ * spirit of `frontline` — "at least one neighbor is owned by Humans", NOT a
+ * "can be liberated" claim (campaign-launch eligibility is a game rule this
+ * server does not model). */
+export interface AdjacencySummary {
+  outbound: number;
+  inbound: number;
+  super_earth_neighbors: number[];
+  borders_super_earth: boolean;
+}
+
+/** Feature 1: one node in get_supply_graph — a planet plus the same
+ * borders_super_earth adjacency fact get_planet carries. */
+export interface SupplyGraphNode {
+  index: number;
+  name: string | null;
+  owner: string | null;
+  has_active_campaign: boolean;
+  campaign_kind: "liberation" | "defense" | null;
+  borders_super_earth: boolean;
+}
+
+/** Feature 1: one directed supply edge. `observed: true` always — only edges
+ * upstream actually lists (a planet's own waypoints) are emitted; an implied
+ * reverse edge is never synthesized. */
+export interface SupplyGraphEdge {
+  from: number;
+  to: number;
+  observed: true;
+}
+
+/** Feature 2: the resolved origin of an attack on a defense planet — the
+ * planet whose attack targets this defense. Raw state only;
+ * `is_major_order_target` is a pure membership join against the current MO
+ * target set (the same pattern get_campaigns uses), NOT a priority score.
+ * There is deliberately no gambit_viable / timing verdict — the consumer
+ * reasons about feasibility. */
+export interface GambitOrigin {
+  index: number;
+  name: string | null;
+  owner: string | null;
+  has_active_campaign: boolean;
+  campaign_kind: "liberation" | "defense" | null;
+  raw_hp: number | null;
+  is_major_order_target: boolean;
+}
+
+/** Feature 3: per-player effective rates, all CONSUMING the single signed
+ * hp_per_hour (never recomputing it). `gross_*` are liberation-only (defense
+ * decay is force-nulled by invariant 1, so gross is uncomputable there) and
+ * `reason` explains any null (`defense_decay_nulled_invariant_1`,
+ * `no_players`, `no_current_rate`). Never a smoothed or judged number. */
+export interface PerPlayerRates {
+  net_hp_per_hour_per_1k_players: number | null;
+  gross_depletion_per_hour: number | null;
+  gross_depletion_per_1k_players: number | null;
+  reason?: string;
+}
+
+/** Feature 4: one normalized per-region/city sub-objective — a faithful
+ * passthrough of the raw fields that exist, never a derived liberation
+ * contribution. */
+export interface RegionInfo {
+  id: number | null;
+  name: string | null;
+  description: string | null;
+  health: number | null;
+  max_health: number | null;
+  /** Upstream's own region classification (e.g. "City") — verbatim. */
+  size: string | null;
+  regen_per_second: number | null;
+  availability_factor: number | null;
+  is_available: boolean | null;
+  players: number | null;
+}
 
 /** Worker environment bindings. */
 export interface Env {
