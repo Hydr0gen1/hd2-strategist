@@ -46,7 +46,15 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   frozen — new code CONSUMES the single signed `hp_per_hour` and the
   invariant-1 nulled decay, never recomputing a rate or reaching around a
   suppressed field. `inbound_neighbors` is the pure inversion of observed
-  waypoints (no symmetrization/routing); `gambit_origin` inverts the observed
+  waypoints (no symmetrization/routing); `get_supply_graph` is READ-ONLY
+  (records nothing on any path) and its staleness NAMES its source — a
+  structured `provenance` block separates planet-list provenance (`planet_source`,
+  governs topology) from campaign-overlay provenance (`campaigns:
+  ok|stale|unavailable`, governs annotations + the active-only selection), so a
+  campaign-only outage is never mislabeled a planet-snapshot fallback; under a
+  campaign outage topology stays complete while nodes are
+  `campaign_state_known: false` (an empty active subgraph reads as UNKNOWN, never
+  "no active campaigns"); `gambit_origin` inverts the observed
   source→target attack pairs; `per_player_rates` divide-guard zero players;
   `regions` is a faithful passthrough with NO derived liberation-contribution
   math; the warm `snapshot:planets` cache feeds adjacency/ownership/HP context

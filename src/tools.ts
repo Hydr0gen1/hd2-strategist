@@ -316,7 +316,7 @@ interface CampaignBundle {
 
 async function loadNormalizedCampaigns(
   env: Env,
-  opts: { withWar?: boolean } = {},
+  opts: { withWar?: boolean; persist?: boolean } = {},
 ): Promise<CampaignBundle> {
   const [campaignsRes, assignmentsRes, warRes] = await Promise.all([
     fetchUpstream<RawCampaign[]>(env, "/api/v1/campaigns"),
@@ -341,6 +341,9 @@ async function loadNormalizedCampaigns(
     !campaignsRes.stale &&
     !assignmentsRes.stale &&
     (warRes ? !warRes.stale : true);
+  // A read-only caller (get_supply_graph) forces persist off regardless of
+  // freshness: a topology/overlay query never drives the sampling cadence.
+  const persistThisPoll = liveFetch && opts.persist !== false;
 
   const samples = await samplePlanetRates(
     env,
@@ -359,8 +362,9 @@ async function loadNormalizedCampaigns(
     ),
     nowMs,
     {
-      // P1: write nothing when the underlying fetch was a stale fallback.
-      persist: liveFetch,
+      // P1: write nothing when the underlying fetch was a stale fallback, or
+      // when the caller is read-only (get_supply_graph).
+      persist: persistThisPoll,
       // Stage 5/8 accumulation layers — folded into the SAME single write.
       // Global statistics are present only on the get_war_status path (the
       // one place the war is fetched); signatures and MO progress fold on
@@ -1066,9 +1070,12 @@ export async function getPlanet(
  * The sampling write budget is unchanged: a live load writes once as before; a
  * resilient-empty load writes nothing.
  */
-async function loadCampaignsResilient(env: Env): Promise<CampaignBundle> {
+async function loadCampaignsResilient(
+  env: Env,
+  opts: { persist?: boolean } = {},
+): Promise<CampaignBundle> {
   try {
-    return await loadNormalizedCampaigns(env);
+    return await loadNormalizedCampaigns(env, { persist: opts.persist });
   } catch {
     // P1: a RESILIENT-EMPTY result — the fetch failed and was swallowed.
     // ok:false marks campaign state as UNKNOWN (not "no active campaigns"), so
@@ -1087,10 +1094,15 @@ async function loadCampaignsResilient(env: Env): Promise<CampaignBundle> {
  * Feature 1: the supply-line graph tool. Default (no args) returns the
  * active-campaign subgraph (every active-campaign planet plus its one-hop
  * inbound+outbound neighbors); full: true returns the whole galaxy. Edges are
- * ONLY observed waypoints (observed: true) — no implied reverse edges. Reuses
- * the same warm-cache fallback and resilient campaign load as get_planet, so an
- * upstream outage serves the most recent bulk snapshot (stale: true) instead of
- * erroring.
+ * ONLY observed waypoints (observed: true) — no implied reverse edges.
+ *
+ * READ-ONLY: this tool records nothing (the campaign load is forced
+ * persist:false), so no fallback path can ever sample. Staleness names its
+ * SOURCE via a structured `provenance` block — planet-list provenance
+ * (topology) and campaign-overlay provenance (annotations + active-only
+ * selection) are independent, so a campaign-only outage is no longer
+ * mislabeled as a planet-snapshot fallback. Topology stays complete under a
+ * campaign outage; only the annotations and the active-only selection degrade.
  */
 export async function getSupplyGraph(
   env: Env,
@@ -1103,12 +1115,37 @@ export async function getSupplyGraph(
 ): Promise<unknown> {
   const [planetsResult, bundle] = await Promise.all([
     fetchPlanetsWithFallback(env),
-    loadCampaignsResilient(env),
+    // Read-only: a topology/overlay query never drives the sampling cadence.
+    loadCampaignsResilient(env, { persist: false }),
   ]);
   const planets = planetsResult.planets;
   const campaignKindByIndex = new Map<number, "liberation" | "defense">(
     bundle.campaigns.map((c) => [c.planet_index, c.campaign_kind]),
   );
+
+  // Split provenance. Planet-list provenance governs topology; the campaign
+  // bundle governs the overlay (per-node annotation + the active-only
+  // selection). `ok:false` is a resilient-empty OUTAGE — campaign state is
+  // UNKNOWN, not "no active campaigns".
+  const planetSource = planetsResult.source; // 'live' | 'snapshot'
+  const campaigns: "ok" | "stale" | "unavailable" = !bundle.ok
+    ? "unavailable"
+    : bundle.stale
+      ? "stale"
+      : "ok";
+  const campaignStateKnown = campaigns !== "unavailable";
+  const overlay: "complete" | "degraded" | "unavailable" =
+    campaigns === "ok" ? "complete" : campaigns === "stale" ? "degraded" : "unavailable";
+  const planetSnapshotUsed = planetSource === "snapshot";
+  const campaignOutage = campaigns === "unavailable";
+
+  const reasons: string[] = [];
+  if (planetSnapshotUsed)
+    reasons.push("planet_list_served_from_snapshot_fallback");
+  if (campaigns === "stale")
+    reasons.push("campaign_overlay_served_from_stale_cache");
+  if (campaignOutage)
+    reasons.push("campaign_overlay_unavailable_active_selection_unknown");
 
   // Resolve an optional root (index or name) — a near-miss surfaces ranked
   // candidates, never a silent substitution (the resolve_planet discipline).
@@ -1142,19 +1179,45 @@ export async function getSupplyGraph(
   const depth = Math.min(3, Math.max(1, Math.floor(args.depth ?? 1)));
   const activeOnly = Boolean(args.active_only);
   const full = Boolean(args.full);
+  // A default (active-campaign) selection cannot be trusted under a campaign
+  // outage — the active set is UNKNOWN, not empty. Return the full topology
+  // instead, flagged campaign_state_known:false, rather than a bare empty node
+  // set that would read as "no active campaigns". Topology is unaffected by a
+  // campaign outage; only the annotations degrade.
+  const defaultSelection = rootIndex == null && !full;
+  const effectiveFull = full || (defaultSelection && campaignOutage);
   const graph = buildSupplyGraph(planets, campaignKindByIndex, {
     rootIndex,
     depth,
     activeOnly,
-    full,
+    full: effectiveFull,
+    campaignStateKnown,
   });
 
+  const scope = full
+    ? "full_galaxy"
+    : rootIndex != null
+      ? "root_subgraph"
+      : campaignOutage
+        ? "active_campaign_subgraph_unknown" // topology returned, active set unknown
+        : "active_campaign_subgraph";
+
   return {
-    scope: full ? "full_galaxy" : rootIndex != null ? "root_subgraph" : "active_campaign_subgraph",
+    scope,
     ...(rootIndex != null ? { root_index: rootIndex } : {}),
     depth,
     active_only: activeOnly,
     full,
+    // Split provenance — staleness names its source(s).
+    provenance: {
+      planet_source: planetSource,
+      campaigns,
+      planet_snapshot_used: planetSnapshotUsed,
+      campaign_outage: campaignOutage,
+      reasons,
+    },
+    // The active-overlay consequence stated explicitly.
+    active_campaign_overlay: overlay,
     node_count: graph.nodes.length,
     edge_count: graph.edges.length,
     nodes: graph.nodes,
@@ -1164,11 +1227,12 @@ export async function getSupplyGraph(
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom([planetsResult.fetchedAt, ...bundle.fetchedAts], Date.now()),
-    // Display staleness (incl. snapshot planets). P1: any sample RECORD rides
-    // loadCampaignsResilient → loadNormalizedCampaigns, gated on campaign-data
-    // provenance — never the snapshot planets list — so a stale graph never
-    // implies snapshot/stale data was recorded.
-    ...(planetsResult.stale || bundle.stale ? { stale: true } : {}),
+    // Top-level `stale` is a ROLLUP (back-compat): true when ANY input was
+    // degraded. `provenance` names which. The tool records nothing on any path,
+    // so this never implies degraded data was persisted.
+    ...(planetSnapshotUsed || campaignOutage || campaigns === "stale"
+      ? { stale: true }
+      : {}),
   };
 }
 

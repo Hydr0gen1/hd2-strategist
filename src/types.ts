@@ -857,13 +857,17 @@ export interface AdjacencySummary {
 }
 
 /** Feature 1: one node in get_supply_graph — a planet plus the same
- * borders_super_earth adjacency fact get_planet carries. */
+ * borders_super_earth adjacency fact get_planet carries. `campaign_state_known`
+ * is false during a campaign outage; then `has_active_campaign` is null (never
+ * asserted false) and `campaign_kind` is null — topology stays complete, only
+ * the campaign annotation degrades. */
 export interface SupplyGraphNode {
   index: number;
   name: string | null;
   owner: string | null;
-  has_active_campaign: boolean;
+  has_active_campaign: boolean | null;
   campaign_kind: "liberation" | "defense" | null;
+  campaign_state_known: boolean;
   borders_super_earth: boolean;
 }
 

@@ -511,7 +511,7 @@ describe("get_planet — feature 1 + 2 + 3 + 4 (cache-served)", () => {
 /* ----------------------- feature 1: get_supply_graph ------------------ */
 
 describe("get_supply_graph handler", () => {
-  it("default returns the active-campaign subgraph with observed edges, one KV put", async () => {
+  it("default returns the active-campaign subgraph with observed edges, READ-ONLY (zero writes)", async () => {
     const kv = fakeKv();
     const env = seededEnv(kv); // active campaign on Sangis (273)
     forbidNetwork();
@@ -522,8 +522,16 @@ describe("get_supply_graph handler", () => {
     expect(out.nodes.map((n: any) => n.index)).toContain(273);
     expect(out.edge_count).toBe(out.edges.length);
     for (const e of out.edges) expect(e.observed).toBe(true);
-    // Reuses the campaign loader → exactly one samples:planets write.
-    expect(kv.puts.filter((p) => p.key === "samples:planets")).toHaveLength(1);
+    expect(out.provenance).toMatchObject({
+      planet_source: "live",
+      campaigns: "ok",
+      planet_snapshot_used: false,
+      campaign_outage: false,
+    });
+    expect(out.active_campaign_overlay).toBe("complete");
+    expect(out.stale).toBeUndefined();
+    // Read-only: a topology/overlay query never drives the sampling cadence.
+    expect(kv.puts.filter((p) => p.key === "samples:planets")).toHaveLength(0);
     for (const k of collectKeys(out)) expect(k).not.toMatch(FORBIDDEN_KEYS);
   });
 
@@ -771,5 +779,186 @@ describe("P1 — provenance-gated persistence", () => {
     const b = (await getPlanet(envB, { index: 50 })) as Record<string, any>;
     expect(b.stale).toBeUndefined(); // wrote ⟹ not stale
     expect(samplePuts(kvB)).toBeGreaterThanOrEqual(1);
+  });
+});
+
+/* --------- supply-graph split provenance (campaign vs planet) --------- */
+
+describe("get_supply_graph — split provenance (campaign vs planet outage)", () => {
+  const everyNode = (out: Record<string, any>) =>
+    out.nodes as Array<Record<string, any>>;
+
+  it("1. campaign-only outage: campaigns 'unavailable', overlay 'unavailable', planet_source live, flagged unknown (not bare empty)", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRaw(kv, "/api/v1/planets", GALAXY); // planets LIVE
+    // No campaigns/assignments cache → loadNormalizedCampaigns throws → ok:false.
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, {})) as Record<string, any>;
+
+    expect(out.provenance.planet_source).toBe("live");
+    expect(out.provenance.campaigns).toBe("unavailable");
+    expect(out.provenance.planet_snapshot_used).toBe(false);
+    expect(out.provenance.campaign_outage).toBe(true);
+    expect(out.active_campaign_overlay).toBe("unavailable");
+    expect(out.stale).toBe(true);
+    // Not a bare empty "no campaigns": topology returned, flagged unknown.
+    expect(out.scope).toBe("active_campaign_subgraph_unknown");
+    expect(out.node_count).toBeGreaterThan(0);
+    for (const n of everyNode(out)) {
+      expect(n.campaign_state_known).toBe(false);
+      expect(n.has_active_campaign).toBeNull();
+    }
+    // Tool note no longer equates stale with the snapshot fallback.
+    expect(out.notes.supply_graph).toContain("provenance");
+    // Read-only on every path.
+    expect(samplePuts(kv)).toBe(0);
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("2. planet-snapshot-only: planet_snapshot_used true, campaigns 'ok', overlay 'complete'", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    // Planets: only the durable snapshot (no raw cache) → source 'snapshot'.
+    kv.store.set(
+      "snapshot:planets",
+      JSON.stringify({ fetchedAt: Date.now() - 120_000, body: GALAXY }),
+    );
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, {})) as Record<string, any>;
+
+    expect(out.provenance.planet_source).toBe("snapshot");
+    expect(out.provenance.planet_snapshot_used).toBe(true);
+    expect(out.provenance.campaigns).toBe("ok");
+    expect(out.provenance.campaign_outage).toBe(false);
+    expect(out.active_campaign_overlay).toBe("complete");
+    expect(out.stale).toBe(true);
+    for (const n of everyNode(out)) expect(n.campaign_state_known).toBe(true);
+    expect(samplePuts(kv)).toBe(0); // read-only
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("3. both nominal: stale false, overlay complete, campaigns ok, no snapshot", async () => {
+    const kv = fakeKv();
+    const env = seededEnv(kv);
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, {})) as Record<string, any>;
+    expect(out.stale).toBeUndefined();
+    expect(out.active_campaign_overlay).toBe("complete");
+    expect(out.provenance).toMatchObject({
+      campaigns: "ok",
+      planet_source: "live",
+      planet_snapshot_used: false,
+      campaign_outage: false,
+    });
+  });
+
+  it("4. both degraded: planet_snapshot_used AND campaign_outage true; reasons lists both", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    kv.store.set(
+      "snapshot:planets",
+      JSON.stringify({ fetchedAt: Date.now() - 120_000, body: GALAXY }),
+    );
+    // No campaigns cache → outage.
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, {})) as Record<string, any>;
+    expect(out.provenance.planet_snapshot_used).toBe(true);
+    expect(out.provenance.campaign_outage).toBe(true);
+    expect(out.provenance.reasons.length).toBeGreaterThanOrEqual(2);
+    expect(out.provenance.reasons.some((r: string) => r.includes("snapshot"))).toBe(true);
+    expect(out.provenance.reasons.some((r: string) => r.includes("campaign"))).toBe(true);
+    expect(samplePuts(kv)).toBe(0);
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("5. full:true during campaign outage: topology complete, per-node campaign_state_known false, overlay unavailable", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRaw(kv, "/api/v1/planets", GALAXY); // planets live
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, { full: true })) as Record<string, any>;
+    expect(out.scope).toBe("full_galaxy");
+    expect(out.nodes.map((n: any) => n.index).sort((a: number, b: number) => a - b)).toEqual([
+      50, 185, 273,
+    ]);
+    expect(out.active_campaign_overlay).toBe("unavailable");
+    expect(out.stale).toBe(true);
+    for (const n of out.nodes as any[]) {
+      expect(n.campaign_state_known).toBe(false);
+      expect(n.has_active_campaign).toBeNull();
+    }
+    expect(samplePuts(kv)).toBe(0);
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("6. no node asserts has_active_campaign:false while campaigns unknown", async () => {
+    const kv = fakeKv();
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, { full: true })) as Record<string, any>;
+    for (const n of out.nodes as any[]) expect(n.has_active_campaign).not.toBe(false);
+  });
+
+  it("7. no persistence on any degraded path (snapshot or campaign outage)", async () => {
+    forbidNetwork();
+    // Campaign outage:
+    const kvA = fakeKv();
+    const d1A = new FakeD1();
+    seedRaw(kvA, "/api/v1/planets", GALAXY);
+    await getSupplyGraph(
+      {
+        WAR_CACHE: kvA as unknown as KVNamespace,
+        HISTORY_DB: d1A as unknown as D1Database,
+      },
+      {},
+    );
+    expect(samplePuts(kvA)).toBe(0);
+    expect(d1A.batchCalls).toBe(0);
+
+    // Planet snapshot:
+    const kvB = fakeKv();
+    const d1B = new FakeD1();
+    kvB.store.set(
+      "snapshot:planets",
+      JSON.stringify({ fetchedAt: Date.now() - 120_000, body: GALAXY }),
+    );
+    seedRaw(kvB, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kvB, "/api/v1/assignments", []);
+    forbidNetwork();
+    await getSupplyGraph(
+      {
+        WAR_CACHE: kvB as unknown as KVNamespace,
+        HISTORY_DB: d1B as unknown as D1Database,
+      },
+      {},
+    );
+    expect(samplePuts(kvB)).toBe(0);
+    expect(d1B.batchCalls).toBe(0);
   });
 });

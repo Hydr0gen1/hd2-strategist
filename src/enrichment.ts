@@ -602,8 +602,13 @@ export function buildSupplyGraph(
     depth: number;
     activeOnly: boolean;
     full: boolean;
+    /** P1/overlay honesty: false during a campaign outage — nodes then carry
+     * has_active_campaign:null + campaign_state_known:false (never asserted
+     * false). Topology is unaffected; only the campaign annotation degrades. */
+    campaignStateKnown?: boolean;
   },
 ): { nodes: SupplyGraphNode[]; edges: SupplyGraphEdge[] } {
+  const campaignStateKnown = opts.campaignStateKnown !== false;
   const planetByIndex = new Map<number, RawPlanet>(
     planets.map((p) => [p.index, p]),
   );
@@ -661,8 +666,11 @@ export function buildSupplyGraph(
       index: idx,
       name: typeof planet.name === "string" ? planet.name : null,
       owner: typeof planet.currentOwner === "string" ? planet.currentOwner : null,
-      has_active_campaign: kind != null,
-      campaign_kind: kind,
+      // Campaign annotation degrades to null when campaign state is unknown —
+      // never asserted false. Topology (owner/borders_super_earth) is unaffected.
+      has_active_campaign: campaignStateKnown ? kind != null : null,
+      campaign_kind: campaignStateKnown ? kind : null,
+      campaign_state_known: campaignStateKnown,
       borders_super_earth: bordersSuperEarth(idx, planetByIndex, reverseAdjacency),
     };
   });
@@ -1495,9 +1503,9 @@ export const PER_PLAYER_RATES_NOTE =
 export const REGIONS_NOTE =
   "regions is a faithful passthrough of upstream's per-region/city sub-objective array (health, size, players, availability, …) — present when regions_available is true. has_city_region keys off upstream's own size === 'City' classification, never a biome inference. No derived 'capturing this region yields X% liberation' contribution is computed — that is not a deterministic transform of fields held here, so it stays in conversation.";
 
-/** Feature 5: stale bulk-snapshot fallback semantics, documented inline. */
+/** Feature 1: supply-graph semantics + the split provenance signal. */
 export const SUPPLY_GRAPH_NOTE =
-  "Observed supply edges over the live planet snapshot: nodes are planets, edges are a planet's own waypoints (observed: true) — implied reverse edges are never synthesized. Default (no args) is the active-campaign subgraph (every active-campaign planet plus its one-hop inbound+outbound neighbors); full: true returns the whole galaxy. borders_super_earth on each node is the same adjacency fact get_planet carries. stale: true means this was served from the most recent cached bulk snapshot because a live fetch could not complete.";
+  "Observed supply edges over the planet snapshot: nodes are planets, edges are a planet's own waypoints (observed: true) — implied reverse edges are never synthesized. Default (no args) is the active-campaign subgraph (every active-campaign planet plus its one-hop inbound+outbound neighbors); full: true returns the whole galaxy. borders_super_earth on each node is the same adjacency fact get_planet carries. Read-only: this tool records nothing. stale: true is a ROLLUP meaning one or more inputs were degraded — see `provenance` for the specific source(s): planet_source ('live' | 'snapshot') governs topology; campaigns ('ok' | 'stale' | 'unavailable') governs the campaign overlay and the active-only selection. active_campaign_overlay states the overlay's trust ('complete' | 'degraded' | 'unavailable'); when 'unavailable' (campaign outage) nodes carry campaign_state_known:false with has_active_campaign:null — an empty active subgraph then means UNKNOWN, never 'no active campaigns'. Topology stays complete under a campaign outage; only the annotations and the active-only selection degrade.";
 
 /** Stage 7, Part D: the Major Order objective decode, documented inline. */
 export const MO_OBJECTIVE_DECODE_NOTE =

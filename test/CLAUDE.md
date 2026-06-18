@@ -361,8 +361,18 @@ the project's definition of done:
     array.
   - Handlers (KV stub, stage6 pattern): `get_planet` surfaces all four
     features cache-served with a **prime-directive key-name pin** over the whole
-    payload; `get_supply_graph` returns the active-campaign subgraph with one
-    `samples:planets` put and resolves a root by name / `full`.
+    payload; `get_supply_graph` returns the active-campaign subgraph READ-ONLY
+    (zero `samples:planets` puts), resolves a root by name / `full`, and carries
+    the split `provenance` + `active_campaign_overlay` block. Split-provenance
+    acceptance tests: (1) campaign-only outage → `campaigns: 'unavailable'`,
+    overlay `unavailable`, `planet_source: 'live'`, topology returned flagged
+    `campaign_state_known: false` (not a bare empty), note points at provenance;
+    (2) planet-snapshot-only → `planet_snapshot_used: true`, `campaigns: 'ok'`,
+    overlay `complete`; (3) both nominal → `stale` absent, overlay `complete`;
+    (4) both degraded → both flags + reasons; (5) `full:true` under campaign
+    outage → complete topology, per-node `campaign_state_known: false`, overlay
+    `unavailable`; (6) no node asserts `has_active_campaign: false` while
+    unknown; (7) ZERO persistence (KV + `FakeD1` batch) on every degraded path.
   - Feature 5: `get_planet` serves the durable `snapshot:planets` (`stale:
     true`) when every live fetch fails; the snapshot is refreshed only on a
     genuine upstream fetch (a cache hit writes none).
