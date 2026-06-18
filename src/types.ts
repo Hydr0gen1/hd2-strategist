@@ -408,7 +408,9 @@ export interface NeighborInfo {
   index: number;
   name: string | null;
   owner: string | null;
-  has_active_campaign: boolean;
+  /** Tri-state: boolean when campaign state is known, null when UNKNOWN (a
+   * campaign outage) — never asserted false from an absent map entry. */
+  has_active_campaign: boolean | null;
   campaign_kind: "liberation" | "defense" | null;
 }
 
@@ -890,10 +892,12 @@ export interface GambitOrigin {
   index: number;
   name: string | null;
   owner: string | null;
-  has_active_campaign: boolean;
+  /** Tri-state (see NeighborInfo): null under a campaign outage. */
+  has_active_campaign: boolean | null;
   campaign_kind: "liberation" | "defense" | null;
   raw_hp: number | null;
-  is_major_order_target: boolean;
+  /** Tri-state membership: boolean when known, null when UNKNOWN. */
+  is_major_order_target: boolean | null;
 }
 
 /** Feature 3: per-player effective rates, all CONSUMING the single signed

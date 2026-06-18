@@ -9,6 +9,7 @@ import type {
   MoArchiveRow,
   PlanetArchiveRow,
 } from "./archive";
+import type { CampaignView } from "./provenance";
 import type {
   GlobalSample,
   HealthSample,
@@ -454,7 +455,7 @@ export function moPlanetAssignmentMap(
 export function buildNeighbors(
   planet: RawPlanet,
   planetByIndex: ReadonlyMap<number, RawPlanet>,
-  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
+  campaigns: CampaignView,
 ): {
   neighbors: NeighborInfo[];
   neighbor_summary: NeighborSummary;
@@ -468,7 +469,6 @@ export function buildNeighbors(
 
   const neighbors = waypoints.map((index): NeighborInfo => {
     const neighbor = planetByIndex.get(index);
-    const kind = campaignKindByPlanetIndex.get(index) ?? null;
     const owner =
       typeof neighbor?.currentOwner === "string"
         ? neighbor.currentOwner
@@ -479,13 +479,14 @@ export function buildNeighbors(
       byOwner[owner] = (byOwner[owner] ?? 0) + 1;
       if (owner !== planet.currentOwner) frontline = true;
     }
-    if (kind != null) withCampaign += 1;
+    // Tri-state campaign annotation — null (not false) when state is unknown.
+    if (campaigns.status(index) === "active") withCampaign += 1;
     return {
       index,
       name: typeof neighbor?.name === "string" ? neighbor.name : null,
       owner,
-      has_active_campaign: kind != null,
-      campaign_kind: kind,
+      has_active_campaign: campaigns.hasActiveCampaign(index),
+      campaign_kind: campaigns.kind(index),
     };
   });
 
@@ -518,19 +519,19 @@ export function buildNeighbors(
 export function buildInboundNeighbors(
   planet: RawPlanet,
   planetByIndex: ReadonlyMap<number, RawPlanet>,
-  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
+  campaigns: CampaignView,
 ): NeighborInfo[] {
   const inbound: NeighborInfo[] = [];
   for (const p of planetByIndex.values()) {
     const waypoints = Array.isArray(p.waypoints) ? p.waypoints : [];
     if (!waypoints.includes(planet.index)) continue;
-    const kind = campaignKindByPlanetIndex.get(p.index) ?? null;
     inbound.push({
       index: p.index,
       name: typeof p.name === "string" ? p.name : null,
       owner: typeof p.currentOwner === "string" ? p.currentOwner : null,
-      has_active_campaign: kind != null,
-      campaign_kind: kind,
+      // Tri-state — null (not false) when campaign state is unknown.
+      has_active_campaign: campaigns.hasActiveCampaign(p.index),
+      campaign_kind: campaigns.kind(p.index),
     });
   }
   inbound.sort((a, b) => a.index - b.index);
@@ -596,16 +597,12 @@ function bordersSuperEarth(
  */
 export function buildSupplyGraph(
   planets: RawPlanet[],
-  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
+  campaigns: CampaignView,
   opts: {
     rootIndex?: number | null;
     depth: number;
     activeOnly: boolean;
     full: boolean;
-    /** P1/overlay honesty: false during a campaign outage — nodes then carry
-     * has_active_campaign:null + campaign_state_known:false (never asserted
-     * false). Topology is unaffected; only the campaign annotation degrades. */
-    campaignStateKnown?: boolean;
   },
 ): {
   nodes: SupplyGraphNode[];
@@ -615,7 +612,7 @@ export function buildSupplyGraph(
    * silent stand-in for "no active campaigns" under outage). */
   active_only_applied: boolean;
 } {
-  const campaignStateKnown = opts.campaignStateKnown !== false;
+  const campaignStateKnown = campaigns.known;
   const planetByIndex = new Map<number, RawPlanet>(
     planets.map((p) => [p.index, p]),
   );
@@ -638,7 +635,7 @@ export function buildSupplyGraph(
       opts.rootIndex != null && planetByIndex.has(opts.rootIndex)
         ? [opts.rootIndex]
         : planets
-            .filter((p) => campaignKindByPlanetIndex.has(p.index))
+            .filter((p) => campaigns.status(p.index) === "active")
             .map((p) => p.index);
     let frontier = new Set<number>(seeds);
     for (const s of seeds) nodeSet.add(s);
@@ -659,31 +656,31 @@ export function buildSupplyGraph(
     }
   }
 
-  // P2: apply the active_only deletion ONLY when campaign state is known. Under
-  // a campaign outage `campaignKindByPlanetIndex` is empty, so an unconditional
-  // filter would delete every node and the empty graph would read as "no active
-  // campaigns" — but the active set is actually UNKNOWN. Skip the filter, keep
-  // the full topology (flagged campaign_state_known:false), and report that it
-  // was not applied so the client can tell "unknown" from "really empty".
+  // P2: apply the active_only deletion ONLY when campaign state is known (via
+  // the tri-state accessor, never a raw map lookup). Under a campaign outage
+  // status is 'unknown' for every planet, so an unconditional filter would
+  // delete every node and the empty graph would read as "no active campaigns"
+  // — but the active set is actually UNKNOWN. Skip the filter, keep the full
+  // topology (flagged campaign_state_known:false), and report it was not
+  // applied so the client can tell "unknown" from "really empty".
   const activeOnlyApplied = Boolean(opts.activeOnly) && campaignStateKnown;
   if (activeOnlyApplied) {
     for (const idx of [...nodeSet]) {
-      if (!campaignKindByPlanetIndex.has(idx)) nodeSet.delete(idx);
+      if (campaigns.status(idx) !== "active") nodeSet.delete(idx);
     }
   }
 
   const sorted = [...nodeSet].sort((a, b) => a - b);
   const nodes: SupplyGraphNode[] = sorted.map((idx) => {
     const planet = planetByIndex.get(idx)!;
-    const kind = campaignKindByPlanetIndex.get(idx) ?? null;
     return {
       index: idx,
       name: typeof planet.name === "string" ? planet.name : null,
       owner: typeof planet.currentOwner === "string" ? planet.currentOwner : null,
-      // Campaign annotation degrades to null when campaign state is unknown —
-      // never asserted false. Topology (owner/borders_super_earth) is unaffected.
-      has_active_campaign: campaignStateKnown ? kind != null : null,
-      campaign_kind: campaignStateKnown ? kind : null,
+      // Campaign annotation via the tri-state accessor — null when unknown,
+      // never asserted false. Topology (owner/borders_super_earth) unaffected.
+      has_active_campaign: campaigns.hasActiveCampaign(idx),
+      campaign_kind: campaigns.kind(idx),
       campaign_state_known: campaignStateKnown,
       borders_super_earth: bordersSuperEarth(idx, planetByIndex, reverseAdjacency),
     };
@@ -710,25 +707,25 @@ export function buildSupplyGraph(
 export function buildGambitOrigins(
   planet: RawPlanet,
   planetByIndex: ReadonlyMap<number, RawPlanet>,
-  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
-  moPlanetIndices: ReadonlySet<number>,
+  campaigns: CampaignView,
 ): GambitOrigin[] {
   const origins: GambitOrigin[] = [];
   for (const p of planetByIndex.values()) {
     const attacking = Array.isArray(p.attacking) ? p.attacking : [];
     if (!attacking.includes(planet.index)) continue;
-    const kind = campaignKindByPlanetIndex.get(p.index) ?? null;
+    const mo = campaigns.moMembership(p.index);
     origins.push({
       index: p.index,
       name: typeof p.name === "string" ? p.name : null,
       owner: typeof p.currentOwner === "string" ? p.currentOwner : null,
-      has_active_campaign: kind != null,
-      campaign_kind: kind,
+      // Tri-state campaign + MO annotations — null (not false) when unknown.
+      has_active_campaign: campaigns.hasActiveCampaign(p.index),
+      campaign_kind: campaigns.kind(p.index),
       raw_hp:
         typeof p.health === "number" && Number.isFinite(p.health)
           ? p.health
           : null,
-      is_major_order_target: moPlanetIndices.has(p.index),
+      is_major_order_target: mo === "unknown" ? null : mo,
     });
   }
   origins.sort((a, b) => a.index - b.index);

@@ -60,30 +60,40 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   math; the warm `snapshot:planets` cache feeds adjacency/ownership/HP context
   lookups ONLY (get_planet / get_supply_graph fallback) and MUST NOT backfill
   the history/global-stats archive.
-- **Persistence requires a complete live fetch** (P1 provenance gate — the
-  durable invariant that keeps the warm snapshot out of the record). Sampling
-  is gated on data PROVENANCE (live vs. fallback), never on apparent planet
-  state (quiet vs. active). Any fallback / snapshot / resilient-empty path is
-  READ-ONLY and marked `stale: true`; degraded data may be SERVED (clearly
-  flagged) but never RECORDED — same serve-but-don't-record logic that keeps the
-  `18145 / 0.07364573` sentinel out of the archive. **Loaders are
-  side-effect-free; persistence happens ONCE, after all input provenance is
-  known.** `loadNormalizedCampaigns` calls `prepareSampleTick` (one KV read,
-  ZERO writes) and returns the computed-but-unwritten tick as `bundle.pendingTick`;
-  the handler runs the single terminal `commitCampaignTick(env, bundle, eligible)`
-  only when EVERY input is a complete live fetch (planet-fetching handlers gate
-  on `planets.source === 'live' && !planets.stale && bundle.ok && !bundle.stale`;
-  cron/get_campaigns, which fetch no planet list, gate on campaign provenance
-  alone). This makes the write ORDER-INDEPENDENT — no loader writes, so a
-  snapshot-backed `get_planet` with fresh campaigns can no longer leak a campaign
-  sample before the planet gate applies. `get_supply_graph` simply never commits
-  (read-only). Provenance is explicit, not inferred: `fetchPlanetsWithFallback`
-  returns `source: 'live' | 'snapshot'` and the resilient campaign load carries
-  `ok` (an empty array with `ok: true` is a real "no active campaigns";
-  `ok: false` is an outage — UNKNOWN, never quiet, and `has_active_campaign` is
-  null with `campaign_state_known: false`, never asserted false). The "skip
-  persistence" condition and `stale: true` are the SAME predicate (a stale
-  response recorded nothing; a recording response was not stale).
+- **One provenance contract** (`src/provenance.ts` — the single representation
+  of degradation; everything else CONSUMES it, nothing re-derives it). Two enums
+  are the source of truth: `PlanetProvenance` (`live_fresh` |
+  `live_expired_cache` | `snapshot_fallback` — note a LIVE fetch can still be
+  STALE, so freshness is `=== 'live_fresh'`, NEVER `source === 'live'`) and
+  `CampaignProvenance` (`ok` | `stale` | `unavailable`). Two derived predicates
+  are the ONLY consumers of staleness: `anyDegraded` drives every tool's
+  top-level `stale` rollup; `allFresh` is the ONLY condition under which
+  anything persists. A tri-state `campaignView` accessor (`status` →
+  `active|inactive|unknown`, `hasActiveCampaign` → `bool|null`, `moMembership` →
+  `bool|'unknown'`) is the ONLY way annotation builders read campaign/MO
+  membership — an absent map entry is NEVER silently `false`; under
+  `unavailable` every query is unknown → `has_active_campaign: null`,
+  `campaign_kind: null`, `is_major_order_target: null`, `campaign_state_known:
+  false`, in the planet AND in every nested neighbor/gambit annotation. No
+  per-site `source === 'live'` / `bundle.ok` / `Map.has()` checks remain
+  (predicate-audit test pins this).
+- **Persistence requires a complete live fetch** (the durable invariant that
+  keeps the warm snapshot out of the record). Gated on PROVENANCE, never on
+  apparent planet state (quiet vs. active). Any fallback / snapshot /
+  expired-cache / resilient-empty path is READ-ONLY and marked `stale: true`;
+  degraded data may be SERVED (flagged) but never RECORDED — the same
+  serve-but-don't-record logic that keeps the `18145 / 0.07364573` sentinel out
+  of the archive. **Loaders are side-effect-free; persistence happens ONCE,
+  after all input provenance is known.** `loadNormalizedCampaigns` calls
+  `prepareSampleTick` (one KV read, ZERO writes) and returns the
+  computed-but-unwritten tick as `bundle.pendingTick`; the handler runs the
+  single terminal `commitCampaignTick(env, bundle, allFresh(planet, campaign))`
+  (cron/get_campaigns fetch no planet list, so they gate on campaign provenance
+  alone). No loader writes, so the write is ORDER-INDEPENDENT — a snapshot- or
+  expired-cache-backed `get_planet` with fresh campaigns records nothing.
+  `get_supply_graph` never commits (read-only). The "skip persistence" predicate
+  and the `stale: true` rollup are the SAME `allFresh`/`anyDegraded` pair (a
+  stale response recorded nothing; a recording response was not stale).
 - **Two history stores, never reconciled** (Stage 12): KV
   (`samples:planets`) is the bounded recent ring buffer and the SOURCE OF
   TRUTH for all live logic (`hp_per_hour`, the dual ETAs, divergence read

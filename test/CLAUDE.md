@@ -1,7 +1,8 @@
 # test/ — unit tests
 
 Plain vitest, no Workers runtime: everything under test is pure
-(`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`, `src/wiki.ts`).
+(`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`, `src/wiki.ts`,
+`src/provenance.ts`).
 If a test needs I/O or KV, the code under test is in the wrong module — move
 the logic, don't mock the world. Two sanctioned exceptions:
 `src/wikiClient.ts` (stage4.test.ts), whose fetch is INJECTED per call, and
@@ -401,6 +402,18 @@ the project's definition of done:
     empty graph misread as "no active campaigns"; `active_only` with `ok`
     campaigns applies the filter (`active_only_applied: true`); with `stale`
     campaigns applies it on the last-known set (overlay `degraded`).
+  - One provenance contract (`provenance.ts` consolidation): `planetProvenanceOf`
+    maps source/stale → the three states; `allFresh`/`anyDegraded` exhaustively
+    over the 3×3 grid; `campaignView` is tri-state (unknown under 'unavailable',
+    never silently false). Cross-cutting handler tests: nested-unknown — a
+    campaign-outage `get_planet` has EVERY neighbor + gambit_origin
+    `has_active_campaign: null` / `is_major_order_target: null` (asserted NONE
+    are false); the `live_expired_cache` planet state → `stale: true`, writes
+    nothing; a **persist matrix** (9 planet×campaign combos) asserts writes occur
+    iff `allFresh`; a **rollup matrix** asserts `stale` iff `anyDegraded`; a
+    **predicate-audit** reads `src/tools.ts` + `src/enrichment.ts` and pins ZERO
+    `.source === 'live'` or campaign-map `.has()` lookups (the per-site checks
+    were deleted, not duplicated).
 
 ## Conventions
 

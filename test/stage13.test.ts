@@ -19,8 +19,23 @@ import {
   selectRegions,
 } from "../src/enrichment";
 import { RAW_STATUS_PATH } from "../src/crosscheck";
+import {
+  campaignView,
+  type CampaignProvenance,
+  type CampaignView,
+} from "../src/provenance";
 import { getPlanet, getSupplyGraph, runScheduledSample } from "../src/tools";
 import type { Env, RawAssignment, RawCampaign, RawPlanet, RawWar } from "../src/types";
+
+/** Test helper: wrap a kind map (+ optional MO set / provenance) in the
+ * tri-state campaign accessor the builders now consume. */
+function cview(
+  kinds: Map<number, "liberation" | "defense">,
+  mo: Set<number> = new Set(),
+  provenance: CampaignProvenance = "ok",
+): CampaignView {
+  return campaignView(kinds, mo, provenance);
+}
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -95,7 +110,7 @@ describe("feature 1 — inbound neighbors + adjacency summary", () => {
   const kinds = new Map<number, "liberation" | "defense">([[273, "liberation"]]);
 
   it("inbound_neighbors inverts observed waypoints (Sangis + Alathfar point into Karlia)", () => {
-    const inbound = buildInboundNeighbors(KARLIA, byIndex(GALAXY), kinds);
+    const inbound = buildInboundNeighbors(KARLIA, byIndex(GALAXY), cview(kinds));
     expect(inbound.map((n) => n.index)).toEqual([50, 273]); // sorted by index
     expect(inbound.find((n) => n.index === 273)).toMatchObject({
       name: "SANGIS",
@@ -111,13 +126,13 @@ describe("feature 1 — inbound neighbors + adjacency summary", () => {
   });
 
   it("existing outbound neighbors are unchanged by the inbound addition", () => {
-    const out = buildNeighbors(KARLIA, byIndex(GALAXY), kinds);
+    const out = buildNeighbors(KARLIA, byIndex(GALAXY), cview(kinds));
     expect(out.neighbors.map((n) => n.index)).toEqual([273]); // upstream order
   });
 
   it("adjacency_summary reports counts + borders_super_earth from a Human neighbor", () => {
-    const out = buildNeighbors(KARLIA, byIndex(GALAXY), kinds);
-    const inbound = buildInboundNeighbors(KARLIA, byIndex(GALAXY), kinds);
+    const out = buildNeighbors(KARLIA, byIndex(GALAXY), cview(kinds));
+    const inbound = buildInboundNeighbors(KARLIA, byIndex(GALAXY), cview(kinds));
     const summary = buildAdjacencySummary(out.neighbors, inbound);
     expect(summary).toEqual({
       outbound: 1,
@@ -130,8 +145,8 @@ describe("feature 1 — inbound neighbors + adjacency summary", () => {
   it("borders_super_earth is false with no Human neighbor", () => {
     const lone = planet({ index: 9, currentOwner: "Terminids", waypoints: [] });
     const map = byIndex([lone]);
-    const out = buildNeighbors(lone, map, new Map());
-    const inbound = buildInboundNeighbors(lone, map, new Map());
+    const out = buildNeighbors(lone, map, cview(new Map()));
+    const inbound = buildInboundNeighbors(lone, map, cview(new Map()));
     expect(buildAdjacencySummary(out.neighbors, inbound).borders_super_earth).toBe(
       false,
     );
@@ -147,7 +162,7 @@ describe("feature 1 — buildSupplyGraph", () => {
   ]);
 
   it("default subgraph seeds active-campaign planets + one-hop neighbors, observed edges only", () => {
-    const { nodes, edges } = buildSupplyGraph(GALAXY, kinds, {
+    const { nodes, edges } = buildSupplyGraph(GALAXY, cview(kinds), {
       depth: 1,
       activeOnly: false,
       full: false,
@@ -164,7 +179,7 @@ describe("feature 1 — buildSupplyGraph", () => {
   });
 
   it("active_only narrows nodes to active-campaign planets", () => {
-    const { nodes } = buildSupplyGraph(GALAXY, kinds, {
+    const { nodes } = buildSupplyGraph(GALAXY, cview(kinds), {
       depth: 1,
       activeOnly: true,
       full: false,
@@ -173,7 +188,7 @@ describe("feature 1 — buildSupplyGraph", () => {
   });
 
   it("full returns the whole galaxy", () => {
-    const { nodes } = buildSupplyGraph(GALAXY, kinds, {
+    const { nodes } = buildSupplyGraph(GALAXY, cview(kinds), {
       depth: 1,
       activeOnly: false,
       full: true,
@@ -183,7 +198,7 @@ describe("feature 1 — buildSupplyGraph", () => {
 
   it("dangling waypoint targets are never promoted to nodes or edges", () => {
     const dangling = planet({ index: 7, waypoints: [999], attacking: [] });
-    const { nodes, edges } = buildSupplyGraph([dangling], new Map(), {
+    const { nodes, edges } = buildSupplyGraph([dangling], cview(new Map()), {
       rootIndex: 7,
       depth: 2,
       activeOnly: false,
@@ -201,8 +216,7 @@ describe("feature 2 — buildGambitOrigins", () => {
     const origins = buildGambitOrigins(
       KARLIA,
       byIndex(GALAXY),
-      new Map([[273, "liberation"]]),
-      new Set([273]),
+      cview(new Map([[273, "liberation"]]), new Set([273])),
     );
     expect(origins).toHaveLength(1);
     expect(origins[0]).toEqual({
@@ -221,8 +235,7 @@ describe("feature 2 — buildGambitOrigins", () => {
     const origins = buildGambitOrigins(
       KARLIA,
       byIndex([KARLIA, SANGIS, a]),
-      new Map(),
-      new Set(),
+      cview(new Map()),
     );
     expect(origins.map((o) => o.index)).toEqual([184, 273]);
     for (const o of origins) {
@@ -234,7 +247,7 @@ describe("feature 2 — buildGambitOrigins", () => {
   it("no attacker → empty list", () => {
     const quiet = planet({ index: 1, attacking: [] });
     expect(
-      buildGambitOrigins(quiet, byIndex([quiet]), new Map(), new Set()),
+      buildGambitOrigins(quiet, byIndex([quiet]), cview(new Map())),
     ).toEqual([]);
   });
 });
@@ -1141,4 +1154,206 @@ describe("get_supply_graph — active_only under campaign outage (P2)", () => {
     expect(out.active_campaign_overlay).toBe("unavailable");
     expect(out.active_only_applied).toBe(false);
   });
+});
+
+/* ============ PR #17 consolidation: one provenance contract ============ */
+
+import {
+  allFresh,
+  anyDegraded,
+  planetProvenanceOf,
+} from "../src/provenance";
+
+/** Read a repo-relative source file at runtime (node), untyped to avoid a
+ * @types/node dependency the Worker build deliberately omits. */
+async function readSource(rel: string): Promise<string> {
+  const fsName = "node:fs";
+  const fs: any = await import(fsName);
+  const cwd: string = (globalThis as any).process.cwd();
+  return fs.readFileSync(`${cwd}/${rel}`, "utf8") as string;
+}
+
+describe("provenance module — predicates + tri-state accessor", () => {
+  it("planetProvenanceOf maps source/stale to the three states", () => {
+    expect(planetProvenanceOf("live", false)).toBe("live_fresh");
+    expect(planetProvenanceOf("live", true)).toBe("live_expired_cache");
+    expect(planetProvenanceOf("snapshot", true)).toBe("snapshot_fallback");
+  });
+
+  it("allFresh iff both fresh; anyDegraded is its negation", () => {
+    const planet = ["live_fresh", "live_expired_cache", "snapshot_fallback"] as const;
+    const camp = ["ok", "stale", "unavailable"] as const;
+    for (const p of planet)
+      for (const c of camp) {
+        const fresh = p === "live_fresh" && c === "ok";
+        expect(allFresh(p, c)).toBe(fresh);
+        expect(anyDegraded(p, c)).toBe(!fresh);
+      }
+  });
+
+  it("campaignView is tri-state: unknown under 'unavailable', never silently false", () => {
+    const kinds = new Map<number, "liberation" | "defense">([[1, "liberation"]]);
+    const mo = new Set([1]);
+    const ok = campaignView(kinds, mo, "ok");
+    expect(ok.status(1)).toBe("active");
+    expect(ok.status(2)).toBe("inactive");
+    expect(ok.hasActiveCampaign(2)).toBe(false);
+    expect(ok.moMembership(2)).toBe(false);
+
+    const out = campaignView(kinds, mo, "unavailable");
+    expect(out.known).toBe(false);
+    expect(out.status(1)).toBe("unknown");
+    expect(out.hasActiveCampaign(1)).toBeNull();
+    expect(out.kind(1)).toBeNull();
+    expect(out.moMembership(1)).toBe("unknown");
+  });
+});
+
+describe("nested unknown — get_planet during a campaign outage (the new P2)", () => {
+  it("every neighbor + gambit_origin is null, never false", async () => {
+    const kv = fakeKv();
+    seedRaw(kv, "/api/v1/planets", GALAXY); // planets live
+    seedRaw(kv, RAW_STATUS_PATH, {});
+    // No campaigns/assignments cache → campaign_provenance 'unavailable'.
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    const out = (await getPlanet(env, { index: 185 })) as Record<string, any>;
+
+    expect(out.campaign_state_known).toBe(false);
+    expect(out.has_active_campaign).toBeNull();
+
+    const nested = [
+      ...(out.neighbors as any[]),
+      ...(out.inbound_neighbors as any[]),
+    ];
+    expect(nested.length).toBeGreaterThan(0);
+    for (const n of nested) {
+      expect(n.has_active_campaign).toBeNull();
+      expect(n.has_active_campaign).not.toBe(false);
+    }
+    const origin = out.defense_event.gambit_origin;
+    expect(origin).toBeTruthy();
+    expect(origin.has_active_campaign).toBeNull();
+    expect(origin.is_major_order_target).toBeNull();
+    expect(origin.has_active_campaign).not.toBe(false);
+    expect(origin.is_major_order_target).not.toBe(false);
+  });
+});
+
+describe("expired planet cache — three-state planet provenance", () => {
+  it("get_supply_graph: live_expired_cache → stale:true, planet_stale:true, snapshot_used:false", async () => {
+    const kv = fakeKv();
+    seedRawAged(kv, "/api/v1/planets", GALAXY, 60_000); // expired raw cache
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, {})) as Record<string, any>;
+    expect(out.provenance.planet_provenance).toBe("live_expired_cache");
+    expect(out.provenance.planet_stale).toBe(true);
+    expect(out.provenance.planet_snapshot_used).toBe(false);
+    expect(out.provenance.campaigns).toBe("ok");
+    expect(out.stale).toBe(true);
+  });
+
+  it("get_planet: live_expired_cache planets + fresh campaigns → writes nothing", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRawAged(kv, "/api/v1/planets", GALAXY, 60_000);
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    seedRaw(kv, RAW_STATUS_PATH, {});
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+    expect(out.stale).toBe(true);
+    expect(samplePuts(kv)).toBe(0); // expired cache is NOT recorded
+    expect(d1.batchCalls).toBe(0);
+  });
+});
+
+describe("predicate audit — per-site checks were deleted, not duplicated", () => {
+  it("no `.source === 'live'` freshness checks outside the provenance module", async () => {
+    for (const rel of ["src/tools.ts", "src/enrichment.ts"]) {
+      expect(await readSource(rel)).not.toMatch(/\.source === ['"]live['"]/);
+    }
+  });
+
+  it("no raw campaign-map `.has()` lookups outside the accessor", async () => {
+    for (const rel of ["src/tools.ts", "src/enrichment.ts"]) {
+      const src = await readSource(rel);
+      expect(src).not.toMatch(/campaignKindByIndex\.has\(/);
+      expect(src).not.toMatch(/campaignKindByPlanetIndex\.has\(/);
+      expect(src).not.toMatch(/moPlanetIndices\.has\(/);
+      expect(src).not.toMatch(/moMap\.has\(/);
+    }
+  });
+});
+
+/** Build an env for a (planet × campaign) provenance combination. */
+function comboEnv(
+  kv: FakeKv,
+  planet: "live_fresh" | "live_expired_cache" | "snapshot_fallback",
+  campaign: "ok" | "stale" | "unavailable",
+): Env {
+  if (planet === "live_fresh") seedRaw(kv, "/api/v1/planets", GALAXY);
+  else if (planet === "live_expired_cache")
+    seedRawAged(kv, "/api/v1/planets", GALAXY, 60_000);
+  else
+    kv.store.set(
+      "snapshot:planets",
+      JSON.stringify({ fetchedAt: Date.now() - 120_000, body: GALAXY }),
+    );
+
+  if (campaign === "ok") {
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    seedRaw(kv, "/api/v1/war", P1_WAR);
+  } else if (campaign === "stale") {
+    seedRawAged(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })], 60_000);
+    seedRawAged(kv, "/api/v1/assignments", [], 60_000);
+    seedRawAged(kv, "/api/v1/war", P1_WAR, 60_000);
+  }
+  // 'unavailable' → seed nothing (fetch fails → resilient-empty).
+  seedRaw(kv, RAW_STATUS_PATH, {});
+  return { WAR_CACHE: kv as unknown as KVNamespace };
+}
+
+const PLANET_STATES = [
+  "live_fresh",
+  "live_expired_cache",
+  "snapshot_fallback",
+] as const;
+const CAMPAIGN_STATES = ["ok", "stale", "unavailable"] as const;
+
+describe("persist matrix — writes iff allFresh (get_planet)", () => {
+  for (const p of PLANET_STATES)
+    for (const c of CAMPAIGN_STATES) {
+      it(`planet=${p} campaign=${c} → ${allFresh(p, c) ? "writes" : "no write"}`, async () => {
+        const kv = fakeKv();
+        const env = comboEnv(kv, p, c);
+        forbidNetwork();
+        await getPlanet(env, { index: 50 });
+        expect(samplePuts(kv) > 0).toBe(allFresh(p, c));
+      });
+    }
+});
+
+describe("rollup matrix — stale iff anyDegraded (get_supply_graph)", () => {
+  for (const p of PLANET_STATES)
+    for (const c of CAMPAIGN_STATES) {
+      it(`planet=${p} campaign=${c} → stale ${anyDegraded(p, c)}`, async () => {
+        const kv = fakeKv();
+        const env = comboEnv(kv, p, c);
+        forbidNetwork();
+        const out = (await getSupplyGraph(env, {})) as Record<string, any>;
+        expect(Boolean(out.stale)).toBe(anyDegraded(p, c));
+      });
+    }
 });
