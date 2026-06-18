@@ -17,7 +17,9 @@ import {
 } from "./archive";
 import {
   cacheBulkPlanets,
+  commitSampleTick,
   fetchUpstream,
+  prepareSampleTick,
   readBulkPlanetsSnapshot,
   readGlobalSamples,
   readMoSeries,
@@ -26,6 +28,7 @@ import {
   samplePlanetRates,
   SAMPLES_KEY_TTL_SECONDS,
   UpstreamError,
+  type PreparedSampleTick,
   type SampleInput,
 } from "./client";
 import {
@@ -312,11 +315,24 @@ interface CampaignBundle {
    * existing parallel fetch so its global statistics reach the single
    * sample-store write without a second round-trip. */
   war?: { data: RawWar; stale: boolean };
+  /** P1: the COMPUTED-BUT-UNWRITTEN sample tick. The loader is side-effect-free
+   * — it persists nothing. The handler commits this via commitSampleTick ONLY
+   * after all input provenance is known and the all-inputs-live gate passes.
+   * Absent when there were no campaign inputs to sample. */
+  pendingTick?: PreparedSampleTick;
 }
 
+/**
+ * P1: SIDE-EFFECT-FREE campaign loader. Fetches + normalizes and computes the
+ * sample tick READ-ONLY (one KV read, zero writes); the unwritten tick rides
+ * back in `bundle.pendingTick`. The handler decides — after all input
+ * provenance is known — whether to commit it (commitCampaignTick). No loader
+ * writes, so persistence is order-independent and can never leak a snapshot/
+ * resilient-empty observation into the record.
+ */
 async function loadNormalizedCampaigns(
   env: Env,
-  opts: { withWar?: boolean; persist?: boolean } = {},
+  opts: { withWar?: boolean } = {},
 ): Promise<CampaignBundle> {
   const [campaignsRes, assignmentsRes, warRes] = await Promise.all([
     fetchUpstream<RawCampaign[]>(env, "/api/v1/campaigns"),
@@ -332,20 +348,15 @@ async function loadNormalizedCampaigns(
   const moPlanetIndices = new Set(moMap.keys());
   const nowMs = Date.now();
 
-  // P1 provenance gate: this poll's sampled health comes from the campaigns
-  // (and war) fetch. Persist ONLY when that data is a complete live fetch —
-  // a stale-fallback copy (fetchUpstream serving an expired cache on upstream
-  // failure) is served but never recorded. Predicate unity: this is the SAME
-  // condition as the bundle's `stale` flag below.
+  // Provenance for the bundle's `stale` flag: a complete live fetch vs a
+  // stale-fallback copy. The loader NO LONGER persists — the handler's terminal
+  // gate (planets-live AND this `live`) decides whether the tick is committed.
   const liveFetch =
     !campaignsRes.stale &&
     !assignmentsRes.stale &&
     (warRes ? !warRes.stale : true);
-  // A read-only caller (get_supply_graph) forces persist off regardless of
-  // freshness: a topology/overlay query never drives the sampling cadence.
-  const persistThisPoll = liveFetch && opts.persist !== false;
 
-  const samples = await samplePlanetRates(
+  const prepared = await prepareSampleTick(
     env,
     raw.map(
       (c): SampleInput => ({
@@ -362,9 +373,6 @@ async function loadNormalizedCampaigns(
     ),
     nowMs,
     {
-      // P1: write nothing when the underlying fetch was a stale fallback, or
-      // when the caller is read-only (get_supply_graph).
-      persist: persistThisPoll,
       // Stage 5/8 accumulation layers — folded into the SAME single write.
       // Global statistics are present only on the get_war_status path (the
       // one place the war is fetched); signatures and MO progress fold on
@@ -380,6 +388,7 @@ async function loadNormalizedCampaigns(
       moProgress: moProgressObservations(assignmentsRes.data ?? []),
     },
   );
+  const samples = prepared.results;
 
   const campaigns = raw.map((c): EnrichedCampaign => {
     const sample = samples.get(c.planet.index);
@@ -438,7 +447,9 @@ async function loadNormalizedCampaigns(
 
   return {
     campaigns,
-    // Predicate unity: stale === !liveFetch === "this poll wrote nothing".
+    // `stale` reflects campaign-fetch provenance (a complete live fetch vs a
+    // stale-fallback copy). The handler ANDs this with planet provenance to
+    // decide whether to commit pendingTick.
     stale: !liveFetch,
     // A genuine live load — the fetch returned (empty-but-live is still ok).
     ok: true,
@@ -448,8 +459,30 @@ async function loadNormalizedCampaigns(
       assignmentsRes.fetchedAt,
       ...(warRes ? [warRes.fetchedAt] : []),
     ],
+    // The computed-but-unwritten tick — the handler commits it only when ALL
+    // inputs are live. Always present (it also carries the global-stats /
+    // signature / MO accumulation layers, which advance even when the campaign
+    // list is empty); the eligibility gate, not its presence, governs the write.
+    pendingTick: prepared,
     ...(warRes ? { war: { data: warRes.data, stale: warRes.stale } } : {}),
   };
+}
+
+/**
+ * P1: the terminal gated persistence step. Commit the loader's computed-but-
+ * unwritten sample tick ONLY when `eligible` — i.e. after the handler has
+ * resolved ALL input provenance and confirmed every input is a complete live
+ * fetch (planets.source === 'live' && campaigns ok && !stale). A loader never
+ * calls this; the write happens here, once, order-independently.
+ */
+async function commitCampaignTick(
+  env: Env,
+  bundle: CampaignBundle,
+  eligible: boolean,
+): Promise<void> {
+  if (eligible && bundle.pendingTick) {
+    await commitSampleTick(env, bundle.pendingTick);
+  }
 }
 
 /**
@@ -458,15 +491,17 @@ async function loadNormalizedCampaigns(
  * EXACTLY the request path's poll — loadNormalizedCampaigns with the war
  * fetch joined: the same cache/fetch logic, the same 60s minimum sample
  * interval, and the same single merged sample-store write (planet series +
- * signatures + global statistics) inside samplePlanetRates. The cron path
- * cannot drift from the request path because it IS the request path's
- * loader — never a forked sampler. Best-effort by design: no user is
- * watching a cron tick, so an upstream failure is logged and swallowed and
- * the next tick retries.
+ * signatures + global statistics). P1: the loader is side-effect-free; the
+ * cron path performs the terminal gated commit itself (cron fetches no planet
+ * list, so its gate is campaign provenance alone — a stale/resilient-empty
+ * campaign fetch records nothing). Best-effort by design: an upstream failure
+ * is logged and swallowed and the next tick retries.
  */
 export async function runScheduledSample(env: Env): Promise<void> {
   try {
-    await loadNormalizedCampaigns(env, { withWar: true });
+    const bundle = await loadNormalizedCampaigns(env, { withWar: true });
+    // No planet-list input on the cron path → gate on campaign provenance only.
+    await commitCampaignTick(env, bundle, bundle.ok && !bundle.stale);
   } catch (err) {
     console.warn(
       `scheduled sample skipped: ${err instanceof Error ? err.message : String(err)}`,
@@ -486,6 +521,16 @@ export async function getWarStatus(env: Env): Promise<unknown> {
   ]);
   const war = bundle.war!.data;
   const planets = planetsResult.planets;
+
+  // P1: single terminal gated commit — only when ALL inputs are a complete
+  // live fetch (planet list live AND campaign fetch live). A snapshot/stale
+  // planet list or a stale campaign fetch records nothing.
+  const live =
+    planetsResult.source === "live" &&
+    !planetsResult.stale &&
+    bundle.ok &&
+    !bundle.stale;
+  await commitCampaignTick(env, bundle, live);
 
   const byFaction = new Map<string, EnrichedCampaign[]>();
   for (const c of bundle.campaigns) {
@@ -571,6 +616,9 @@ export async function getCampaigns(
   filters: CampaignFilters = {},
 ): Promise<unknown> {
   const bundle = await loadNormalizedCampaigns(env);
+  // P1: terminal gated commit. No planet-list input here → gate on campaign
+  // provenance alone (a stale campaign fetch records nothing).
+  await commitCampaignTick(env, bundle, bundle.ok && !bundle.stale);
   // Stage 6, Part B: filtering runs AFTER normalization — every invariant
   // already ran over the full list; filters only narrow what is returned.
   const filtered = filterCampaigns(bundle.campaigns, filters);
@@ -795,6 +843,13 @@ export async function getPlanet(
   const campaignStateKnown = bundle.ok;
   const planetsLive = planetsResult.source === "live" && !planetsResult.stale;
   const live = planetsLive && campaignStateKnown && !bundle.stale;
+
+  // P1: terminal gated commit of the campaign batch — runs AFTER both inputs'
+  // provenance is known. A snapshot-backed get_planet (planetsLive false) now
+  // writes NOTHING even when campaigns are fresh: the loader recorded nothing,
+  // and this gate suppresses the commit. The quiet-probe write below shares the
+  // same `live` gate, so the whole response is read-only unless fully live.
+  await commitCampaignTick(env, bundle, live);
 
   let normalized: NormalizedCampaign;
   let probeSamples: HealthSample[] = [];
@@ -1070,12 +1125,9 @@ export async function getPlanet(
  * The sampling write budget is unchanged: a live load writes once as before; a
  * resilient-empty load writes nothing.
  */
-async function loadCampaignsResilient(
-  env: Env,
-  opts: { persist?: boolean } = {},
-): Promise<CampaignBundle> {
+async function loadCampaignsResilient(env: Env): Promise<CampaignBundle> {
   try {
-    return await loadNormalizedCampaigns(env, { persist: opts.persist });
+    return await loadNormalizedCampaigns(env);
   } catch {
     // P1: a RESILIENT-EMPTY result — the fetch failed and was swallowed.
     // ok:false marks campaign state as UNKNOWN (not "no active campaigns"), so
@@ -1115,8 +1167,9 @@ export async function getSupplyGraph(
 ): Promise<unknown> {
   const [planetsResult, bundle] = await Promise.all([
     fetchPlanetsWithFallback(env),
-    // Read-only: a topology/overlay query never drives the sampling cadence.
-    loadCampaignsResilient(env, { persist: false }),
+    // Read-only: the loader is side-effect-free and this tool never commits the
+    // tick — a topology/overlay query never drives the sampling cadence.
+    loadCampaignsResilient(env),
   ]);
   const planets = planetsResult.planets;
   const campaignKindByIndex = new Map<number, "liberation" | "defense">(
@@ -1193,6 +1246,11 @@ export async function getSupplyGraph(
     full: effectiveFull,
     campaignStateKnown,
   });
+  // P2: active_only requested but skipped (campaign state unknown) — say so, so
+  // the full topology returned isn't mistaken for "filter applied, empty".
+  if (activeOnly && !graph.active_only_applied) {
+    reasons.push("active_only_filter_skipped_campaign_state_unknown");
+  }
 
   const scope = full
     ? "full_galaxy"
@@ -1207,6 +1265,9 @@ export async function getSupplyGraph(
     ...(rootIndex != null ? { root_index: rootIndex } : {}),
     depth,
     active_only: activeOnly,
+    // P2: whether the active_only deletion actually ran (false = requested but
+    // skipped because campaign state was unknown — full topology returned).
+    active_only_applied: graph.active_only_applied,
     full,
     // Split provenance — staleness names its source(s).
     provenance: {
@@ -1574,6 +1635,14 @@ export async function getWarBrief(env: Env): Promise<unknown> {
   const planets = planetsRes.data ?? [];
   const nowMs = Date.now();
 
+  // P1: single terminal gated commit — every input (planets + campaigns) must
+  // be a complete live fetch. A stale planet or campaign fetch records nothing.
+  await commitCampaignTick(
+    env,
+    bundle,
+    !planetsRes.stale && bundle.ok && !bundle.stale,
+  );
+
   const orders = shapeMajorOrders(bundle.assignments, nowMs);
   const moMap = moPlanetAssignmentMap(bundle.assignments);
 
@@ -1685,6 +1754,12 @@ export async function getSourceCrossCheck(env: Env): Promise<unknown> {
     tryFetchRaw<RawWarStatus>(env, RAW_STATUS_PATH),
     tryFetchRaw<RawWarStatusAssignment[]>(env, RAW_ASSIGNMENT_PATH),
   ]);
+  // P1: terminal gated commit — all inputs must be a complete live fetch.
+  await commitCampaignTick(
+    env,
+    bundle,
+    !planetsRes.stale && bundle.ok && !bundle.stale,
+  );
   const planetByIndex = new Map(
     (planetsRes.data ?? []).map((p) => [p.index, p]),
   );

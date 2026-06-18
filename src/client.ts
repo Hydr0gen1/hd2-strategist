@@ -337,6 +337,53 @@ export async function samplePlanetRates(
     moProgress?: MoProgressObservation[];
   } = {},
 ): Promise<Map<number, SampleOutput>> {
+  const prepared = await prepareSampleTick(env, inputs, nowMs, opts);
+  // P1: persistence is a SEPARATE, opt-in step. Default true preserves every
+  // existing live call site; persist:false (or a pure loader) computes rates and
+  // writes nothing. The decoupled commit (commitSampleTick) is what handlers use
+  // to write ONCE, after all input provenance is known.
+  if (opts.persist !== false) await commitSampleTick(env, prepared);
+  return prepared.results;
+}
+
+/** P1: the result of computing a sample tick WITHOUT writing it — the rates for
+ * the response plus everything commitSampleTick needs to persist later. A pure
+ * loader returns one of these; the handler's terminal gated step commits it (or
+ * not). Side-effect-free: prepareSampleTick performs one KV READ and no write. */
+export interface PreparedSampleTick {
+  results: Map<number, SampleOutput>;
+  nextStore: SampleStore;
+  /** Inputs the D1 archive step needs at commit time (old store + folded
+   * sections + the per-tick planet rows). */
+  archive: {
+    planetRows: PlanetArchiveWriteRow[];
+    oldStore: SampleStore;
+    global: GlobalSample[];
+    mo: MoObjectiveSeries[];
+    signatures: SignatureObservation[];
+    nowMs: number;
+  };
+}
+
+/**
+ * P1: compute a sample tick read-only — one KV read, ZERO writes. Returns the
+ * rates (for the response) and the fully-built next store + archive rows for a
+ * later commit. Loaders call this and persist NOTHING; the handler decides
+ * whether to commitSampleTick once both inputs' provenance is known.
+ */
+export async function prepareSampleTick(
+  env: Env,
+  inputs: SampleInput[],
+  nowMs: number,
+  opts: {
+    carryForward?: boolean;
+    signatures?: SignatureObservation[];
+    globalStatistics?: RawStatistics | null;
+    globalImpactMultiplier?: number | null;
+    globalActiveCampaignCount?: number | null;
+    moProgress?: MoProgressObservation[];
+  } = {},
+): Promise<PreparedSampleTick> {
   const results = new Map<number, SampleOutput>();
   const store = await readSampleStore(env);
 
@@ -436,21 +483,43 @@ export async function samplePlanetRates(
     });
   }
 
+  return {
+    results,
+    nextStore,
+    archive: {
+      planetRows: archivePlanetRows,
+      oldStore: store,
+      global,
+      mo,
+      signatures: opts.signatures ?? [],
+      nowMs,
+    },
+  };
+}
+
+/**
+ * P1: the WRITE half — the single gated persistence step. Writes the prepared
+ * next store to KV and (only when that put commits) appends the D1 archive
+ * tick. Failure-isolated exactly as before. Handlers call this ONCE, after all
+ * input provenance is known and the all-inputs-live gate passed; a loader never
+ * calls it. A within-60s replay's nextStore is identical to the current store,
+ * so re-writing it is a harmless no-op for history (the append guards live in
+ * prepare).
+ */
+export async function commitSampleTick(
+  env: Env,
+  prepared: PreparedSampleTick,
+): Promise<void> {
   // Track whether the KV ring buffer actually persisted this tick. The D1
   // archive must ride a COMMITTED KV sample: if the KV write is skipped (no
   // binding) or fails (a transient KV error / exhausted write budget), the
   // next poll re-reads an empty/old store and re-seeds the SAME observation as
   // "fresh", so archiving now would accumulate duplicate/over-sampled rows that
   // no longer correspond to the ring buffer. Gate the archive on the put.
-  // P1 provenance gate: a non-live observation (persist === false) is
-  // READ-ONLY. Skipping the KV put leaves kvCommitted false, which in turn
-  // skips the D1 archive write below — so a stale snapshot or resilient-empty
-  // tick advances NEITHER store, for any caller.
-  const persist = opts.persist !== false;
   let kvCommitted = false;
-  if (env.WAR_CACHE && persist) {
+  if (env.WAR_CACHE) {
     try {
-      await env.WAR_CACHE.put(SAMPLES_KEY, JSON.stringify(nextStore), {
+      await env.WAR_CACHE.put(SAMPLES_KEY, JSON.stringify(prepared.nextStore), {
         // 30 days, refreshed on every write: planet samples still age out
         // in code at 48h (sampling.ts), but the Stage 5 accumulation layers
         // must survive gaps in usage — a truly abandoned store still
@@ -479,12 +548,12 @@ export async function samplePlanetRates(
       await archiveSampleTick(
         env,
         buildArchiveTick(
-          archivePlanetRows,
-          store,
-          global,
-          mo,
-          opts.signatures ?? [],
-          nowMs,
+          prepared.archive.planetRows,
+          prepared.archive.oldStore,
+          prepared.archive.global,
+          prepared.archive.mo,
+          prepared.archive.signatures,
+          prepared.archive.nowMs,
         ),
       );
     } catch (err) {
@@ -495,8 +564,6 @@ export async function samplePlanetRates(
       );
     }
   }
-
-  return results;
 }
 
 /**

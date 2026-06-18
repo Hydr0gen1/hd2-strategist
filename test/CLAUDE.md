@@ -388,6 +388,19 @@ the project's definition of done:
     response wrote nothing and a writing response was not stale, asserted both
     directions. A minimal `FakeD1` (batch counter) proves the archive gate; the
     `samples:planets` put count proves the KV gate.
+  - P1 round 2 (decoupled persistence): the reviewer's case — planets SNAPSHOT
+    + campaigns FRESH → `get_planet` writes ZERO samples (the loader records
+    nothing; the terminal gate suppresses the commit); planets-live+campaigns-ok
+    still persists (regression); planets-live+campaigns-`ok:false` writes
+    nothing; **loader purity** — a fully-live `get_supply_graph` commits nothing
+    (the loader itself never writes); cron over a stale campaign cache records
+    nothing.
+  - P2 (active_only under outage): `{full:true, active_only:true}` during a
+    campaign outage returns the COMPLETE topology (`active_only_applied: false`,
+    overlay `unavailable`, per-node `campaign_state_known: false`), never an
+    empty graph misread as "no active campaigns"; `active_only` with `ok`
+    campaigns applies the filter (`active_only_applied: true`); with `stale`
+    campaigns applies it on the last-known set (overlay `degraded`).
 
 ## Conventions
 

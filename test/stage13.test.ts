@@ -962,3 +962,183 @@ describe("get_supply_graph — split provenance (campaign vs planet outage)", ()
     expect(d1B.batchCalls).toBe(0);
   });
 });
+
+/* ---- P1 round 2: decoupled persistence (loaders pure, one writer) ----- */
+
+describe("P1 round 2 — side-effect-free loaders + single gated write", () => {
+  it("1. planets SNAPSHOT + campaigns FRESH: get_planet writes nothing (reviewer's case)", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    // Planets only from the durable snapshot; campaigns/assignments are FRESH.
+    kv.store.set(
+      "snapshot:planets",
+      JSON.stringify({ fetchedAt: Date.now() - 120_000, body: GALAXY }),
+    );
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    // Query a quiet planet so a campaign batch (Sangis) exists to (not) write.
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+
+    expect(out.stale).toBe(true);
+    // The loader recorded nothing; the gate suppressed the commit.
+    expect(samplePuts(kv)).toBe(0); // zero campaign-sample AND planet-sample writes
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("2. planets live + campaigns ok: persists normally (regression guard)", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    seedRaw(kv, RAW_STATUS_PATH, {});
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+    expect(out.stale).toBeUndefined();
+    expect(samplePuts(kv)).toBeGreaterThanOrEqual(1);
+    expect(d1.batchCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("3. planets live + campaigns ok:false: no writes, degraded", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRaw(kv, "/api/v1/planets", GALAXY); // planets live
+    // campaigns down → resilient-empty (ok:false)
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+    expect(out.stale).toBe(true);
+    expect(out.campaign_state_known).toBe(false);
+    expect(samplePuts(kv)).toBe(0);
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("4. loader purity: a live get_supply_graph commits NOTHING (only the terminal step writes)", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    // Fully-live seeds (so the loader DOES compute a tick) — but get_supply_graph
+    // never commits, proving the loader itself wrote nothing.
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    forbidNetwork();
+
+    await getSupplyGraph(env, {});
+    expect(samplePuts(kv)).toBe(0);
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("5. cron tick over a stale campaign cache records nothing (cron's degraded path)", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRawAged(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })], 60_000);
+    seedRawAged(kv, "/api/v1/assignments", [], 60_000);
+    seedRawAged(kv, "/api/v1/war", P1_WAR, 60_000);
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    await runScheduledSample(env);
+    expect(samplePuts(kv)).toBe(0);
+    expect(d1.batchCalls).toBe(0);
+  });
+});
+
+/* ------ P2: active_only preserves topology under campaign outage ------- */
+
+describe("get_supply_graph — active_only under campaign outage (P2)", () => {
+  it("1. {full:true, active_only:true} during outage: non-empty topology, overlay unavailable, active_only_applied false", async () => {
+    const kv = fakeKv();
+    seedRaw(kv, "/api/v1/planets", GALAXY); // planets live; campaigns down
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, {
+      full: true,
+      active_only: true,
+    })) as Record<string, any>;
+
+    expect(out.node_count).toBe(3); // topology NOT emptied
+    expect(out.active_campaign_overlay).toBe("unavailable");
+    expect(out.active_only_applied).toBe(false);
+    expect(
+      out.provenance.reasons.some((r: string) => r.includes("active_only")),
+    ).toBe(true);
+    for (const n of out.nodes as any[]) {
+      expect(n.campaign_state_known).toBe(false);
+      expect(n.has_active_campaign).toBeNull();
+    }
+  });
+
+  it("2. active_only:true, campaigns ok: filter applies; active_only_applied true", async () => {
+    const kv = fakeKv();
+    const env = seededEnv(kv); // Sangis (273) active
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, { active_only: true })) as Record<
+      string,
+      any
+    >;
+    expect(out.active_only_applied).toBe(true);
+    expect(out.active_campaign_overlay).toBe("complete");
+    // Only active campaign planets survive the filter.
+    for (const n of out.nodes as any[]) expect(n.has_active_campaign).toBe(true);
+    expect(out.nodes.map((n: any) => n.index)).toContain(273);
+  });
+
+  it("3. active_only:true, campaigns stale: filter applies on last-known; overlay degraded", async () => {
+    const kv = fakeKv();
+    seedRaw(kv, "/api/v1/planets", GALAXY); // planets live
+    // Campaigns served from an EXPIRED cache → stale (ok:true, stale:true).
+    seedRawAged(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })], 60_000);
+    seedRawAged(kv, "/api/v1/assignments", [], 60_000);
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, { active_only: true })) as Record<
+      string,
+      any
+    >;
+    expect(out.provenance.campaigns).toBe("stale");
+    expect(out.active_campaign_overlay).toBe("degraded");
+    expect(out.active_only_applied).toBe(true);
+    for (const n of out.nodes as any[]) expect(n.has_active_campaign).toBe(true);
+  });
+
+  it("4. an empty graph is never a silent stand-in for 'no active campaigns' under outage", async () => {
+    const kv = fakeKv();
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    const out = (await getSupplyGraph(env, { active_only: true })) as Record<
+      string,
+      any
+    >;
+    // Default+active_only under outage → full topology flagged unknown.
+    expect(out.node_count).toBeGreaterThan(0);
+    expect(out.active_campaign_overlay).toBe("unavailable");
+    expect(out.active_only_applied).toBe(false);
+  });
+});

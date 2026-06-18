@@ -607,7 +607,14 @@ export function buildSupplyGraph(
      * false). Topology is unaffected; only the campaign annotation degrades. */
     campaignStateKnown?: boolean;
   },
-): { nodes: SupplyGraphNode[]; edges: SupplyGraphEdge[] } {
+): {
+  nodes: SupplyGraphNode[];
+  edges: SupplyGraphEdge[];
+  /** P2: whether the active_only filter actually ran — false when requested but
+   * skipped because campaign state was unknown (so an empty result is never a
+   * silent stand-in for "no active campaigns" under outage). */
+  active_only_applied: boolean;
+} {
   const campaignStateKnown = opts.campaignStateKnown !== false;
   const planetByIndex = new Map<number, RawPlanet>(
     planets.map((p) => [p.index, p]),
@@ -652,7 +659,14 @@ export function buildSupplyGraph(
     }
   }
 
-  if (opts.activeOnly) {
+  // P2: apply the active_only deletion ONLY when campaign state is known. Under
+  // a campaign outage `campaignKindByPlanetIndex` is empty, so an unconditional
+  // filter would delete every node and the empty graph would read as "no active
+  // campaigns" — but the active set is actually UNKNOWN. Skip the filter, keep
+  // the full topology (flagged campaign_state_known:false), and report that it
+  // was not applied so the client can tell "unknown" from "really empty".
+  const activeOnlyApplied = Boolean(opts.activeOnly) && campaignStateKnown;
+  if (activeOnlyApplied) {
     for (const idx of [...nodeSet]) {
       if (!campaignKindByPlanetIndex.has(idx)) nodeSet.delete(idx);
     }
@@ -683,7 +697,7 @@ export function buildSupplyGraph(
       if (nodeSet.has(w)) edges.push({ from: idx, to: w, observed: true });
     }
   }
-  return { nodes, edges };
+  return { nodes, edges, active_only_applied: activeOnlyApplied };
 }
 
 /**

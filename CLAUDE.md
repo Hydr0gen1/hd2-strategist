@@ -66,18 +66,24 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   state (quiet vs. active). Any fallback / snapshot / resilient-empty path is
   READ-ONLY and marked `stale: true`; degraded data may be SERVED (clearly
   flagged) but never RECORDED — same serve-but-don't-record logic that keeps the
-  `18145 / 0.07364573` sentinel out of the archive. The gate lives INSIDE the
-  writer (`samplePlanetRates`'s `persist` flag): a non-live observation computes
-  rates for the response but writes NOTHING (no KV append, no D1 row), so
-  contamination is impossible for EVERY caller (cron, get_planet, get_war_status,
-  …), not patched per call site. Provenance is explicit, not inferred:
-  `fetchPlanetsWithFallback` returns `source: 'live' | 'snapshot'` and the
-  resilient campaign load carries `ok` (an empty array with `ok: true` is a real
-  "no active campaigns"; `ok: false` is an outage — UNKNOWN, never quiet, and
-  `has_active_campaign` is null with `campaign_state_known: false`, never
-  asserted false). The "skip persistence" condition and `stale: true` are the
-  SAME predicate (a stale response recorded nothing; a recording response was
-  not stale).
+  `18145 / 0.07364573` sentinel out of the archive. **Loaders are
+  side-effect-free; persistence happens ONCE, after all input provenance is
+  known.** `loadNormalizedCampaigns` calls `prepareSampleTick` (one KV read,
+  ZERO writes) and returns the computed-but-unwritten tick as `bundle.pendingTick`;
+  the handler runs the single terminal `commitCampaignTick(env, bundle, eligible)`
+  only when EVERY input is a complete live fetch (planet-fetching handlers gate
+  on `planets.source === 'live' && !planets.stale && bundle.ok && !bundle.stale`;
+  cron/get_campaigns, which fetch no planet list, gate on campaign provenance
+  alone). This makes the write ORDER-INDEPENDENT — no loader writes, so a
+  snapshot-backed `get_planet` with fresh campaigns can no longer leak a campaign
+  sample before the planet gate applies. `get_supply_graph` simply never commits
+  (read-only). Provenance is explicit, not inferred: `fetchPlanetsWithFallback`
+  returns `source: 'live' | 'snapshot'` and the resilient campaign load carries
+  `ok` (an empty array with `ok: true` is a real "no active campaigns";
+  `ok: false` is an outage — UNKNOWN, never quiet, and `has_active_campaign` is
+  null with `campaign_state_known: false`, never asserted false). The "skip
+  persistence" condition and `stale: true` are the SAME predicate (a stale
+  response recorded nothing; a recording response was not stale).
 - **Two history stores, never reconciled** (Stage 12): KV
   (`samples:planets`) is the bounded recent ring buffer and the SOURCE OF
   TRUTH for all live logic (`hp_per_hour`, the dual ETAs, divergence read
