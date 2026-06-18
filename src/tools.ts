@@ -258,9 +258,15 @@ async function tryFetchRaw<T>(
  * get_supply_graph (and get_war_status, to keep the snapshot warm). The
  * snapshot feeds adjacency/ownership/HP context only — never the history path.
  */
-async function fetchPlanetsWithFallback(
-  env: Env,
-): Promise<{ planets: RawPlanet[]; fetchedAt: number; stale: boolean }> {
+async function fetchPlanetsWithFallback(env: Env): Promise<{
+  planets: RawPlanet[];
+  fetchedAt: number;
+  stale: boolean;
+  /** P1 provenance: 'live' = from the upstream fetch/raw cache (real data,
+   * possibly stale-cached); 'snapshot' = from the durable bulk fallback. The
+   * persistence gate keys off this, not off apparent planet state. */
+  source: "live" | "snapshot";
+}> {
   try {
     const res = await fetchUpstream<RawPlanet[]>(env, "/api/v1/planets");
     const planets = Array.isArray(res.data) ? res.data : [];
@@ -270,7 +276,7 @@ async function fetchPlanetsWithFallback(
     if (!res.cached && !res.stale && Array.isArray(res.data)) {
       await cacheBulkPlanets(env, planets, res.fetchedAt);
     }
-    return { planets, fetchedAt: res.fetchedAt, stale: res.stale };
+    return { planets, fetchedAt: res.fetchedAt, stale: res.stale, source: "live" };
   } catch (err) {
     if (err instanceof UpstreamError) {
       const snapshot = await readBulkPlanetsSnapshot<RawPlanet[]>(env);
@@ -279,6 +285,7 @@ async function fetchPlanetsWithFallback(
           planets: snapshot.data,
           fetchedAt: snapshot.fetchedAt,
           stale: true,
+          source: "snapshot",
         };
       }
     }
@@ -289,6 +296,12 @@ async function fetchPlanetsWithFallback(
 interface CampaignBundle {
   campaigns: EnrichedCampaign[];
   stale: boolean;
+  /** P1 provenance: true = a genuine campaign/assignment load (fetch
+   * succeeded; an empty array with ok:true is a REAL "no active campaigns").
+   * false = a resilient-empty result (the fetch failed and was swallowed) —
+   * campaign state is UNKNOWN, never "no active campaigns", and must not gate
+   * persistence or emit has_active_campaign:false as a fact. */
+  ok: boolean;
   /** Raw assignments from the same fetch the MO planet map used — exposed so
    * the war brief can reuse the MO shaping without a second fetch. */
   assignments: RawAssignment[];
@@ -319,6 +332,16 @@ async function loadNormalizedCampaigns(
   const moPlanetIndices = new Set(moMap.keys());
   const nowMs = Date.now();
 
+  // P1 provenance gate: this poll's sampled health comes from the campaigns
+  // (and war) fetch. Persist ONLY when that data is a complete live fetch —
+  // a stale-fallback copy (fetchUpstream serving an expired cache on upstream
+  // failure) is served but never recorded. Predicate unity: this is the SAME
+  // condition as the bundle's `stale` flag below.
+  const liveFetch =
+    !campaignsRes.stale &&
+    !assignmentsRes.stale &&
+    (warRes ? !warRes.stale : true);
+
   const samples = await samplePlanetRates(
     env,
     raw.map(
@@ -336,6 +359,8 @@ async function loadNormalizedCampaigns(
     ),
     nowMs,
     {
+      // P1: write nothing when the underlying fetch was a stale fallback.
+      persist: liveFetch,
       // Stage 5/8 accumulation layers — folded into the SAME single write.
       // Global statistics are present only on the get_war_status path (the
       // one place the war is fetched); signatures and MO progress fold on
@@ -409,7 +434,10 @@ async function loadNormalizedCampaigns(
 
   return {
     campaigns,
-    stale: campaignsRes.stale || assignmentsRes.stale,
+    // Predicate unity: stale === !liveFetch === "this poll wrote nothing".
+    stale: !liveFetch,
+    // A genuine live load — the fetch returned (empty-but-live is still ok).
+    ok: true,
     assignments: assignmentsRes.data ?? [],
     fetchedAts: [
       campaignsRes.fetchedAt,
@@ -523,6 +551,11 @@ export async function getWarStatus(env: Env): Promise<unknown> {
       [planetsResult.fetchedAt, ...bundle.fetchedAts],
       Date.now(),
     ),
+    // Display staleness across ALL contributing sources (incl. snapshot
+    // planets). P1 note: the sample RECORD is gated separately on campaign-data
+    // provenance inside loadNormalizedCampaigns (this tool samples
+    // campaign-endpoint health, NEVER the snapshot planets list), so a stale
+    // DISPLAY never means snapshot/stale data was recorded — no contamination.
     ...(planetsResult.stale || bundle.war!.stale || bundle.stale
       ? { stale: true }
       : {}),
@@ -750,13 +783,23 @@ export async function getPlanet(
     (c) => c.planet_index === planet!.index,
   );
 
+  // P1 provenance. `campaignStateKnown` = the campaign load actually returned
+  // (ok); when false, campaign state is UNKNOWN — never "quiet". A fully-LIVE
+  // observation needs live planets AND a live (non-stale) campaign load; only
+  // then may a quiet-planet probe record. `live` is the SINGLE predicate that
+  // governs BOTH the write gate and the response `stale` flag (requirement D).
+  const campaignStateKnown = bundle.ok;
+  const planetsLive = planetsResult.source === "live" && !planetsResult.stale;
+  const live = planetsLive && campaignStateKnown && !bundle.stale;
+
   let normalized: NormalizedCampaign;
   let probeSamples: HealthSample[] = [];
   if (active) {
     normalized = active;
-  } else {
-    // No active campaign: normalize a synthetic record so invariants
-    // (defense decay nulling, display-only %, projection guards) still apply.
+  } else if (campaignStateKnown) {
+    // Campaign state is KNOWN and this planet has no active campaign — a
+    // genuine quiet planet. Probe its health, but PERSIST only on a fully-live
+    // observation (P1): a snapshot/stale planet is served, never recorded.
     const nowMs = Date.now();
     const samples = await samplePlanetRates(
       env,
@@ -778,8 +821,9 @@ export async function getPlanet(
       ],
       nowMs,
       // Single-planet probe: carry the rest of the store forward so one
-      // lookup doesn't wipe other planets' series / campaign ages.
-      { carryForward: true },
+      // lookup doesn't wipe other planets' series / campaign ages. P1: write
+      // nothing unless the probed planet data is a complete live fetch.
+      { carryForward: true, persist: live },
     );
     const sample = samples.get(planet.index);
     probeSamples = sample?.samples ?? [];
@@ -787,6 +831,24 @@ export async function getPlanet(
       { id: -1, planet, type: 0, count: 0, faction: planet.currentOwner },
       {
         hpPerHour: sample?.hpPerHour ?? null,
+        campaignAgeMs: defenseAgeMs(planet, nowMs),
+        hpcTypes: HPC_CAMPAIGN_TYPES,
+        moPlanetIndices: new Set(),
+      },
+    );
+  } else {
+    // Campaign state UNKNOWN (outage / resilient-empty). Unknown ≠ quiet: do
+    // NOT enter the sampling branch (it would both misclassify AND contaminate
+    // the store). Serve READ-ONLY from last-known samples — zero writes.
+    const nowMs = Date.now();
+    probeSamples = await readPlanetSamples(env, planet.index);
+    const knownRates = perIntervalRates(probeSamples);
+    const lastKnownRate =
+      knownRates.length > 0 ? knownRates[knownRates.length - 1]! : null;
+    normalized = normalizeCampaign(
+      { id: -1, planet, type: 0, count: 0, faction: planet.currentOwner },
+      {
+        hpPerHour: lastKnownRate,
         campaignAgeMs: defenseAgeMs(planet, nowMs),
         hpcTypes: HPC_CAMPAIGN_TYPES,
         moPlanetIndices: new Set(),
@@ -882,7 +944,10 @@ export async function getPlanet(
     sector: planet.sector,
     current_owner: planet.currentOwner,
     initial_owner: planet.initialOwner,
-    has_active_campaign: Boolean(active),
+    // P1 output honesty: when campaign state is UNKNOWN (outage), never assert
+    // has_active_campaign:false — it is null, with campaign_state_known:false.
+    has_active_campaign: campaignStateKnown ? Boolean(active) : null,
+    campaign_state_known: campaignStateKnown,
     campaign_kind: normalized.campaign_kind,
     raw_hp: normalized.raw_hp,
     max_hp: normalized.max_hp,
@@ -964,6 +1029,12 @@ export async function getPlanet(
       defense_window: DEFENSE_WINDOW_NOTE,
       eta: ETA_NOTE,
       defense_eta: DEFENSE_ETA_NOTE,
+      ...(campaignStateKnown
+        ? {}
+        : {
+            campaign_state_known:
+              "Campaign/assignment data could not be fetched this request (outage), so campaign state is UNKNOWN — has_active_campaign is null (never asserted false), campaign_kind/eta reflect last-known or synthetic state, and NOTHING was recorded to the history store. stale: true. Retry when upstream recovers.",
+          }),
       neighbors:
         "Upstream's own waypoints array for this planet, in upstream order — joined by index against the full planets list and the active campaign set, never symmetrized or rerouted (direction semantics are upstream's). A dangling index still counts in neighbor_summary.total with name/owner null, tallied under by_owner.unknown.",
       frontline:
@@ -978,26 +1049,34 @@ export async function getPlanet(
       [planetsResult.fetchedAt, ...bundle.fetchedAts],
       Date.now(),
     ),
-    ...(planetsResult.stale || bundle.stale ? { stale: true } : {}),
+    // P1 predicate unity: `stale: true` is exactly `!live` — the SAME condition
+    // that gated the quiet-probe write above. A stale response recorded
+    // nothing; a response that recorded was not stale.
+    ...(!live ? { stale: true } : {}),
   };
 }
 
 /**
- * Feature 5: load the normalized campaign bundle, degrading to an empty bundle
- * (stale: true) when its own upstream fetches cannot complete. This lets
- * get_planet still answer adjacency/ownership/region questions from the planet
- * snapshot during an outage instead of hard-failing — a planet with an active
- * campaign then reads through the same synthetic-normalize path a quiet planet
- * uses. The sampling write budget is unchanged: a successful load writes once
- * as before; a failed load writes nothing.
+ * Feature 5 + P1: load the normalized campaign bundle, degrading to a
+ * resilient-empty bundle (`ok: false`, `stale: true`) when its own upstream
+ * fetches cannot complete. This lets get_planet still answer adjacency/
+ * ownership/region questions from the planet snapshot during an outage instead
+ * of hard-failing. `ok: false` means campaign state is UNKNOWN (not "no active
+ * campaigns"): the caller serves read-only last-known data and records nothing.
+ * The sampling write budget is unchanged: a live load writes once as before; a
+ * resilient-empty load writes nothing.
  */
 async function loadCampaignsResilient(env: Env): Promise<CampaignBundle> {
   try {
     return await loadNormalizedCampaigns(env);
   } catch {
+    // P1: a RESILIENT-EMPTY result — the fetch failed and was swallowed.
+    // ok:false marks campaign state as UNKNOWN (not "no active campaigns"), so
+    // callers neither persist against it nor emit has_active_campaign:false.
     return {
       campaigns: [],
       stale: true,
+      ok: false,
       assignments: [],
       fetchedAts: [],
     };
@@ -1085,6 +1164,10 @@ export async function getSupplyGraph(
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom([planetsResult.fetchedAt, ...bundle.fetchedAts], Date.now()),
+    // Display staleness (incl. snapshot planets). P1: any sample RECORD rides
+    // loadCampaignsResilient → loadNormalizedCampaigns, gated on campaign-data
+    // provenance — never the snapshot planets list — so a stale graph never
+    // implies snapshot/stale data was recorded.
     ...(planetsResult.stale || bundle.stale ? { stale: true } : {}),
   };
 }
@@ -1478,6 +1561,10 @@ export async function getWarBrief(env: Env): Promise<unknown> {
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom([planetsRes.fetchedAt, ...bundle.fetchedAts], nowMs),
+    // Display staleness across all sources. P1: the brief's single sample
+    // RECORD rides loadNormalizedCampaigns, gated on campaign-data provenance
+    // (it samples campaign-endpoint health, never the planets list), so a stale
+    // brief never means snapshot/stale data was recorded.
     ...(planetsRes.stale || bundle.war!.stale || bundle.stale
       ? { stale: true }
       : {}),

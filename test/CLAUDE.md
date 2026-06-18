@@ -366,6 +366,18 @@ the project's definition of done:
   - Feature 5: `get_planet` serves the durable `snapshot:planets` (`stale:
     true`) when every live fetch fails; the snapshot is refreshed only on a
     genuine upstream fetch (a cache hit writes none).
+  - P1 provenance-gated persistence (the `samplePlanetRates` `persist` gate):
+    (1) get_planet during a campaign-fetch failure with planets from snapshot →
+    `stale: true`, ZERO `samples:planets` puts and ZERO D1 batches; (2) a cron
+    tick over EXPIRED (stale-served) caches → no KV append, no D1 row; (3) a
+    fully-live fetch still samples + archives (the gate did not over-block);
+    (4) an active planet during a campaign outage is `has_active_campaign: null`
+    + `campaign_state_known: false` (never false) and does not sample as quiet;
+    (5) an empty-but-LIVE campaigns result (`ok: true`) still records —
+    distinguished from `ok: false`; (6) predicate unity — a `stale: true`
+    response wrote nothing and a writing response was not stale, asserted both
+    directions. A minimal `FakeD1` (batch counter) proves the archive gate; the
+    `samples:planets` put count proves the KV gate.
 
 ## Conventions
 

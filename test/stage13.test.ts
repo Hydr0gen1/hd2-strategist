@@ -19,8 +19,8 @@ import {
   selectRegions,
 } from "../src/enrichment";
 import { RAW_STATUS_PATH } from "../src/crosscheck";
-import { getPlanet, getSupplyGraph } from "../src/tools";
-import type { Env, RawAssignment, RawCampaign, RawPlanet } from "../src/types";
+import { getPlanet, getSupplyGraph, runScheduledSample } from "../src/tools";
+import type { Env, RawAssignment, RawCampaign, RawPlanet, RawWar } from "../src/types";
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -589,5 +589,187 @@ describe("feature 5 — warm bulk-snapshot fallback", () => {
     await getSupplyGraph(env, {});
     const after = kv.puts.filter((p) => p.key === "snapshot:planets").length;
     expect(after).toBe(before); // cache hit wrote no snapshot
+  });
+});
+
+/* ------------- P1: provenance-gated persistence (Codex fix) ------------ */
+
+// Minimal D1 stub: archiveSampleTick rides kvCommitted, so when persistence is
+// gated off it is never reached and batchCalls stays 0. On a live tick it runs.
+class FakeD1 {
+  batchCalls = 0;
+  prepare(_sql: string) {
+    return { bind: (..._a: unknown[]) => ({}) };
+  }
+  async batch(_stmts: unknown[]) {
+    this.batchCalls += 1;
+    return [];
+  }
+}
+
+function seedRawAged(
+  kv: FakeKv,
+  path: string,
+  body: unknown,
+  ageMs: number,
+): void {
+  kv.store.set(
+    `raw:${path}`,
+    JSON.stringify({ fetchedAt: Date.now() - ageMs, body }),
+  );
+}
+
+const P1_WAR: RawWar = {
+  started: "2024-01-23T20:05:13Z",
+  ended: "2028-02-08T20:04:55Z",
+  now: "1972-04-26T00:00:00Z",
+  clientVersion: "0.3.0",
+  factions: ["Humans", "Terminids", "Automaton", "Illuminate"],
+  impactMultiplier: 0.02,
+  statistics: {
+    missionsWon: 1,
+    missionsLost: 1,
+    missionSuccessRate: 50,
+    terminidKills: 1,
+    automatonKills: 1,
+    illuminateKills: 1,
+    deaths: 1,
+    playerCount: 50_000,
+    accuracy: 60,
+  },
+};
+
+const samplePuts = (kv: FakeKv) =>
+  kv.puts.filter((p) => p.key === "samples:planets").length;
+
+describe("P1 — provenance-gated persistence", () => {
+  it("1. getPlanet during campaign-fetch failure (planets from snapshot): stale, zero writes", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    // Only the durable snapshot exists; every raw: fetch fails (no cache).
+    kv.store.set(
+      "snapshot:planets",
+      JSON.stringify({ fetchedAt: Date.now() - 300_000, body: GALAXY }),
+    );
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+
+    expect(out.stale).toBe(true);
+    expect(out.campaign_state_known).toBe(false);
+    expect(samplePuts(kv)).toBe(0); // no KV append
+    expect(d1.batchCalls).toBe(0); // no D1 archive row
+  });
+
+  it("2. cron tick during the same outage: no KV append, no D1 row", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    // Campaign/assignment/war caches exist but are EXPIRED (>45s); the network
+    // is down, so fetchUpstream serves them stale — a non-live observation.
+    seedRawAged(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })], 60_000);
+    seedRawAged(kv, "/api/v1/assignments", [], 60_000);
+    seedRawAged(kv, "/api/v1/war", P1_WAR, 60_000);
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    await runScheduledSample(env);
+
+    expect(samplePuts(kv)).toBe(0); // archive/ring buffer untouched
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("3. fully-live fetch: samples and persists normally (gate did not over-block)", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    seedRaw(kv, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kv, "/api/v1/assignments", []);
+    seedRaw(kv, RAW_STATUS_PATH, {});
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+
+    expect(out.stale).toBeUndefined(); // live → not stale
+    expect(out.campaign_state_known).toBe(true);
+    expect(samplePuts(kv)).toBeGreaterThanOrEqual(1); // persisted
+    expect(d1.batchCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("4. active planet during a campaign outage: not has_active_campaign:false; campaign_state_known:false; no quiet sampling", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    // Planets endpoint is up (live), campaigns endpoint is down (no cache).
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    // 185 (Karlia) would be an active defense if campaigns resolved.
+    const out = (await getPlanet(env, { index: 185 })) as Record<string, any>;
+
+    expect(out.has_active_campaign).toBeNull(); // never asserted false
+    expect(out.campaign_state_known).toBe(false);
+    expect(out.stale).toBe(true);
+    expect(samplePuts(kv)).toBe(0); // unknown ≠ quiet → no sampling
+    expect(d1.batchCalls).toBe(0);
+  });
+
+  it("5. genuinely empty live result (ok:true, empty): writes allowed", async () => {
+    const kv = fakeKv();
+    const d1 = new FakeD1();
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    seedRaw(kv, "/api/v1/campaigns", []); // LIVE empty — a real 'no campaigns'
+    seedRaw(kv, "/api/v1/assignments", []);
+    seedRaw(kv, RAW_STATUS_PATH, {});
+    const env: Env = {
+      WAR_CACHE: kv as unknown as KVNamespace,
+      HISTORY_DB: d1 as unknown as D1Database,
+    };
+    forbidNetwork();
+
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+
+    expect(out.campaign_state_known).toBe(true);
+    expect(out.has_active_campaign).toBe(false); // real quiet, not unknown
+    expect(out.stale).toBeUndefined();
+    expect(samplePuts(kv)).toBeGreaterThanOrEqual(1); // empty-but-live records
+  });
+
+  it("6. predicate unity: stale ⟺ no write (both directions)", async () => {
+    // Degraded: campaigns down, planets from snapshot → stale, no write.
+    const kvA = fakeKv();
+    kvA.store.set(
+      "snapshot:planets",
+      JSON.stringify({ fetchedAt: Date.now() - 300_000, body: GALAXY }),
+    );
+    const envA: Env = { WAR_CACHE: kvA as unknown as KVNamespace };
+    forbidNetwork();
+    const a = (await getPlanet(envA, { index: 50 })) as Record<string, any>;
+    expect(a.stale).toBe(true);
+    expect(samplePuts(kvA)).toBe(0); // stale ⟹ no write
+
+    // Live: everything fresh → not stale, wrote.
+    const kvB = fakeKv();
+    seedRaw(kvB, "/api/v1/planets", GALAXY);
+    seedRaw(kvB, "/api/v1/campaigns", [rawCampaign({ id: 51, planet: SANGIS })]);
+    seedRaw(kvB, "/api/v1/assignments", []);
+    seedRaw(kvB, RAW_STATUS_PATH, {});
+    const envB: Env = { WAR_CACHE: kvB as unknown as KVNamespace };
+    const b = (await getPlanet(envB, { index: 50 })) as Record<string, any>;
+    expect(b.stale).toBeUndefined(); // wrote ⟹ not stale
+    expect(samplePuts(kvB)).toBeGreaterThanOrEqual(1);
   });
 });

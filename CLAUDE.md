@@ -52,6 +52,24 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   math; the warm `snapshot:planets` cache feeds adjacency/ownership/HP context
   lookups ONLY (get_planet / get_supply_graph fallback) and MUST NOT backfill
   the history/global-stats archive.
+- **Persistence requires a complete live fetch** (P1 provenance gate — the
+  durable invariant that keeps the warm snapshot out of the record). Sampling
+  is gated on data PROVENANCE (live vs. fallback), never on apparent planet
+  state (quiet vs. active). Any fallback / snapshot / resilient-empty path is
+  READ-ONLY and marked `stale: true`; degraded data may be SERVED (clearly
+  flagged) but never RECORDED — same serve-but-don't-record logic that keeps the
+  `18145 / 0.07364573` sentinel out of the archive. The gate lives INSIDE the
+  writer (`samplePlanetRates`'s `persist` flag): a non-live observation computes
+  rates for the response but writes NOTHING (no KV append, no D1 row), so
+  contamination is impossible for EVERY caller (cron, get_planet, get_war_status,
+  …), not patched per call site. Provenance is explicit, not inferred:
+  `fetchPlanetsWithFallback` returns `source: 'live' | 'snapshot'` and the
+  resilient campaign load carries `ok` (an empty array with `ok: true` is a real
+  "no active campaigns"; `ok: false` is an outage — UNKNOWN, never quiet, and
+  `has_active_campaign` is null with `campaign_state_known: false`, never
+  asserted false). The "skip persistence" condition and `stale: true` are the
+  SAME predicate (a stale response recorded nothing; a recording response was
+  not stale).
 - **Two history stores, never reconciled** (Stage 12): KV
   (`samples:planets`) is the bounded recent ring buffer and the SOURCE OF
   TRUTH for all live logic (`hp_per_hour`, the dual ETAs, divergence read

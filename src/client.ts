@@ -306,6 +306,17 @@ async function readSampleStore(env: Env): Promise<SampleStore> {
  * without `signatures` / `globalStatistics` passes those layers through
  * untouched; the MO series additionally apply their age eviction on every
  * write (that is how a prior MO's retained series eventually ages out).
+ *
+ * PROVENANCE GATE (P1 fix — the load-bearing choke point). Persistence
+ * requires a COMPLETE LIVE fetch. `opts.persist === false` makes this call
+ * READ-ONLY: rates are still computed and returned for the response, but
+ * NOTHING is written — no KV append, no D1 archive row (the D1 write already
+ * rides `kvCommitted`, which stays false). The caller sets `persist` from the
+ * PROVENANCE of the data it is sampling (live fetch vs. fallback/snapshot/
+ * resilient-empty), never from apparent planet state. This is what keeps a
+ * stale snapshot out of `samples:planets`/D1 for EVERY caller (cron,
+ * get_planet, get_war_status, …) — degraded data may be served, never
+ * recorded. Default `true` preserves every existing live call site.
  */
 export async function samplePlanetRates(
   env: Env,
@@ -313,6 +324,9 @@ export async function samplePlanetRates(
   nowMs: number = Date.now(),
   opts: {
     carryForward?: boolean;
+    /** P1 provenance gate: false → compute rates but write nothing (the data
+     * is a fallback/snapshot/resilient-empty observation, not a live fetch). */
+    persist?: boolean;
     signatures?: SignatureObservation[];
     globalStatistics?: RawStatistics | null;
     /** Stage 11: raw war-root impactMultiplier + active-campaign count,
@@ -428,8 +442,13 @@ export async function samplePlanetRates(
   // next poll re-reads an empty/old store and re-seeds the SAME observation as
   // "fresh", so archiving now would accumulate duplicate/over-sampled rows that
   // no longer correspond to the ring buffer. Gate the archive on the put.
+  // P1 provenance gate: a non-live observation (persist === false) is
+  // READ-ONLY. Skipping the KV put leaves kvCommitted false, which in turn
+  // skips the D1 archive write below — so a stale snapshot or resilient-empty
+  // tick advances NEITHER store, for any caller.
+  const persist = opts.persist !== false;
   let kvCommitted = false;
-  if (env.WAR_CACHE) {
+  if (env.WAR_CACHE && persist) {
     try {
       await env.WAR_CACHE.put(SAMPLES_KEY, JSON.stringify(nextStore), {
         // 30 days, refreshed on every write: planet samples still age out
