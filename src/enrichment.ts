@@ -9,6 +9,7 @@ import type {
   MoArchiveRow,
   PlanetArchiveRow,
 } from "./archive";
+import type { CampaignView } from "./provenance";
 import type {
   GlobalSample,
   HealthSample,
@@ -18,6 +19,7 @@ import type {
   ObservedSignature,
 } from "./sampling";
 import type {
+  AdjacencySummary,
   BiomeInfo,
   CampaignFilters,
   DefenseTiming,
@@ -29,13 +31,18 @@ import type {
   FactionRollup,
   FreshnessMeta,
   FrontRateAggregate,
+  GambitOrigin,
   GlobalHistoryPoint,
   HazardInfo,
   HistoryRateAggregates,
   MoHistorySeries,
+  PerPlayerRates,
   PlanetArchivePoint,
   NeighborInfo,
   NeighborSummary,
+  RegionInfo,
+  SupplyGraphEdge,
+  SupplyGraphNode,
   ObservedSignatureInfo,
   PatchNoteInfo,
   PlanetCandidate,
@@ -448,7 +455,7 @@ export function moPlanetAssignmentMap(
 export function buildNeighbors(
   planet: RawPlanet,
   planetByIndex: ReadonlyMap<number, RawPlanet>,
-  campaignKindByPlanetIndex: ReadonlyMap<number, "liberation" | "defense">,
+  campaigns: CampaignView,
 ): {
   neighbors: NeighborInfo[];
   neighbor_summary: NeighborSummary;
@@ -462,7 +469,6 @@ export function buildNeighbors(
 
   const neighbors = waypoints.map((index): NeighborInfo => {
     const neighbor = planetByIndex.get(index);
-    const kind = campaignKindByPlanetIndex.get(index) ?? null;
     const owner =
       typeof neighbor?.currentOwner === "string"
         ? neighbor.currentOwner
@@ -473,13 +479,14 @@ export function buildNeighbors(
       byOwner[owner] = (byOwner[owner] ?? 0) + 1;
       if (owner !== planet.currentOwner) frontline = true;
     }
-    if (kind != null) withCampaign += 1;
+    // Tri-state campaign annotation — null (not false) when state is unknown.
+    if (campaigns.status(index) === "active") withCampaign += 1;
     return {
       index,
       name: typeof neighbor?.name === "string" ? neighbor.name : null,
       owner,
-      has_active_campaign: kind != null,
-      campaign_kind: kind,
+      has_active_campaign: campaigns.hasActiveCampaign(index),
+      campaign_kind: campaigns.kind(index),
     };
   });
 
@@ -497,6 +504,332 @@ export function buildNeighbors(
       with_active_campaign: withCampaign,
     },
     frontline,
+  };
+}
+
+/**
+ * Feature 1: a planet's INBOUND neighbors — every planet whose own waypoints
+ * array names THIS planet's index. Purely the inversion of observed upstream
+ * edges over the single consistent planet snapshot — no symmetrization beyond
+ * what is observed, no routing. Same joined shape as buildNeighbors' outbound
+ * set; a planet whose waypoints list this index is always a real planet (we
+ * iterate the snapshot), so there are no dangling entries here. Sorted by
+ * index for a deterministic payload.
+ */
+export function buildInboundNeighbors(
+  planet: RawPlanet,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  campaigns: CampaignView,
+): NeighborInfo[] {
+  const inbound: NeighborInfo[] = [];
+  for (const p of planetByIndex.values()) {
+    const waypoints = Array.isArray(p.waypoints) ? p.waypoints : [];
+    if (!waypoints.includes(planet.index)) continue;
+    inbound.push({
+      index: p.index,
+      name: typeof p.name === "string" ? p.name : null,
+      owner: typeof p.currentOwner === "string" ? p.currentOwner : null,
+      // Tri-state — null (not false) when campaign state is unknown.
+      has_active_campaign: campaigns.hasActiveCampaign(p.index),
+      campaign_kind: campaigns.kind(p.index),
+    });
+  }
+  inbound.sort((a, b) => a.index - b.index);
+  return inbound;
+}
+
+/**
+ * Feature 1: deterministic adjacency counts over the COMBINED inbound ∪
+ * outbound neighbor sets. `borders_super_earth` is true iff at least one
+ * distinct neighbor is owned by "Humans" — an adjacency fact in the spirit of
+ * `frontline`, NOT a liberation-eligibility claim. `super_earth_neighbors`
+ * lists those Human-owned neighbor indices (deduped, sorted).
+ */
+export function buildAdjacencySummary(
+  outbound: NeighborInfo[],
+  inbound: NeighborInfo[],
+): AdjacencySummary {
+  const superEarth = new Set<number>();
+  for (const n of [...outbound, ...inbound]) {
+    if (n.owner === "Humans") superEarth.add(n.index);
+  }
+  const super_earth_neighbors = [...superEarth].sort((a, b) => a - b);
+  return {
+    outbound: outbound.length,
+    inbound: inbound.length,
+    super_earth_neighbors,
+    borders_super_earth: super_earth_neighbors.length > 0,
+  };
+}
+
+/** Feature 1: does this planet border a Human-owned planet over its FULL-galaxy
+ * adjacency (inbound ∪ outbound)? The same fact AdjacencySummary carries,
+ * computed per supply-graph node. Pure lookup over precomputed adjacency. */
+function bordersSuperEarth(
+  index: number,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  reverseAdjacency: ReadonlyMap<number, number[]>,
+): boolean {
+  const planet = planetByIndex.get(index);
+  const outbound =
+    planet && Array.isArray(planet.waypoints) ? planet.waypoints : [];
+  const inbound = reverseAdjacency.get(index) ?? [];
+  for (const n of [...outbound, ...inbound]) {
+    if (planetByIndex.get(n)?.currentOwner === "Humans") return true;
+  }
+  return false;
+}
+
+/**
+ * Feature 1: the supply-line subgraph. Pure graph construction over the single
+ * planet snapshot — emits ONLY observed edges (a planet's own waypoints,
+ * tagged observed: true), never an implied reverse edge. Node selection:
+ *
+ * - full: the whole galaxy.
+ * - rootIndex set: BFS outward (inbound + outbound) from that planet to depth.
+ * - default (no root): every active-campaign planet plus its neighbors to
+ *   depth — the strategically relevant slice, payload-bounded.
+ *
+ * `activeOnly` then narrows nodes to active-campaign planets. Each node carries
+ * borders_super_earth over its FULL-galaxy adjacency (not just the subgraph),
+ * matching get_planet. Dangling waypoint targets (no matching planet) are never
+ * promoted to nodes and never emitted as edges.
+ */
+export function buildSupplyGraph(
+  planets: RawPlanet[],
+  campaigns: CampaignView,
+  opts: {
+    rootIndex?: number | null;
+    depth: number;
+    activeOnly: boolean;
+    full: boolean;
+  },
+): {
+  nodes: SupplyGraphNode[];
+  edges: SupplyGraphEdge[];
+  /** P2: whether the active_only filter actually ran — false when requested but
+   * skipped because campaign state was unknown (so an empty result is never a
+   * silent stand-in for "no active campaigns" under outage). */
+  active_only_applied: boolean;
+} {
+  const campaignStateKnown = campaigns.known;
+  const planetByIndex = new Map<number, RawPlanet>(
+    planets.map((p) => [p.index, p]),
+  );
+  // Reverse adjacency once: index → planets whose waypoints name it.
+  const reverseAdjacency = new Map<number, number[]>();
+  for (const p of planets) {
+    const waypoints = Array.isArray(p.waypoints) ? p.waypoints : [];
+    for (const w of waypoints) {
+      const list = reverseAdjacency.get(w);
+      if (list) list.push(p.index);
+      else reverseAdjacency.set(w, [p.index]);
+    }
+  }
+
+  const nodeSet = new Set<number>();
+  if (opts.full) {
+    for (const p of planets) nodeSet.add(p.index);
+  } else {
+    const seeds =
+      opts.rootIndex != null && planetByIndex.has(opts.rootIndex)
+        ? [opts.rootIndex]
+        : planets
+            .filter((p) => campaigns.status(p.index) === "active")
+            .map((p) => p.index);
+    let frontier = new Set<number>(seeds);
+    for (const s of seeds) nodeSet.add(s);
+    for (let d = 0; d < opts.depth && frontier.size > 0; d++) {
+      const next = new Set<number>();
+      for (const idx of frontier) {
+        const planet = planetByIndex.get(idx);
+        const outbound =
+          planet && Array.isArray(planet.waypoints) ? planet.waypoints : [];
+        const inbound = reverseAdjacency.get(idx) ?? [];
+        for (const n of [...outbound, ...inbound]) {
+          if (!planetByIndex.has(n) || nodeSet.has(n)) continue;
+          nodeSet.add(n);
+          next.add(n);
+        }
+      }
+      frontier = next;
+    }
+  }
+
+  // P2: apply the active_only deletion ONLY when campaign state is known (via
+  // the tri-state accessor, never a raw map lookup). Under a campaign outage
+  // status is 'unknown' for every planet, so an unconditional filter would
+  // delete every node and the empty graph would read as "no active campaigns"
+  // — but the active set is actually UNKNOWN. Skip the filter, keep the full
+  // topology (flagged campaign_state_known:false), and report it was not
+  // applied so the client can tell "unknown" from "really empty".
+  const activeOnlyApplied = Boolean(opts.activeOnly) && campaignStateKnown;
+  if (activeOnlyApplied) {
+    for (const idx of [...nodeSet]) {
+      if (campaigns.status(idx) !== "active") nodeSet.delete(idx);
+    }
+  }
+
+  const sorted = [...nodeSet].sort((a, b) => a - b);
+  const nodes: SupplyGraphNode[] = sorted.map((idx) => {
+    const planet = planetByIndex.get(idx)!;
+    return {
+      index: idx,
+      name: typeof planet.name === "string" ? planet.name : null,
+      owner: typeof planet.currentOwner === "string" ? planet.currentOwner : null,
+      // Campaign annotation via the tri-state accessor — null when unknown,
+      // never asserted false. Topology (owner/borders_super_earth) unaffected.
+      has_active_campaign: campaigns.hasActiveCampaign(idx),
+      campaign_kind: campaigns.kind(idx),
+      campaign_state_known: campaignStateKnown,
+      borders_super_earth: bordersSuperEarth(idx, planetByIndex, reverseAdjacency),
+    };
+  });
+
+  const edges: SupplyGraphEdge[] = [];
+  for (const idx of sorted) {
+    const planet = planetByIndex.get(idx)!;
+    const waypoints = Array.isArray(planet.waypoints) ? planet.waypoints : [];
+    for (const w of [...waypoints].sort((a, b) => a - b)) {
+      if (nodeSet.has(w)) edges.push({ from: idx, to: w, observed: true });
+    }
+  }
+  return { nodes, edges, active_only_applied: activeOnlyApplied };
+}
+
+/**
+ * Feature 2: the attack origin(s) of a defense — every planet whose outbound
+ * `attacking` array names THIS planet's index (the inversion of the observed
+ * source→target attack pairs over the single snapshot). Each origin surfaces
+ * its raw state plus a pure is_major_order_target membership join — never a
+ * priority/timing verdict. Sorted by index. Empty when no attack resolves.
+ */
+export function buildGambitOrigins(
+  planet: RawPlanet,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  campaigns: CampaignView,
+): GambitOrigin[] {
+  const origins: GambitOrigin[] = [];
+  for (const p of planetByIndex.values()) {
+    const attacking = Array.isArray(p.attacking) ? p.attacking : [];
+    if (!attacking.includes(planet.index)) continue;
+    const mo = campaigns.moMembership(p.index);
+    origins.push({
+      index: p.index,
+      name: typeof p.name === "string" ? p.name : null,
+      owner: typeof p.currentOwner === "string" ? p.currentOwner : null,
+      // Tri-state campaign + MO annotations — null (not false) when unknown.
+      has_active_campaign: campaigns.hasActiveCampaign(p.index),
+      campaign_kind: campaigns.kind(p.index),
+      raw_hp:
+        typeof p.health === "number" && Number.isFinite(p.health)
+          ? p.health
+          : null,
+      is_major_order_target: mo === "unknown" ? null : mo,
+    });
+  }
+  origins.sort((a, b) => a.index - b.index);
+  return origins;
+}
+
+/**
+ * Feature 3: per-player effective rates, all CONSUMING the one signed
+ * hp_per_hour (and decay_per_hour, itself the invariant-1 normalized regen ×
+ * 3600) — nothing is recomputed. Sign convention is preserved exactly:
+ * gross_depletion_per_hour = hp_per_hour + decay_per_hour (player depletion =
+ * net progress + regen the players also had to overcome). Defenses null the
+ * gross fields (decay is force-nulled by invariant 1 — gross is uncomputable,
+ * never reached around). Zero/unknown players null the per-player fields
+ * rather than divide. Every null carries a machine-readable reason.
+ */
+export function perPlayerRates(args: {
+  hpPerHour: number | null;
+  decayPerHour: number | null;
+  campaignKind: "liberation" | "defense";
+  playerCount: number | null;
+}): PerPlayerRates {
+  const { hpPerHour, decayPerHour, campaignKind, playerCount } = args;
+  const hasPlayers =
+    playerCount != null && Number.isFinite(playerCount) && playerCount > 0;
+  const per1k = hasPlayers ? playerCount! / 1000 : null;
+
+  const net_hp_per_hour_per_1k_players =
+    hpPerHour != null && per1k != null ? hpPerHour / per1k : null;
+
+  // gross = player depletion before regen — liberation only (invariant 1
+  // force-nulls defense decay, so gross is uncomputable on a defense).
+  let gross_depletion_per_hour: number | null = null;
+  let grossReason: string | undefined;
+  if (campaignKind === "defense") {
+    grossReason = "defense_decay_nulled_invariant_1";
+  } else if (hpPerHour == null) {
+    grossReason = "no_current_rate";
+  } else if (decayPerHour == null) {
+    grossReason = "decay_unknown";
+  } else {
+    gross_depletion_per_hour = hpPerHour + decayPerHour;
+  }
+
+  const gross_depletion_per_1k_players =
+    gross_depletion_per_hour != null && per1k != null
+      ? gross_depletion_per_hour / per1k
+      : null;
+
+  // A single dominant reason for any null: no players first (it nulls the
+  // most), then the gross-specific reason.
+  let reason: string | undefined;
+  if (!hasPlayers) reason = "no_players";
+  else if (grossReason) reason = grossReason;
+
+  return {
+    net_hp_per_hour_per_1k_players,
+    gross_depletion_per_hour,
+    gross_depletion_per_1k_players,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+/**
+ * Feature 4: faithful passthrough of a planet's raw per-region/city array.
+ * Maps ONLY the fields upstream actually carries (verified live 2026-06-17) —
+ * no derived liberation-contribution math (that is not a deterministic
+ * transform of fields we hold, so it stays in conversation). `regions_available`
+ * is false when upstream has no usable region array; `has_city_region` keys off
+ * upstream's own `size === "City"` classification, never a biome inference. The
+ * literal string "null" some descriptions carry is coerced to null.
+ */
+export function selectRegions(
+  regions: RawPlanet["regions"],
+): {
+  regions: RegionInfo[];
+  regions_available: boolean;
+  has_city_region: boolean;
+} {
+  if (!Array.isArray(regions) || regions.length === 0) {
+    return { regions: [], regions_available: false, has_city_region: false };
+  }
+  const mapped = regions.map((r): RegionInfo => {
+    const description =
+      typeof r.description === "string" && r.description !== "null"
+        ? r.description
+        : null;
+    return {
+      id: finiteOrNull(r.id),
+      name: typeof r.name === "string" ? r.name : null,
+      description,
+      health: finiteOrNull(r.health),
+      max_health: finiteOrNull(r.maxHealth),
+      size: typeof r.size === "string" ? r.size : null,
+      regen_per_second: finiteOrNull(r.regenPerSecond),
+      availability_factor: finiteOrNull(r.availabilityFactor),
+      is_available: typeof r.isAvailable === "boolean" ? r.isAvailable : null,
+      players: finiteOrNull(r.players),
+    };
+  });
+  return {
+    regions: mapped,
+    regions_available: true,
+    has_city_region: mapped.some((r) => r.size === "City"),
   };
 }
 
@@ -1164,6 +1497,26 @@ export const LIBERATION_PCT_NOTE =
  * deterministic comparisons they are — never a success/failure prediction. */
 export const DEFENSE_WINDOW_NOTE =
   "Defense campaigns only. projected_hp_at_defense_end = raw_hp − hp_per_hour × defense_hours_remaining: a linear extrapolation of the current signed rate to the defense deadline (≤ 0 means the extrapolation reaches the win state inside the window; unclamped so the arithmetic is verifiable). resolution_within_defense_window = hours_to_resolution ≤ defense_hours_remaining: a deterministic comparison of two fields already in this payload — it co-locates the timing gap, it does NOT predict success or failure. Both null when no rate exists; the boolean is also null on a stalemate (no resolution projection to compare).";
+
+/** Feature 1: inbound adjacency + the supply-graph view, documented inline. */
+export const INBOUND_NEIGHBORS_NOTE =
+  "inbound_neighbors inverts observed upstream waypoints: every planet whose own waypoints array names THIS planet, joined the same way as neighbors (outbound). Pure edge inversion over one consistent snapshot — never symmetrized or rerouted. adjacency_summary counts the combined inbound ∪ outbound sets; super_earth_neighbors lists adjacent Human-owned planet indices and borders_super_earth is true when any exists — an adjacency fact like frontline, NOT a 'can be liberated' claim (campaign-launch eligibility is a game rule this server does not model).";
+
+/** Feature 2: the defense gambit origin, documented inline. */
+export const GAMBIT_ORIGIN_NOTE =
+  "Defense campaigns only. gambit_origin (or gambit_origins, when several attacks target this planet) is the planet whose attack targets this defense — resolved by inverting the observed source→target attack pairs (a planet's outbound `attacking` array). It surfaces the origin's raw state plus is_major_order_target (a pure membership join, not a priority score). There is deliberately NO gambit_viable / timing verdict: whether clearing the origin in time is feasible is the consumer's call. gambit_origin null with a reason means no attack origin could be resolved from raw.";
+
+/** Feature 3: the per-player effective rates, documented inline. */
+export const PER_PLAYER_RATES_NOTE =
+  "All consume the single signed hp_per_hour (never recomputed). net_hp_per_hour_per_1k_players = hp_per_hour / (player_count / 1000). gross_depletion_per_hour = hp_per_hour + decay_per_hour = the raw player depletion before regen — LIBERATION campaigns only (invariant 1 force-nulls defense decay, so gross is uncomputable on a defense → null with reason defense_decay_nulled_invariant_1). gross_depletion_per_1k_players is that per 1k players. Zero/unknown players → per-player fields null with reason no_players (never a divide-by-zero). Low player counts are reported as-is (noisy), never smoothed.";
+
+/** Feature 4: the per-region/city passthrough, documented inline. */
+export const REGIONS_NOTE =
+  "regions is a faithful passthrough of upstream's per-region/city sub-objective array (health, size, players, availability, …) — present when regions_available is true. has_city_region keys off upstream's own size === 'City' classification, never a biome inference. No derived 'capturing this region yields X% liberation' contribution is computed — that is not a deterministic transform of fields held here, so it stays in conversation.";
+
+/** Feature 1: supply-graph semantics + the split provenance signal. */
+export const SUPPLY_GRAPH_NOTE =
+  "Observed supply edges over the planet snapshot: nodes are planets, edges are a planet's own waypoints (observed: true) — implied reverse edges are never synthesized. Default (no args) is the active-campaign subgraph (every active-campaign planet plus its one-hop inbound+outbound neighbors); full: true returns the whole galaxy. borders_super_earth on each node is the same adjacency fact get_planet carries. Read-only: this tool records nothing. stale: true is a ROLLUP meaning one or more inputs were degraded — see `provenance` for the specific source(s): planet_source ('live' | 'snapshot') governs topology; campaigns ('ok' | 'stale' | 'unavailable') governs the campaign overlay and the active-only selection. active_campaign_overlay states the overlay's trust ('complete' | 'degraded' | 'unavailable'); when 'unavailable' (campaign outage) nodes carry campaign_state_known:false with has_active_campaign:null — an empty active subgraph then means UNKNOWN, never 'no active campaigns'. Topology stays complete under a campaign outage; only the annotations and the active-only selection degrade.";
 
 /** Stage 7, Part D: the Major Order objective decode, documented inline. */
 export const MO_OBJECTIVE_DECODE_NOTE =

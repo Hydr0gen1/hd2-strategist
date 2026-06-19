@@ -1,5 +1,5 @@
 /**
- * The seventeen MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The eighteen MCP tools. Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
@@ -16,30 +16,40 @@ import {
   sinceCutoffMs,
 } from "./archive";
 import {
+  cacheBulkPlanets,
+  commitSampleTick,
   fetchUpstream,
+  prepareSampleTick,
+  readBulkPlanetsSnapshot,
   readGlobalSamples,
   readMoSeries,
   readObservedSignatures,
   readPlanetSamples,
   samplePlanetRates,
   SAMPLES_KEY_TTL_SECONDS,
+  UpstreamError,
+  type PreparedSampleTick,
   type SampleInput,
 } from "./client";
 import {
   aggregateFrontRate,
   buildActiveEvents,
+  buildAdjacencySummary,
   buildDefenseEtaBlock,
   buildEtaBlock,
   buildFactionRollup,
+  buildGambitOrigins,
   buildGlobalArchivePoints,
   buildGlobalHistoryPoints,
   buildHistoryPoints,
+  buildInboundNeighbors,
   buildMajorOrderTargets,
   buildMoArchiveSeries,
   buildMoHistorySeries,
   buildNeighbors,
   buildPlanetArchivePoints,
   buildSectorRollup,
+  buildSupplyGraph,
   decayPerHour,
   decodeEventModifier,
   DEFENSE_ETA_NOTE,
@@ -51,16 +61,22 @@ import {
   filterCampaigns,
   freshnessFrom,
   FRESHNESS_NOTE,
+  GAMBIT_ORIGIN_NOTE,
   historyRateAggregates,
   hpRemainingToObjective,
+  INBOUND_NEIGHBORS_NOTE,
   LIBERATION_PCT_NOTE,
   MO_OBJECTIVE_DECODE_NOTE,
   moIntervalRates,
   moPlanetAssignmentMap,
   moProgressObservations,
   perIntervalRates,
+  PER_PLAYER_RATES_NOTE,
+  perPlayerRates,
   RATE_SIGN_NOTE,
+  REGIONS_NOTE,
   resolvePlanetName,
+  selectRegions,
   seriesSpanHours,
   selectBiome,
   selectHazards,
@@ -69,9 +85,20 @@ import {
   shapeMajorOrders,
   shapeObservedSignatures,
   shapePatchNotes,
+  SUPPLY_GRAPH_NOTE,
   WIN_CONDITION_NOTE,
   winCondition,
 } from "./enrichment";
+import {
+  allFresh,
+  anyDegraded,
+  campaignView,
+  planetProvenanceOf,
+  provenanceReasons,
+  type CampaignProvenance,
+  type CampaignView,
+  type PlanetProvenance,
+} from "./provenance";
 import {
   buildCrossCheckBlock,
   CROSS_CHECK_NOTE,
@@ -235,9 +262,63 @@ async function tryFetchRaw<T>(
   }
 }
 
+/**
+ * Feature 5: fetch the full planets list with the warm-cache fallback. On a
+ * genuine network fetch (not a plain cache hit) the durable bulk snapshot is
+ * refreshed; if the live fetch cannot complete AND the short raw: cache has
+ * already evaporated (fetchUpstream throws), the most recent bulk snapshot is
+ * served with stale: true instead of hard-failing. Used by get_planet and
+ * get_supply_graph (and get_war_status, to keep the snapshot warm). The
+ * snapshot feeds adjacency/ownership/HP context only — never the history path.
+ */
+async function fetchPlanetsWithFallback(env: Env): Promise<{
+  planets: RawPlanet[];
+  fetchedAt: number;
+  /** The ONE planet-provenance enum downstream reads — never `source`/`stale`.
+   * Distinguishes a fresh fetch from an expired raw cache (both upstream-served)
+   * from the durable snapshot fallback. */
+  planet_provenance: PlanetProvenance;
+}> {
+  try {
+    const res = await fetchUpstream<RawPlanet[]>(env, "/api/v1/planets");
+    const planets = Array.isArray(res.data) ? res.data : [];
+    // Refresh the durable snapshot ONLY on a real upstream fetch — never on a
+    // cache hit (that would add a KV write to the hot path) and never on a
+    // stale fallback (it carries the older fetchedAt already).
+    if (!res.cached && !res.stale && Array.isArray(res.data)) {
+      await cacheBulkPlanets(env, planets, res.fetchedAt);
+    }
+    return {
+      planets,
+      fetchedAt: res.fetchedAt,
+      planet_provenance: planetProvenanceOf("live", res.stale),
+    };
+  } catch (err) {
+    if (err instanceof UpstreamError) {
+      const snapshot = await readBulkPlanetsSnapshot<RawPlanet[]>(env);
+      if (snapshot && Array.isArray(snapshot.data)) {
+        return {
+          planets: snapshot.data,
+          fetchedAt: snapshot.fetchedAt,
+          planet_provenance: planetProvenanceOf("snapshot", true),
+        };
+      }
+    }
+    throw err;
+  }
+}
+
 interface CampaignBundle {
   campaigns: EnrichedCampaign[];
-  stale: boolean;
+  /** The ONE campaign-provenance enum (single source of truth): 'ok' = fresh
+   * live; 'stale' = last-known cache; 'unavailable' = resilient-empty / fetch
+   * failed (state UNKNOWN, never "no active campaigns"). The freshness gate and
+   * the staleness rollup derive from this via the shared predicates — no
+   * separate ok/stale booleans to drift. */
+  campaign_provenance: CampaignProvenance;
+  /** The tri-state campaign accessor over this bundle — annotation builders
+   * consume it so an absent entry is never silently `false`. */
+  view: CampaignView;
   /** Raw assignments from the same fetch the MO planet map used — exposed so
    * the war brief can reuse the MO shaping without a second fetch. */
   assignments: RawAssignment[];
@@ -248,8 +329,21 @@ interface CampaignBundle {
    * existing parallel fetch so its global statistics reach the single
    * sample-store write without a second round-trip. */
   war?: { data: RawWar; stale: boolean };
+  /** P1: the COMPUTED-BUT-UNWRITTEN sample tick. The loader is side-effect-free
+   * — it persists nothing. The handler commits this via commitSampleTick ONLY
+   * after all input provenance is known and the all-inputs-live gate passes.
+   * Absent when there were no campaign inputs to sample. */
+  pendingTick?: PreparedSampleTick;
 }
 
+/**
+ * P1: SIDE-EFFECT-FREE campaign loader. Fetches + normalizes and computes the
+ * sample tick READ-ONLY (one KV read, zero writes); the unwritten tick rides
+ * back in `bundle.pendingTick`. The handler decides — after all input
+ * provenance is known — whether to commit it (commitCampaignTick). No loader
+ * writes, so persistence is order-independent and can never leak a snapshot/
+ * resilient-empty observation into the record.
+ */
 async function loadNormalizedCampaigns(
   env: Env,
   opts: { withWar?: boolean } = {},
@@ -268,7 +362,23 @@ async function loadNormalizedCampaigns(
   const moPlanetIndices = new Set(moMap.keys());
   const nowMs = Date.now();
 
-  const samples = await samplePlanetRates(
+  // Campaign provenance: a complete live fetch vs a stale-fallback copy. A
+  // successful fetch (even an empty live list) is 'ok' / 'stale'; the
+  // resilient-empty 'unavailable' case is set by loadCampaignsResilient's catch.
+  const liveFetch =
+    !campaignsRes.stale &&
+    !assignmentsRes.stale &&
+    (warRes ? !warRes.stale : true);
+  const campaign_provenance: CampaignProvenance = liveFetch ? "ok" : "stale";
+  // The tri-state accessor over THIS bundle — the single way every annotation
+  // builder reads campaign/MO membership (absence is never silently `false`).
+  const view = campaignView(
+    new Map(raw.map((c) => [c.planet.index, campaignKind(c)])),
+    moPlanetIndices,
+    campaign_provenance,
+  );
+
+  const prepared = await prepareSampleTick(
     env,
     raw.map(
       (c): SampleInput => ({
@@ -300,6 +410,7 @@ async function loadNormalizedCampaigns(
       moProgress: moProgressObservations(assignmentsRes.data ?? []),
     },
   );
+  const samples = prepared.results;
 
   const campaigns = raw.map((c): EnrichedCampaign => {
     const sample = samples.get(c.planet.index);
@@ -344,9 +455,9 @@ async function loadNormalizedCampaigns(
             hoursToResolution: normalized.hours_to_resolution,
           })
         : {}),
-      // Stage 5: pure join against the MO task planet set — the same map
-      // invariant 5 consumes; membership fact, not a priority score.
-      is_major_order_target: moMap.has(c.planet.index),
+      // Stage 5: MO membership via the SAME tri-state accessor the nested
+      // annotations use (here the load is live/known, so it resolves boolean).
+      is_major_order_target: view.moMembership(c.planet.index) === true,
       major_order_id: moMap.get(c.planet.index) ?? null,
       // Stage 9: dual ETAs (instantaneous + historical) + divergence, from
       // the SAME signed rate and the SAME retained sample series the single
@@ -358,15 +469,38 @@ async function loadNormalizedCampaigns(
 
   return {
     campaigns,
-    stale: campaignsRes.stale || assignmentsRes.stale,
+    campaign_provenance,
+    view,
     assignments: assignmentsRes.data ?? [],
     fetchedAts: [
       campaignsRes.fetchedAt,
       assignmentsRes.fetchedAt,
       ...(warRes ? [warRes.fetchedAt] : []),
     ],
+    // The computed-but-unwritten tick — the handler commits it only when ALL
+    // inputs are live. Always present (it also carries the global-stats /
+    // signature / MO accumulation layers, which advance even when the campaign
+    // list is empty); the eligibility gate, not its presence, governs the write.
+    pendingTick: prepared,
     ...(warRes ? { war: { data: warRes.data, stale: warRes.stale } } : {}),
   };
+}
+
+/**
+ * P1: the terminal gated persistence step. Commit the loader's computed-but-
+ * unwritten sample tick ONLY when `eligible` — i.e. after the handler has
+ * resolved ALL input provenance and confirmed every input is perfectly fresh
+ * (the shared allFresh predicate). A loader never calls this; the write happens
+ * here, once, order-independently.
+ */
+async function commitCampaignTick(
+  env: Env,
+  bundle: CampaignBundle,
+  eligible: boolean,
+): Promise<void> {
+  if (eligible && bundle.pendingTick) {
+    await commitSampleTick(env, bundle.pendingTick);
+  }
 }
 
 /**
@@ -375,15 +509,18 @@ async function loadNormalizedCampaigns(
  * EXACTLY the request path's poll — loadNormalizedCampaigns with the war
  * fetch joined: the same cache/fetch logic, the same 60s minimum sample
  * interval, and the same single merged sample-store write (planet series +
- * signatures + global statistics) inside samplePlanetRates. The cron path
- * cannot drift from the request path because it IS the request path's
- * loader — never a forked sampler. Best-effort by design: no user is
- * watching a cron tick, so an upstream failure is logged and swallowed and
- * the next tick retries.
+ * signatures + global statistics). P1: the loader is side-effect-free; the
+ * cron path performs the terminal gated commit itself (cron fetches no planet
+ * list, so its gate is campaign provenance alone — a stale/resilient-empty
+ * campaign fetch records nothing). Best-effort by design: an upstream failure
+ * is logged and swallowed and the next tick retries.
  */
 export async function runScheduledSample(env: Env): Promise<void> {
   try {
-    await loadNormalizedCampaigns(env, { withWar: true });
+    const bundle = await loadNormalizedCampaigns(env, { withWar: true });
+    // No planet-list input on the cron path → gate on campaign provenance only
+    // (a complete live campaign fetch). Same as allFresh with no planet input.
+    await commitCampaignTick(env, bundle, bundle.campaign_provenance === "ok");
   } catch (err) {
     console.warn(
       `scheduled sample skipped: ${err instanceof Error ? err.message : String(err)}`,
@@ -395,12 +532,23 @@ export async function getWarStatus(env: Env): Promise<unknown> {
   // Stage 5: the war fetch rides inside loadNormalizedCampaigns (withWar) so
   // its global statistics reach the single sample-store write; the planets
   // list (already KV-cached, used by get_planet) feeds the rollups.
-  const [planetsRes, bundle] = await Promise.all([
-    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
+  const [planetsResult, bundle] = await Promise.all([
+    // Feature 5: keep the durable bulk snapshot warm on the most-frequent
+    // planets-fetching tool (refresh on a real fetch, fallback on outage).
+    fetchPlanetsWithFallback(env),
     loadNormalizedCampaigns(env, { withWar: true }),
   ]);
   const war = bundle.war!.data;
-  const planets = planetsRes.data ?? [];
+  const planets = planetsResult.planets;
+
+  // P1: single terminal gated commit — only when ALL inputs are perfectly
+  // fresh (allFresh). A snapshot/expired-cache planet list or a stale/
+  // unavailable campaign fetch records nothing.
+  await commitCampaignTick(
+    env,
+    bundle,
+    allFresh(planetsResult.planet_provenance, bundle.campaign_provenance),
+  );
 
   const byFaction = new Map<string, EnrichedCampaign[]>();
   for (const c of bundle.campaigns) {
@@ -467,10 +615,14 @@ export async function getWarStatus(env: Env): Promise<unknown> {
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom(
-      [planetsRes.fetchedAt, ...bundle.fetchedAts],
+      [planetsResult.fetchedAt, ...bundle.fetchedAts],
       Date.now(),
     ),
-    ...(planetsRes.stale || bundle.war!.stale || bundle.stale
+    // Top-level rollup: any input degraded (the shared anyDegraded predicate;
+    // campaign provenance already folds in war-fetch staleness). The sample
+    // RECORD is gated separately on allFresh, so a stale DISPLAY never means
+    // degraded data was recorded.
+    ...(anyDegraded(planetsResult.planet_provenance, bundle.campaign_provenance)
       ? { stale: true }
       : {}),
   };
@@ -481,6 +633,9 @@ export async function getCampaigns(
   filters: CampaignFilters = {},
 ): Promise<unknown> {
   const bundle = await loadNormalizedCampaigns(env);
+  // P1: terminal gated commit. No planet-list input here → gate on campaign
+  // provenance alone (a stale campaign fetch records nothing).
+  await commitCampaignTick(env, bundle, bundle.campaign_provenance === "ok");
   // Stage 6, Part B: filtering runs AFTER normalization — every invariant
   // already ran over the full list; filters only narrow what is returned.
   const filtered = filterCampaigns(bundle.campaigns, filters);
@@ -521,7 +676,8 @@ export async function getCampaigns(
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom(bundle.fetchedAts, Date.now()),
-    ...(bundle.stale ? { stale: true } : {}),
+    // No planet input → rollup is campaign provenance alone.
+    ...(bundle.campaign_provenance !== "ok" ? { stale: true } : {}),
   };
 }
 
@@ -659,14 +815,26 @@ export async function getPlanet(
 ): Promise<unknown> {
   assertPlanetArgs(args);
 
-  const [planetsRes, bundle, rawStatus] = await Promise.all([
-    fetchUpstream<RawPlanet[]>(env, "/api/v1/planets"),
-    loadNormalizedCampaigns(env),
+  const [planetsResult, bundle, rawStatus] = await Promise.all([
+    // Feature 5: planets via the warm-cache fallback — a live-fetch failure
+    // degrades to the most recent bulk snapshot (stale: true), never an error.
+    fetchPlanetsWithFallback(env),
+    // Feature 5: the campaign bundle degrades to empty if its own fetches
+    // fail, so adjacency/ownership/region context still resolves from the
+    // planet snapshot rather than hard-failing the whole lookup.
+    loadCampaignsResilient(env),
     // Stage 10: the raw ArrowHead status rides the same client/cache path;
     // a /raw failure degrades the cross_check block, never this response.
     tryFetchRaw<RawWarStatus>(env, RAW_STATUS_PATH),
   ]);
-  const planets = planetsRes.data ?? [];
+  const planets = planetsResult.planets;
+  // Feature 1/2: one snapshot index, shared by the outbound/inbound neighbor
+  // joins and the gambit inversion. The tri-state campaign accessor (bundle.view)
+  // is the ONLY way these builders read campaign/MO membership — never a raw map.
+  const planetByIndex = new Map<number, RawPlanet>(
+    planets.map((p) => [p.index, p]),
+  );
+  const view = bundle.view;
 
   const planet = resolvePlanet(
     planets,
@@ -681,13 +849,30 @@ export async function getPlanet(
     (c) => c.planet_index === planet!.index,
   );
 
+  // Provenance. `campaignStateKnown` = campaign state is not UNKNOWN; when
+  // unknown (outage) it is never "quiet". `live` (= allFresh) is the SINGLE
+  // predicate that governs BOTH the write gate and the response `stale` flag.
+  const campaignStateKnown = view.known;
+  const live = allFresh(
+    planetsResult.planet_provenance,
+    bundle.campaign_provenance,
+  );
+
+  // P1: terminal gated commit of the campaign batch — runs AFTER both inputs'
+  // provenance is known. A snapshot-backed get_planet (planetsLive false) now
+  // writes NOTHING even when campaigns are fresh: the loader recorded nothing,
+  // and this gate suppresses the commit. The quiet-probe write below shares the
+  // same `live` gate, so the whole response is read-only unless fully live.
+  await commitCampaignTick(env, bundle, live);
+
   let normalized: NormalizedCampaign;
   let probeSamples: HealthSample[] = [];
   if (active) {
     normalized = active;
-  } else {
-    // No active campaign: normalize a synthetic record so invariants
-    // (defense decay nulling, display-only %, projection guards) still apply.
+  } else if (campaignStateKnown) {
+    // Campaign state is KNOWN and this planet has no active campaign — a
+    // genuine quiet planet. Probe its health, but PERSIST only on a fully-live
+    // observation (P1): a snapshot/stale planet is served, never recorded.
     const nowMs = Date.now();
     const samples = await samplePlanetRates(
       env,
@@ -709,8 +894,9 @@ export async function getPlanet(
       ],
       nowMs,
       // Single-planet probe: carry the rest of the store forward so one
-      // lookup doesn't wipe other planets' series / campaign ages.
-      { carryForward: true },
+      // lookup doesn't wipe other planets' series / campaign ages. P1: write
+      // nothing unless the probed planet data is a complete live fetch.
+      { carryForward: true, persist: live },
     );
     const sample = samples.get(planet.index);
     probeSamples = sample?.samples ?? [];
@@ -718,6 +904,24 @@ export async function getPlanet(
       { id: -1, planet, type: 0, count: 0, faction: planet.currentOwner },
       {
         hpPerHour: sample?.hpPerHour ?? null,
+        campaignAgeMs: defenseAgeMs(planet, nowMs),
+        hpcTypes: HPC_CAMPAIGN_TYPES,
+        moPlanetIndices: new Set(),
+      },
+    );
+  } else {
+    // Campaign state UNKNOWN (outage / resilient-empty). Unknown ≠ quiet: do
+    // NOT enter the sampling branch (it would both misclassify AND contaminate
+    // the store). Serve READ-ONLY from last-known samples — zero writes.
+    const nowMs = Date.now();
+    probeSamples = await readPlanetSamples(env, planet.index);
+    const knownRates = perIntervalRates(probeSamples);
+    const lastKnownRate =
+      knownRates.length > 0 ? knownRates[knownRates.length - 1]! : null;
+    normalized = normalizeCampaign(
+      { id: -1, planet, type: 0, count: 0, faction: planet.currentOwner },
+      {
+        hpPerHour: lastKnownRate,
         campaignAgeMs: defenseAgeMs(planet, nowMs),
         hpcTypes: HPC_CAMPAIGN_TYPES,
         moPlanetIndices: new Set(),
@@ -753,7 +957,7 @@ export async function getPlanet(
   const cross_check = rawStatus.ok
     ? buildCrossCheckBlock(crossCheckMeta, rawStatus.data, {
         normalizedFetchedAtMs: Math.min(
-          planetsRes.fetchedAt,
+          planetsResult.fetchedAt,
           ...bundle.fetchedAts,
         ),
         rawFetchedAtMs: rawStatus.fetchedAt,
@@ -761,14 +965,87 @@ export async function getPlanet(
       })
     : unavailableCrossCheck("raw_unavailable", rawStatus.detail);
 
+  // Feature 1: outbound (existing) + inbound (inverted) adjacency over the same
+  // snapshot, plus the combined summary with the borders_super_earth fact.
+  const adjacency = buildNeighbors(planet, planetByIndex, view);
+  const inbound_neighbors = buildInboundNeighbors(planet, planetByIndex, view);
+  const adjacency_summary = buildAdjacencySummary(
+    adjacency.neighbors,
+    inbound_neighbors,
+  );
+
+  // Feature 2: defense gambit origin(s) — the planet(s) attacking this defense,
+  // from the inverted source→target pairs. Raw state + tri-state MO membership
+  // (null, never false, when campaign state is unknown).
+  const gambitFields: Record<string, unknown> = {};
+  if (planet.event) {
+    const origins = buildGambitOrigins(planet, planetByIndex, view);
+    if (origins.length === 0) {
+      gambitFields.gambit_origin = null;
+      gambitFields.gambit_origin_reason = "no_attack_origin_in_raw";
+    } else if (origins.length === 1) {
+      gambitFields.gambit_origin = origins[0];
+    } else {
+      gambitFields.gambit_origins = origins;
+    }
+  }
+
+  // Feature 3: per-player effective rates, consuming the SAME signed
+  // hp_per_hour and the invariant-1 normalized decay (defense decay stays null).
+  const per_player_rates = perPlayerRates({
+    hpPerHour: normalized.hp_per_hour,
+    decayPerHour: decayPerHour(normalized.regen_per_second),
+    campaignKind: normalized.campaign_kind,
+    playerCount: planet.statistics?.playerCount ?? null,
+  });
+
+  // Feature 4: faithful per-region/city passthrough (isolated — a schema
+  // surprise here cannot affect features 1–3 above).
+  const regionInfo = selectRegions(planet.regions);
+
+  // Campaign-derived CLASSIFICATION fields come from the synthetic `normalized`
+  // record, which DEFAULTS a kind/trajectory even when the campaign overlay is
+  // unavailable (a non-event planet defaults to 'liberation'). When campaign
+  // state is UNKNOWN, null them ALL uniformly at this single locus — so nothing
+  // can assert a kind/direction/HPC the sibling has_active_campaign:null /
+  // campaign_state_known:false already disclaim, and a future field added here
+  // is gated in one place (no sibling leak). Planet-state facts (HP, regen,
+  // lib%, projection math) are NOT campaign-derived and ride through unchanged.
+  const campaignDerived = campaignStateKnown
+    ? {
+        campaign_kind: normalized.campaign_kind,
+        win_condition: winCondition(normalized.campaign_kind),
+        direction: normalized.direction,
+        alert: normalized.alert,
+        stabilizing: normalized.stabilizing,
+        hpc: normalized.hpc,
+        ...(normalized.hpc_note ? { hpc_note: normalized.hpc_note } : {}),
+      }
+    : {
+        campaign_kind: null,
+        win_condition: null,
+        direction: null,
+        alert: null,
+        stabilizing: null,
+        hpc: null,
+      };
+
   return {
     planet_index: planet.index,
     planet_name: planet.name,
     sector: planet.sector,
     current_owner: planet.currentOwner,
     initial_owner: planet.initialOwner,
-    has_active_campaign: Boolean(active),
-    campaign_kind: normalized.campaign_kind,
+    // Output honesty via the tri-state accessor: when campaign state is UNKNOWN
+    // (outage) has_active_campaign is null (never false), campaign_state_known
+    // is false. The accessor is the SAME one the nested neighbor/gambit
+    // annotations consume, so the planet and its neighbors can never disagree.
+    has_active_campaign: view.hasActiveCampaign(planet.index),
+    campaign_state_known: campaignStateKnown,
+    // Campaign-derived classification (campaign_kind / win_condition /
+    // direction / alert / stabilizing / hpc[/ _note]) — all null when campaign
+    // state is unknown (see campaignDerived above).
+    ...campaignDerived,
     raw_hp: normalized.raw_hp,
     max_hp: normalized.max_hp,
     hp_per_hour: normalized.hp_per_hour,
@@ -777,17 +1054,11 @@ export async function getPlanet(
     // defense planet can never re-expose its cosmetic decay here.
     decay_per_hour: decayPerHour(normalized.regen_per_second),
     liberation_pct_display_only: normalized.liberation_pct_display_only,
-    // Stage 7, Part A: objective-relative framing — win-state target plus
-    // the always-positive distance to it (smaller = closer, both kinds).
-    win_condition: winCondition(normalized.campaign_kind),
+    // Stage 7, Part A: objective-relative distance to the win state (a
+    // planet-HP fact, smaller = closer); orientation rides win_condition above.
     hp_remaining_to_objective: hpRemainingToObjective(normalized.raw_hp),
     hours_to_resolution: normalized.hours_to_resolution,
     projection_status: normalized.status,
-    direction: normalized.direction,
-    alert: normalized.alert,
-    stabilizing: normalized.stabilizing,
-    hpc: normalized.hpc,
-    ...(normalized.hpc_note ? { hpc_note: normalized.hpc_note } : {}),
     ...(normalized.data_quality
       ? { data_quality: normalized.data_quality }
       : {}),
@@ -800,6 +1071,9 @@ export async function getPlanet(
           attacker: planet.event.faction,
           start_time: planet.event.startTime,
           end_time: planet.event.endTime,
+          // Feature 2: the attack origin(s) the consumer can clear to end the
+          // defense — raw state only, never a viability/timing verdict.
+          ...gambitFields,
         }
       : null,
     ...(timing ?? {}),
@@ -817,19 +1091,23 @@ export async function getPlanet(
     // deadline on a defense) — projections under stated assumptions only.
     eta,
     player_count: planet.statistics?.playerCount ?? null,
+    // Feature 3: per-player effective rates beside the gross hp_per_hour.
+    per_player_rates,
     statistics: selectPlanetStatistics(planet.statistics),
     biome: selectBiome(planet.biome),
     hazards: selectHazards(planet.hazards),
+    // Feature 4: per-region/city sub-objectives (regions / regions_available /
+    // has_city_region) — faithful passthrough, no derived contribution math.
+    ...regionInfo,
     // Stage 5: waypoint neighbors joined against data already in hand — the
     // full planets list and the active campaign set. Adds neighbors,
     // neighbor_summary, frontline.
-    ...buildNeighbors(
-      planet,
-      new Map(planets.map((p) => [p.index, p])),
-      new Map(
-        bundle.campaigns.map((c) => [c.planet_index, c.campaign_kind]),
-      ),
-    ),
+    ...adjacency,
+    // Feature 1: the inverted (inbound) waypoint set + the combined adjacency
+    // summary with the borders_super_earth fact. Existing `neighbors`
+    // (outbound) is unchanged.
+    inbound_neighbors,
+    adjacency_summary,
     // Stage 10: normalized-vs-raw verification block — surfaced
     // disagreement is data; no side is ever picked or averaged.
     cross_check,
@@ -842,17 +1120,197 @@ export async function getPlanet(
       defense_window: DEFENSE_WINDOW_NOTE,
       eta: ETA_NOTE,
       defense_eta: DEFENSE_ETA_NOTE,
+      ...(campaignStateKnown
+        ? {}
+        : {
+            campaign_state_known:
+              "Campaign/assignment data could not be fetched this request (outage), so campaign state is UNKNOWN — has_active_campaign is null (never asserted false), campaign_kind/eta reflect last-known or synthetic state, and NOTHING was recorded to the history store. stale: true. Retry when upstream recovers.",
+          }),
       neighbors:
         "Upstream's own waypoints array for this planet, in upstream order — joined by index against the full planets list and the active campaign set, never symmetrized or rerouted (direction semantics are upstream's). A dangling index still counts in neighbor_summary.total with name/owner null, tallied under by_owner.unknown.",
       frontline:
         "Deterministic adjacency fact: true iff at least one neighbor has a known owner different from this planet's current_owner — 'borders territory of a different owner', nothing more. Not a strategic judgment; neighbors with unknown owners never set it.",
+      inbound_neighbors: INBOUND_NEIGHBORS_NOTE,
+      ...(planet.event ? { gambit_origin: GAMBIT_ORIGIN_NOTE } : {}),
+      per_player_rates: PER_PLAYER_RATES_NOTE,
+      regions: REGIONS_NOTE,
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom(
-      [planetsRes.fetchedAt, ...bundle.fetchedAts],
+      [planetsResult.fetchedAt, ...bundle.fetchedAts],
       Date.now(),
     ),
-    ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
+    // P1 predicate unity: `stale: true` is exactly `!live` — the SAME condition
+    // that gated the quiet-probe write above. A stale response recorded
+    // nothing; a response that recorded was not stale.
+    ...(!live ? { stale: true } : {}),
+  };
+}
+
+/**
+ * Feature 5 + P1: load the normalized campaign bundle, degrading to a
+ * resilient-empty bundle (`campaign_provenance: 'unavailable'`) when its own
+ * upstream fetches cannot complete. This lets get_planet still answer
+ * adjacency/ownership/region questions from the planet snapshot during an
+ * outage instead of hard-failing. 'unavailable' means campaign state is UNKNOWN
+ * (not "no active campaigns"): the tri-state view returns 'unknown' for every
+ * planet, so callers neither persist against it nor emit has_active_campaign as
+ * a fact.
+ */
+async function loadCampaignsResilient(env: Env): Promise<CampaignBundle> {
+  try {
+    return await loadNormalizedCampaigns(env);
+  } catch {
+    return {
+      campaigns: [],
+      campaign_provenance: "unavailable",
+      view: campaignView(new Map(), new Set(), "unavailable"),
+      assignments: [],
+      fetchedAts: [],
+    };
+  }
+}
+
+/**
+ * Feature 1: the supply-line graph tool. Default (no args) returns the
+ * active-campaign subgraph (every active-campaign planet plus its one-hop
+ * inbound+outbound neighbors); full: true returns the whole galaxy. Edges are
+ * ONLY observed waypoints (observed: true) — no implied reverse edges.
+ *
+ * READ-ONLY: this tool records nothing (the campaign load is forced
+ * persist:false), so no fallback path can ever sample. Staleness names its
+ * SOURCE via a structured `provenance` block — planet-list provenance
+ * (topology) and campaign-overlay provenance (annotations + active-only
+ * selection) are independent, so a campaign-only outage is no longer
+ * mislabeled as a planet-snapshot fallback. Topology stays complete under a
+ * campaign outage; only the annotations and the active-only selection degrade.
+ */
+export async function getSupplyGraph(
+  env: Env,
+  args: {
+    root?: number | string;
+    depth?: number;
+    active_only?: boolean;
+    full?: boolean;
+  } = {},
+): Promise<unknown> {
+  const [planetsResult, bundle] = await Promise.all([
+    fetchPlanetsWithFallback(env),
+    // Read-only: the loader is side-effect-free and this tool never commits the
+    // tick — a topology/overlay query never drives the sampling cadence.
+    loadCampaignsResilient(env),
+  ]);
+  const planets = planetsResult.planets;
+
+  // The two provenance enums — the single source of truth. Everything below
+  // (overlay, reasons, rollup, selection) derives MECHANICALLY from these; no
+  // separately-maintained booleans drift out of sync.
+  const planetProvenance = planetsResult.planet_provenance;
+  const campaigns = bundle.campaign_provenance;
+  const campaignStateKnown = campaigns !== "unavailable";
+  const overlay: "complete" | "degraded" | "unavailable" =
+    campaigns === "ok" ? "complete" : campaigns === "stale" ? "degraded" : "unavailable";
+  const campaignOutage = campaigns === "unavailable";
+
+  // Reasons derived mechanically from the two enums (provenance module).
+  const reasons = provenanceReasons(planetProvenance, campaigns);
+
+  // Resolve an optional root (index or name) — a near-miss surfaces ranked
+  // candidates, never a silent substitution (the resolve_planet discipline).
+  let rootIndex: number | null = null;
+  if (typeof args.root === "number" && Number.isFinite(args.root)) {
+    if (!planets.some((p) => p.index === args.root)) {
+      throw new ToolError(
+        `Planet not found for root index ${args.root}. Valid indices are 0–${Math.max(
+          0,
+          planets.length - 1,
+        )}, or pass a name / omit root for the active-campaign subgraph.`,
+      );
+    }
+    rootIndex = args.root;
+  } else if (typeof args.root === "string" && args.root.trim()) {
+    const resolution = resolvePlanetName(args.root, planets);
+    if (resolution.matched) {
+      rootIndex = resolution.planet!.index;
+    } else {
+      const list = resolution.candidates
+        .map((c) => `${c.name} (index ${c.index})`)
+        .join(", ");
+      throw new ToolError(
+        `Planet not found for root "${args.root}".` +
+          (list ? ` Did you mean: ${list}?` : "") +
+          " Retry with one of these names or an index, or call resolve_planet.",
+      );
+    }
+  }
+
+  const depth = Math.min(3, Math.max(1, Math.floor(args.depth ?? 1)));
+  const activeOnly = Boolean(args.active_only);
+  const full = Boolean(args.full);
+  // A default (active-campaign) selection cannot be trusted under a campaign
+  // outage — the active set is UNKNOWN, not empty. Return the full topology
+  // instead, flagged campaign_state_known:false, rather than a bare empty node
+  // set that would read as "no active campaigns". Topology is unaffected by a
+  // campaign outage; only the annotations degrade.
+  const defaultSelection = rootIndex == null && !full;
+  const effectiveFull = full || (defaultSelection && campaignOutage);
+  const graph = buildSupplyGraph(planets, bundle.view, {
+    rootIndex,
+    depth,
+    activeOnly,
+    full: effectiveFull,
+  });
+  // P2: active_only requested but skipped (campaign state unknown) — say so, so
+  // the full topology returned isn't mistaken for "filter applied, empty".
+  if (activeOnly && !graph.active_only_applied) {
+    reasons.push("active_only_filter_skipped_campaign_state_unknown");
+  }
+
+  const scope = full
+    ? "full_galaxy"
+    : rootIndex != null
+      ? "root_subgraph"
+      : campaignOutage
+        ? "active_campaign_subgraph_unknown" // topology returned, active set unknown
+        : "active_campaign_subgraph";
+
+  return {
+    scope,
+    ...(rootIndex != null ? { root_index: rootIndex } : {}),
+    depth,
+    active_only: activeOnly,
+    // P2: whether the active_only deletion actually ran (false = requested but
+    // skipped because campaign state was unknown — full topology returned).
+    active_only_applied: graph.active_only_applied,
+    full,
+    // Split provenance — staleness names its source(s). The three-state
+    // planet_provenance covers the expired-cache case (live but stale); the
+    // back-compat booleans are DERIVED from the enums, never stored separately.
+    provenance: {
+      planet_provenance: planetProvenance,
+      planet_stale: planetProvenance !== "live_fresh",
+      planet_source:
+        planetProvenance === "snapshot_fallback" ? "snapshot" : "live",
+      planet_snapshot_used: planetProvenance === "snapshot_fallback",
+      campaigns,
+      campaign_outage: campaignOutage,
+      reasons,
+    },
+    // The active-overlay consequence stated explicitly.
+    active_campaign_overlay: overlay,
+    node_count: graph.nodes.length,
+    edge_count: graph.edges.length,
+    nodes: graph.nodes,
+    edges: graph.edges,
+    notes: {
+      supply_graph: SUPPLY_GRAPH_NOTE,
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshnessFrom([planetsResult.fetchedAt, ...bundle.fetchedAts], Date.now()),
+    // Top-level `stale` is the shared anyDegraded rollup (back-compat): true
+    // when ANY input was not perfectly fresh. `provenance` names which. The tool
+    // records nothing on any path, so this never implies degraded persistence.
+    ...(anyDegraded(planetProvenance, campaigns) ? { stale: true } : {}),
   };
 }
 
@@ -1193,6 +1651,16 @@ export async function getWarBrief(env: Env): Promise<unknown> {
   const war = bundle.war!.data;
   const planets = planetsRes.data ?? [];
   const nowMs = Date.now();
+  // getWarBrief reads planets via the plain cache (never the durable snapshot),
+  // so its planet provenance is live_fresh or live_expired_cache.
+  const planetProvenance = planetProvenanceOf("live", planetsRes.stale);
+
+  // P1: single terminal gated commit — every input perfectly fresh (allFresh).
+  await commitCampaignTick(
+    env,
+    bundle,
+    allFresh(planetProvenance, bundle.campaign_provenance),
+  );
 
   const orders = shapeMajorOrders(bundle.assignments, nowMs);
   const moMap = moPlanetAssignmentMap(bundle.assignments);
@@ -1245,7 +1713,10 @@ export async function getWarBrief(env: Env): Promise<unknown> {
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom([planetsRes.fetchedAt, ...bundle.fetchedAts], nowMs),
-    ...(planetsRes.stale || bundle.war!.stale || bundle.stale
+    // Top-level rollup: any input degraded (shared anyDegraded; campaign
+    // provenance folds in war-fetch staleness). The RECORD is gated separately
+    // on allFresh, so a stale brief never means degraded data was recorded.
+    ...(anyDegraded(planetProvenance, bundle.campaign_provenance)
       ? { stale: true }
       : {}),
   };
@@ -1301,6 +1772,15 @@ export async function getSourceCrossCheck(env: Env): Promise<unknown> {
     tryFetchRaw<RawWarStatus>(env, RAW_STATUS_PATH),
     tryFetchRaw<RawWarStatusAssignment[]>(env, RAW_ASSIGNMENT_PATH),
   ]);
+  // P1: terminal gated commit — all inputs perfectly fresh (allFresh).
+  await commitCampaignTick(
+    env,
+    bundle,
+    allFresh(
+      planetProvenanceOf("live", planetsRes.stale),
+      bundle.campaign_provenance,
+    ),
+  );
   const planetByIndex = new Map(
     (planetsRes.data ?? []).map((p) => [p.index, p]),
   );
@@ -1416,7 +1896,13 @@ export async function getSourceCrossCheck(env: Env): Promise<unknown> {
       freshness: FRESHNESS_NOTE,
     },
     ...freshnessFrom([planetsRes.fetchedAt, ...bundle.fetchedAts], Date.now()),
-    ...(planetsRes.stale || bundle.stale ? { stale: true } : {}),
+    // Shared anyDegraded rollup over both inputs.
+    ...(anyDegraded(
+      planetProvenanceOf("live", planetsRes.stale),
+      bundle.campaign_provenance,
+    )
+      ? { stale: true }
+      : {}),
   };
 }
 

@@ -63,6 +63,11 @@ export interface UpstreamResult<T> {
    * (the cache record's stored timestamp — NOT when this request ran).
    * Stage 6 freshness metadata derives from it. */
   fetchedAt: number;
+  /** Feature 5: true when this result came from KV (a fresh-cache hit OR a
+   * stale fallback) rather than a NEW network fetch. The warm-cache snapshot is
+   * refreshed only on a genuine network fetch (cached: false), so it never adds
+   * a KV write on a plain cache hit. */
+  cached: boolean;
 }
 
 async function readCache(
@@ -92,7 +97,12 @@ export async function fetchUpstream<T>(
   const cached = await readCache(env, key);
   const now = Date.now();
   if (cached && now - cached.fetchedAt < CACHE_TTL_SECONDS * 1000) {
-    return { data: cached.body as T, stale: false, fetchedAt: cached.fetchedAt };
+    return {
+      data: cached.body as T,
+      stale: false,
+      fetchedAt: cached.fetchedAt,
+      cached: true,
+    };
   }
 
   let response: Response;
@@ -108,7 +118,12 @@ export async function fetchUpstream<T>(
     });
   } catch (err) {
     if (cached) {
-      return { data: cached.body as T, stale: true, fetchedAt: cached.fetchedAt };
+      return {
+        data: cached.body as T,
+        stale: true,
+        fetchedAt: cached.fetchedAt,
+        cached: true,
+      };
     }
     throw new UpstreamError(
       `Upstream request to ${path} failed (${err instanceof Error ? err.message : "network error"}) and no cached copy is available.`,
@@ -117,7 +132,12 @@ export async function fetchUpstream<T>(
 
   if (!response.ok) {
     if (cached) {
-      return { data: cached.body as T, stale: true, fetchedAt: cached.fetchedAt };
+      return {
+        data: cached.body as T,
+        stale: true,
+        fetchedAt: cached.fetchedAt,
+        cached: true,
+      };
     }
     const reason =
       response.status === 429
@@ -141,7 +161,68 @@ export async function fetchUpstream<T>(
       // Cache write failures must never break a successful upstream read.
     }
   }
-  return { data: body, stale: false, fetchedAt: now };
+  return { data: body, stale: false, fetchedAt: now, cached: false };
+}
+
+/* ------------------------------------------------------------------------
+ * Feature 5: warm bulk-planet snapshot.
+ *
+ * A durable, long-TTL copy of the full /api/v1/planets list, refreshed on
+ * every genuine upstream fetch of that list (never on a plain cache hit, so it
+ * adds no KV write to the hot path). It exists ONLY as a fallback: when a live
+ * planets fetch cannot complete AND the short-lived raw: cache has already
+ * evaporated, adjacency/ownership/HP context lookups (get_planet,
+ * get_supply_graph) read this snapshot instead of hard-failing.
+ *
+ * FENCE: this snapshot feeds context lookups ONLY. It MUST NOT backfill the
+ * history/global-stats archive (it is read by no sampling path), so the known
+ * 18145 / 0.07364573 global-stats sentinel can never be enshrined through it.
+ * ---------------------------------------------------------------------- */
+
+const BULK_PLANETS_KEY = "snapshot:planets";
+/** 7 days — long enough to ride out a sustained outage, short enough that a
+ * truly abandoned snapshot still evaporates. */
+export const BULK_SNAPSHOT_TTL_SECONDS = 7 * 86_400;
+
+interface BulkSnapshotEnvelope {
+  fetchedAt: number;
+  body: unknown;
+}
+
+/** Best-effort durable write of the bulk planets snapshot. Never throws — a
+ * snapshot-cache failure must never break the live response it rode in on. */
+export async function cacheBulkPlanets(
+  env: Env,
+  planets: unknown,
+  fetchedAt: number,
+): Promise<void> {
+  if (!env.WAR_CACHE) return;
+  try {
+    await env.WAR_CACHE.put(
+      BULK_PLANETS_KEY,
+      JSON.stringify({ fetchedAt, body: planets } satisfies BulkSnapshotEnvelope),
+      { expirationTtl: BULK_SNAPSHOT_TTL_SECONDS },
+    );
+  } catch {
+    // Snapshot persistence is best-effort; the next fetch retries.
+  }
+}
+
+/** Read the most recent durable bulk planets snapshot, or null when none. */
+export async function readBulkPlanetsSnapshot<T>(
+  env: Env,
+): Promise<{ data: T; fetchedAt: number } | null> {
+  if (!env.WAR_CACHE) return null;
+  try {
+    const env_ = await env.WAR_CACHE.get<BulkSnapshotEnvelope>(
+      BULK_PLANETS_KEY,
+      "json",
+    );
+    if (!env_ || typeof env_.fetchedAt !== "number") return null;
+    return { data: env_.body as T, fetchedAt: env_.fetchedAt };
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------------------
@@ -225,6 +306,17 @@ async function readSampleStore(env: Env): Promise<SampleStore> {
  * without `signatures` / `globalStatistics` passes those layers through
  * untouched; the MO series additionally apply their age eviction on every
  * write (that is how a prior MO's retained series eventually ages out).
+ *
+ * PROVENANCE GATE (P1 fix — the load-bearing choke point). Persistence
+ * requires a COMPLETE LIVE fetch. `opts.persist === false` makes this call
+ * READ-ONLY: rates are still computed and returned for the response, but
+ * NOTHING is written — no KV append, no D1 archive row (the D1 write already
+ * rides `kvCommitted`, which stays false). The caller sets `persist` from the
+ * PROVENANCE of the data it is sampling (live fetch vs. fallback/snapshot/
+ * resilient-empty), never from apparent planet state. This is what keeps a
+ * stale snapshot out of `samples:planets`/D1 for EVERY caller (cron,
+ * get_planet, get_war_status, …) — degraded data may be served, never
+ * recorded. Default `true` preserves every existing live call site.
  */
 export async function samplePlanetRates(
   env: Env,
@@ -232,6 +324,9 @@ export async function samplePlanetRates(
   nowMs: number = Date.now(),
   opts: {
     carryForward?: boolean;
+    /** P1 provenance gate: false → compute rates but write nothing (the data
+     * is a fallback/snapshot/resilient-empty observation, not a live fetch). */
+    persist?: boolean;
     signatures?: SignatureObservation[];
     globalStatistics?: RawStatistics | null;
     /** Stage 11: raw war-root impactMultiplier + active-campaign count,
@@ -242,6 +337,53 @@ export async function samplePlanetRates(
     moProgress?: MoProgressObservation[];
   } = {},
 ): Promise<Map<number, SampleOutput>> {
+  const prepared = await prepareSampleTick(env, inputs, nowMs, opts);
+  // P1: persistence is a SEPARATE, opt-in step. Default true preserves every
+  // existing live call site; persist:false (or a pure loader) computes rates and
+  // writes nothing. The decoupled commit (commitSampleTick) is what handlers use
+  // to write ONCE, after all input provenance is known.
+  if (opts.persist !== false) await commitSampleTick(env, prepared);
+  return prepared.results;
+}
+
+/** P1: the result of computing a sample tick WITHOUT writing it — the rates for
+ * the response plus everything commitSampleTick needs to persist later. A pure
+ * loader returns one of these; the handler's terminal gated step commits it (or
+ * not). Side-effect-free: prepareSampleTick performs one KV READ and no write. */
+export interface PreparedSampleTick {
+  results: Map<number, SampleOutput>;
+  nextStore: SampleStore;
+  /** Inputs the D1 archive step needs at commit time (old store + folded
+   * sections + the per-tick planet rows). */
+  archive: {
+    planetRows: PlanetArchiveWriteRow[];
+    oldStore: SampleStore;
+    global: GlobalSample[];
+    mo: MoObjectiveSeries[];
+    signatures: SignatureObservation[];
+    nowMs: number;
+  };
+}
+
+/**
+ * P1: compute a sample tick read-only — one KV read, ZERO writes. Returns the
+ * rates (for the response) and the fully-built next store + archive rows for a
+ * later commit. Loaders call this and persist NOTHING; the handler decides
+ * whether to commitSampleTick once both inputs' provenance is known.
+ */
+export async function prepareSampleTick(
+  env: Env,
+  inputs: SampleInput[],
+  nowMs: number,
+  opts: {
+    carryForward?: boolean;
+    signatures?: SignatureObservation[];
+    globalStatistics?: RawStatistics | null;
+    globalImpactMultiplier?: number | null;
+    globalActiveCampaignCount?: number | null;
+    moProgress?: MoProgressObservation[];
+  } = {},
+): Promise<PreparedSampleTick> {
   const results = new Map<number, SampleOutput>();
   const store = await readSampleStore(env);
 
@@ -341,6 +483,33 @@ export async function samplePlanetRates(
     });
   }
 
+  return {
+    results,
+    nextStore,
+    archive: {
+      planetRows: archivePlanetRows,
+      oldStore: store,
+      global,
+      mo,
+      signatures: opts.signatures ?? [],
+      nowMs,
+    },
+  };
+}
+
+/**
+ * P1: the WRITE half — the single gated persistence step. Writes the prepared
+ * next store to KV and (only when that put commits) appends the D1 archive
+ * tick. Failure-isolated exactly as before. Handlers call this ONCE, after all
+ * input provenance is known and the all-inputs-live gate passed; a loader never
+ * calls it. A within-60s replay's nextStore is identical to the current store,
+ * so re-writing it is a harmless no-op for history (the append guards live in
+ * prepare).
+ */
+export async function commitSampleTick(
+  env: Env,
+  prepared: PreparedSampleTick,
+): Promise<void> {
   // Track whether the KV ring buffer actually persisted this tick. The D1
   // archive must ride a COMMITTED KV sample: if the KV write is skipped (no
   // binding) or fails (a transient KV error / exhausted write budget), the
@@ -350,7 +519,7 @@ export async function samplePlanetRates(
   let kvCommitted = false;
   if (env.WAR_CACHE) {
     try {
-      await env.WAR_CACHE.put(SAMPLES_KEY, JSON.stringify(nextStore), {
+      await env.WAR_CACHE.put(SAMPLES_KEY, JSON.stringify(prepared.nextStore), {
         // 30 days, refreshed on every write: planet samples still age out
         // in code at 48h (sampling.ts), but the Stage 5 accumulation layers
         // must survive gaps in usage — a truly abandoned store still
@@ -379,12 +548,12 @@ export async function samplePlanetRates(
       await archiveSampleTick(
         env,
         buildArchiveTick(
-          archivePlanetRows,
-          store,
-          global,
-          mo,
-          opts.signatures ?? [],
-          nowMs,
+          prepared.archive.planetRows,
+          prepared.archive.oldStore,
+          prepared.archive.global,
+          prepared.archive.mo,
+          prepared.archive.signatures,
+          prepared.archive.nowMs,
         ),
       );
     } catch (err) {
@@ -395,8 +564,6 @@ export async function samplePlanetRates(
       );
     }
   }
-
-  return results;
 }
 
 /**

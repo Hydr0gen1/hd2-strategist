@@ -1,7 +1,8 @@
 # test/ — unit tests
 
 Plain vitest, no Workers runtime: everything under test is pure
-(`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`, `src/wiki.ts`).
+(`src/invariants.ts`, `src/enrichment.ts`, `src/sampling.ts`, `src/wiki.ts`,
+`src/provenance.ts`).
 If a test needs I/O or KV, the code under test is in the wrong module — move
 the logic, don't mock the world. Two sanctioned exceptions:
 `src/wikiClient.ts` (stage4.test.ts), whose fetch is INJECTED per call, and
@@ -337,6 +338,82 @@ the project's definition of done:
     points with correct deltas, `insufficient_history` on a cold archive with a
     non-error note, zero KV writes, and a **prime-directive key-name pin** (no
     forecast/on_track/required_pace/verdict/recommend/priority/rank key).
+
+- Fabel features (`stage13.test.ts`) — additive facts over the existing,
+  unchanged pipeline:
+  - Feature 1: `buildInboundNeighbors` inverts observed waypoints (sorted, no
+    dangling); existing outbound `buildNeighbors` is byte-unchanged;
+    `buildAdjacencySummary` counts inbound ∪ outbound and sets
+    `borders_super_earth` only from a Human neighbor. `buildSupplyGraph`:
+    default = active-campaign subgraph + one-hop; `active_only` narrows to
+    active planets; `full` spans the galaxy; edges are observed waypoints ONLY
+    (no implied reverse), dangling targets never become nodes/edges.
+  - Feature 2: `buildGambitOrigins` resolves the attacker(s) of a defense from
+    inverted attack pairs, joins `is_major_order_target`, sorts by index, and
+    carries NO viability/verdict key (pinned).
+  - Feature 3: `perPlayerRates` — the Basquine-VIII validation checkpoint
+    (gross ≈ +71k, ≈2.35k per 1k, sign positive); defense nulls gross with
+    `defense_decay_nulled_invariant_1` (net still present); zero players nulls
+    the per-player fields with `no_players` (no divide-by-zero); missing rate →
+    `no_current_rate`.
+  - Feature 4: `selectRegions` passes raw fields through faithfully, detects a
+    City via upstream `size`, coerces the literal `"null"` description, and
+    reports `regions_available: false` with nothing fabricated on an absent
+    array.
+  - Handlers (KV stub, stage6 pattern): `get_planet` surfaces all four
+    features cache-served with a **prime-directive key-name pin** over the whole
+    payload; `get_supply_graph` returns the active-campaign subgraph READ-ONLY
+    (zero `samples:planets` puts), resolves a root by name / `full`, and carries
+    the split `provenance` + `active_campaign_overlay` block. Split-provenance
+    acceptance tests: (1) campaign-only outage → `campaigns: 'unavailable'`,
+    overlay `unavailable`, `planet_source: 'live'`, topology returned flagged
+    `campaign_state_known: false` (not a bare empty), note points at provenance;
+    (2) planet-snapshot-only → `planet_snapshot_used: true`, `campaigns: 'ok'`,
+    overlay `complete`; (3) both nominal → `stale` absent, overlay `complete`;
+    (4) both degraded → both flags + reasons; (5) `full:true` under campaign
+    outage → complete topology, per-node `campaign_state_known: false`, overlay
+    `unavailable`; (6) no node asserts `has_active_campaign: false` while
+    unknown; (7) ZERO persistence (KV + `FakeD1` batch) on every degraded path.
+  - Feature 5: `get_planet` serves the durable `snapshot:planets` (`stale:
+    true`) when every live fetch fails; the snapshot is refreshed only on a
+    genuine upstream fetch (a cache hit writes none).
+  - P1 provenance-gated persistence (the `samplePlanetRates` `persist` gate):
+    (1) get_planet during a campaign-fetch failure with planets from snapshot →
+    `stale: true`, ZERO `samples:planets` puts and ZERO D1 batches; (2) a cron
+    tick over EXPIRED (stale-served) caches → no KV append, no D1 row; (3) a
+    fully-live fetch still samples + archives (the gate did not over-block);
+    (4) an active planet during a campaign outage is `has_active_campaign: null`
+    + `campaign_state_known: false` (never false) and does not sample as quiet;
+    (5) an empty-but-LIVE campaigns result (`ok: true`) still records —
+    distinguished from `ok: false`; (6) predicate unity — a `stale: true`
+    response wrote nothing and a writing response was not stale, asserted both
+    directions. A minimal `FakeD1` (batch counter) proves the archive gate; the
+    `samples:planets` put count proves the KV gate.
+  - P1 round 2 (decoupled persistence): the reviewer's case — planets SNAPSHOT
+    + campaigns FRESH → `get_planet` writes ZERO samples (the loader records
+    nothing; the terminal gate suppresses the commit); planets-live+campaigns-ok
+    still persists (regression); planets-live+campaigns-`ok:false` writes
+    nothing; **loader purity** — a fully-live `get_supply_graph` commits nothing
+    (the loader itself never writes); cron over a stale campaign cache records
+    nothing.
+  - P2 (active_only under outage): `{full:true, active_only:true}` during a
+    campaign outage returns the COMPLETE topology (`active_only_applied: false`,
+    overlay `unavailable`, per-node `campaign_state_known: false`), never an
+    empty graph misread as "no active campaigns"; `active_only` with `ok`
+    campaigns applies the filter (`active_only_applied: true`); with `stale`
+    campaigns applies it on the last-known set (overlay `degraded`).
+  - One provenance contract (`provenance.ts` consolidation): `planetProvenanceOf`
+    maps source/stale → the three states; `allFresh`/`anyDegraded` exhaustively
+    over the 3×3 grid; `campaignView` is tri-state (unknown under 'unavailable',
+    never silently false). Cross-cutting handler tests: nested-unknown — a
+    campaign-outage `get_planet` has EVERY neighbor + gambit_origin
+    `has_active_campaign: null` / `is_major_order_target: null` (asserted NONE
+    are false); the `live_expired_cache` planet state → `stale: true`, writes
+    nothing; a **persist matrix** (9 planet×campaign combos) asserts writes occur
+    iff `allFresh`; a **rollup matrix** asserts `stale` iff `anyDegraded`; a
+    **predicate-audit** reads `src/tools.ts` + `src/enrichment.ts` and pins ZERO
+    `.source === 'live'` or campaign-map `.has()` lookups (the per-site checks
+    were deleted, not duplicated).
 
 ## Conventions
 

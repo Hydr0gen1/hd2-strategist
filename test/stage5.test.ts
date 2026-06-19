@@ -44,6 +44,12 @@ import type {
   RawPlanet,
   RawStatistics,
 } from "../src/types";
+import { campaignView } from "../src/provenance";
+
+/** Wrap a kind map in the tri-state accessor buildNeighbors now consumes. */
+function cview(kinds: Map<number, "liberation" | "defense">) {
+  return campaignView(kinds, new Set(), "ok");
+}
 
 const HOUR_MS = 3_600_000;
 const NOW = 1_780_000_000_000;
@@ -508,7 +514,7 @@ describe("buildNeighbors: waypoint join + factual adjacency", () => {
   ]);
 
   it("joins name/owner/campaign per waypoint, in upstream order", () => {
-    const { neighbors } = buildNeighbors(home, byIndex, kinds);
+    const { neighbors } = buildNeighbors(home, byIndex, cview(kinds));
     expect(neighbors).toEqual([
       { index: 1, name: "ALPHA", owner: "Humans", has_active_campaign: false, campaign_kind: null },
       { index: 2, name: "BETA", owner: "Terminids", has_active_campaign: true, campaign_kind: "liberation" },
@@ -517,7 +523,7 @@ describe("buildNeighbors: waypoint join + factual adjacency", () => {
   });
 
   it("summary counts include the dangling neighbor in total and the unknown bucket", () => {
-    const { neighbor_summary } = buildNeighbors(home, byIndex, kinds);
+    const { neighbor_summary } = buildNeighbors(home, byIndex, cview(kinds));
     expect(neighbor_summary).toEqual({
       total: 3,
       by_owner: { Humans: 1, Terminids: 1, unknown: 1 },
@@ -526,18 +532,18 @@ describe("buildNeighbors: waypoint join + factual adjacency", () => {
   });
 
   it("frontline is true iff a neighbor with a KNOWN owner differs from the planet's owner", () => {
-    expect(buildNeighbors(home, byIndex, kinds).frontline).toBe(true);
+    expect(buildNeighbors(home, byIndex, cview(kinds)).frontline).toBe(true);
 
     const interior = makePlanet({ waypoints: [1] });
-    expect(buildNeighbors(interior, byIndex, kinds).frontline).toBe(false);
+    expect(buildNeighbors(interior, byIndex, cview(kinds)).frontline).toBe(false);
 
     // An unknown (dangling) owner never makes a planet frontline.
     const onlyDangling = makePlanet({ waypoints: [3] });
-    expect(buildNeighbors(onlyDangling, byIndex, kinds).frontline).toBe(false);
+    expect(buildNeighbors(onlyDangling, byIndex, cview(kinds)).frontline).toBe(false);
   });
 
   it("no waypoints → empty neighbors, zeroed summary, frontline false", () => {
-    const out = buildNeighbors(makePlanet(), byIndex, kinds);
+    const out = buildNeighbors(makePlanet(), byIndex, cview(kinds));
     expect(out.neighbors).toEqual([]);
     expect(out.neighbor_summary).toEqual({
       total: 0,

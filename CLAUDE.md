@@ -29,14 +29,78 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
 
 ## Hard rules (project-wide)
 
-- **Exactly seventeen tools**: `get_war_brief`, `get_war_status`,
-  `get_campaigns`, `get_major_order`, `get_planet`, `get_dispatches`,
-  `get_patch_notes`, `get_planet_history`, `get_planet_wiki`,
-  `get_observed_signatures`, `get_global_history`,
+- **Exactly eighteen tools**: `get_war_brief`, `get_war_status`,
+  `get_campaigns`, `get_major_order`, `get_planet`, `get_supply_graph`,
+  `get_dispatches`, `get_patch_notes`, `get_planet_history`,
+  `get_planet_wiki`, `get_observed_signatures`, `get_global_history`,
   `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`,
   and the Stage 12 D1 archive trio `get_planet_archive`,
   `get_global_archive`, `get_major_order_archive`. Do not add tools or
-  rename them.
+  rename them. (`get_supply_graph` was the eighteenth, added by the Fabel
+  supply-graph/gambit pass; the count was seventeen before it.)
+- **Fabel additive-fact rule** (supply graph, gambit, per-player rates,
+  regions, warm cache): every new field is a raw upstream value or a
+  deterministic transform of values already in the payload — never a verdict.
+  Names state facts (`borders_super_earth`, `gambit_origin`), never
+  judgments (`can_liberate`, `gambit_viable`). The five invariants are
+  frozen — new code CONSUMES the single signed `hp_per_hour` and the
+  invariant-1 nulled decay, never recomputing a rate or reaching around a
+  suppressed field. `inbound_neighbors` is the pure inversion of observed
+  waypoints (no symmetrization/routing); `get_supply_graph` is READ-ONLY
+  (records nothing on any path) and its staleness NAMES its source — a
+  structured `provenance` block separates planet-list provenance (`planet_source`,
+  governs topology) from campaign-overlay provenance (`campaigns:
+  ok|stale|unavailable`, governs annotations + the active-only selection), so a
+  campaign-only outage is never mislabeled a planet-snapshot fallback; under a
+  campaign outage topology stays complete while nodes are
+  `campaign_state_known: false` (an empty active subgraph reads as UNKNOWN, never
+  "no active campaigns"); `gambit_origin` inverts the observed
+  source→target attack pairs; `per_player_rates` divide-guard zero players;
+  `regions` is a faithful passthrough with NO derived liberation-contribution
+  math; the warm `snapshot:planets` cache feeds adjacency/ownership/HP context
+  lookups ONLY (get_planet / get_supply_graph fallback) and MUST NOT backfill
+  the history/global-stats archive.
+- **One provenance contract** (`src/provenance.ts` — the single representation
+  of degradation; everything else CONSUMES it, nothing re-derives it). Two enums
+  are the source of truth: `PlanetProvenance` (`live_fresh` |
+  `live_expired_cache` | `snapshot_fallback` — note a LIVE fetch can still be
+  STALE, so freshness is `=== 'live_fresh'`, NEVER `source === 'live'`) and
+  `CampaignProvenance` (`ok` | `stale` | `unavailable`). Two derived predicates
+  are the ONLY consumers of staleness: `anyDegraded` drives every tool's
+  top-level `stale` rollup; `allFresh` is the ONLY condition under which
+  anything persists. A tri-state `campaignView` accessor (`status` →
+  `active|inactive|unknown`, `hasActiveCampaign` → `bool|null`, `moMembership` →
+  `bool|'unknown'`) is the ONLY way annotation builders read campaign/MO
+  membership — an absent map entry is NEVER silently `false`; under
+  `unavailable` every query is unknown → `has_active_campaign: null`,
+  `campaign_kind: null`, `is_major_order_target: null`, `campaign_state_known:
+  false`, in the planet AND in every nested neighbor/gambit annotation.
+  get_planet's `normalized` value is a SYNTHETIC record that DEFAULTS a
+  kind/trajectory, so under `unavailable` the whole campaign-classification
+  block (`campaign_kind` / `win_condition` / `direction` / `alert` /
+  `stabilizing` / `hpc`[/ `hpc_note`]) is nulled at ONE gated locus
+  (`campaignDerived`) — never per-field, so no sibling can leak a default while
+  `campaign_state_known: false`. Planet-state facts (HP, regen, lib%, projection
+  math) are NOT campaign-derived and ride through unchanged. No per-site
+  `source === 'live'` / `bundle.ok` / `Map.has()` checks remain (predicate-audit
+  test pins this).
+- **Persistence requires a complete live fetch** (the durable invariant that
+  keeps the warm snapshot out of the record). Gated on PROVENANCE, never on
+  apparent planet state (quiet vs. active). Any fallback / snapshot /
+  expired-cache / resilient-empty path is READ-ONLY and marked `stale: true`;
+  degraded data may be SERVED (flagged) but never RECORDED — the same
+  serve-but-don't-record logic that keeps the `18145 / 0.07364573` sentinel out
+  of the archive. **Loaders are side-effect-free; persistence happens ONCE,
+  after all input provenance is known.** `loadNormalizedCampaigns` calls
+  `prepareSampleTick` (one KV read, ZERO writes) and returns the
+  computed-but-unwritten tick as `bundle.pendingTick`; the handler runs the
+  single terminal `commitCampaignTick(env, bundle, allFresh(planet, campaign))`
+  (cron/get_campaigns fetch no planet list, so they gate on campaign provenance
+  alone). No loader writes, so the write is ORDER-INDEPENDENT — a snapshot- or
+  expired-cache-backed `get_planet` with fresh campaigns records nothing.
+  `get_supply_graph` never commits (read-only). The "skip persistence" predicate
+  and the `stale: true` rollup are the SAME `allFresh`/`anyDegraded` pair (a
+  stale response recorded nothing; a recording response was not stale).
 - **Two history stores, never reconciled** (Stage 12): KV
   (`samples:planets`) is the bounded recent ring buffer and the SOURCE OF
   TRUTH for all live logic (`hp_per_hour`, the dual ETAs, divergence read
