@@ -1003,6 +1003,33 @@ export async function getPlanet(
   // surprise here cannot affect features 1–3 above).
   const regionInfo = selectRegions(planet.regions);
 
+  // Campaign-derived CLASSIFICATION fields come from the synthetic `normalized`
+  // record, which DEFAULTS a kind/trajectory even when the campaign overlay is
+  // unavailable (a non-event planet defaults to 'liberation'). When campaign
+  // state is UNKNOWN, null them ALL uniformly at this single locus — so nothing
+  // can assert a kind/direction/HPC the sibling has_active_campaign:null /
+  // campaign_state_known:false already disclaim, and a future field added here
+  // is gated in one place (no sibling leak). Planet-state facts (HP, regen,
+  // lib%, projection math) are NOT campaign-derived and ride through unchanged.
+  const campaignDerived = campaignStateKnown
+    ? {
+        campaign_kind: normalized.campaign_kind,
+        win_condition: winCondition(normalized.campaign_kind),
+        direction: normalized.direction,
+        alert: normalized.alert,
+        stabilizing: normalized.stabilizing,
+        hpc: normalized.hpc,
+        ...(normalized.hpc_note ? { hpc_note: normalized.hpc_note } : {}),
+      }
+    : {
+        campaign_kind: null,
+        win_condition: null,
+        direction: null,
+        alert: null,
+        stabilizing: null,
+        hpc: null,
+      };
+
   return {
     planet_index: planet.index,
     planet_name: planet.name,
@@ -1015,7 +1042,10 @@ export async function getPlanet(
     // annotations consume, so the planet and its neighbors can never disagree.
     has_active_campaign: view.hasActiveCampaign(planet.index),
     campaign_state_known: campaignStateKnown,
-    campaign_kind: normalized.campaign_kind,
+    // Campaign-derived classification (campaign_kind / win_condition /
+    // direction / alert / stabilizing / hpc[/ _note]) — all null when campaign
+    // state is unknown (see campaignDerived above).
+    ...campaignDerived,
     raw_hp: normalized.raw_hp,
     max_hp: normalized.max_hp,
     hp_per_hour: normalized.hp_per_hour,
@@ -1024,17 +1054,11 @@ export async function getPlanet(
     // defense planet can never re-expose its cosmetic decay here.
     decay_per_hour: decayPerHour(normalized.regen_per_second),
     liberation_pct_display_only: normalized.liberation_pct_display_only,
-    // Stage 7, Part A: objective-relative framing — win-state target plus
-    // the always-positive distance to it (smaller = closer, both kinds).
-    win_condition: winCondition(normalized.campaign_kind),
+    // Stage 7, Part A: objective-relative distance to the win state (a
+    // planet-HP fact, smaller = closer); orientation rides win_condition above.
     hp_remaining_to_objective: hpRemainingToObjective(normalized.raw_hp),
     hours_to_resolution: normalized.hours_to_resolution,
     projection_status: normalized.status,
-    direction: normalized.direction,
-    alert: normalized.alert,
-    stabilizing: normalized.stabilizing,
-    hpc: normalized.hpc,
-    ...(normalized.hpc_note ? { hpc_note: normalized.hpc_note } : {}),
     ...(normalized.data_quality
       ? { data_quality: normalized.data_quality }
       : {}),

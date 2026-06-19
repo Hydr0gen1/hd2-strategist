@@ -74,9 +74,16 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   membership — an absent map entry is NEVER silently `false`; under
   `unavailable` every query is unknown → `has_active_campaign: null`,
   `campaign_kind: null`, `is_major_order_target: null`, `campaign_state_known:
-  false`, in the planet AND in every nested neighbor/gambit annotation. No
-  per-site `source === 'live'` / `bundle.ok` / `Map.has()` checks remain
-  (predicate-audit test pins this).
+  false`, in the planet AND in every nested neighbor/gambit annotation.
+  get_planet's `normalized` value is a SYNTHETIC record that DEFAULTS a
+  kind/trajectory, so under `unavailable` the whole campaign-classification
+  block (`campaign_kind` / `win_condition` / `direction` / `alert` /
+  `stabilizing` / `hpc`[/ `hpc_note`]) is nulled at ONE gated locus
+  (`campaignDerived`) — never per-field, so no sibling can leak a default while
+  `campaign_state_known: false`. Planet-state facts (HP, regen, lib%, projection
+  math) are NOT campaign-derived and ride through unchanged. No per-site
+  `source === 'live'` / `bundle.ok` / `Map.has()` checks remain (predicate-audit
+  test pins this).
 - **Persistence requires a complete live fetch** (the durable invariant that
   keeps the warm snapshot out of the record). Gated on PROVENANCE, never on
   apparent planet state (quiet vs. active). Any fallback / snapshot /

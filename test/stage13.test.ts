@@ -1357,3 +1357,73 @@ describe("rollup matrix — stale iff anyDegraded (get_supply_graph)", () => {
       });
     }
 });
+
+/* ----- null campaign-derived fields on the synthetic outage record ----- */
+
+describe("get_planet — campaign-derived fields null under a campaign outage", () => {
+  // The classification fields sourced from the synthetic normalized record;
+  // each defaults a value and must be nulled when campaign state is unknown.
+  const CAMPAIGN_DERIVED = [
+    "campaign_kind",
+    "win_condition",
+    "direction",
+    "alert",
+    "stabilizing",
+    "hpc",
+    "hpc_note",
+  ];
+
+  it("1. non-event planet during outage: campaign_kind null (not liberation/defense)", async () => {
+    const kv = fakeKv();
+    seedRaw(kv, "/api/v1/planets", GALAXY); // planets live
+    seedRaw(kv, RAW_STATUS_PATH, {});
+    // No campaigns/assignments cache → campaign_provenance 'unavailable'.
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    // ALATHFAR (50): Human-owned, NO event — previously defaulted to liberation.
+    const out = (await getPlanet(env, { index: 50 })) as Record<string, any>;
+
+    expect(out.campaign_state_known).toBe(false);
+    expect(out.has_active_campaign).toBeNull();
+    expect(out.campaign_kind).toBeNull();
+    expect(out.campaign_kind).not.toBe("liberation");
+    expect(out.campaign_kind).not.toBe("defense");
+  });
+
+  it("2. field-sweep: NO campaign-derived field is non-null while campaign_state_known is false", async () => {
+    const kv = fakeKv();
+    seedRaw(kv, "/api/v1/planets", GALAXY);
+    seedRaw(kv, RAW_STATUS_PATH, {});
+    const env: Env = { WAR_CACHE: kv as unknown as KVNamespace };
+    forbidNetwork();
+
+    // Sweep an event planet (185, defense) AND a non-event planet (50).
+    for (const index of [50, 185]) {
+      const out = (await getPlanet(env, { index })) as Record<string, any>;
+      expect(out.campaign_state_known).toBe(false);
+      for (const field of CAMPAIGN_DERIVED) {
+        // Either absent (hpc_note) or explicitly null — never a defaulted value.
+        if (field in out) {
+          expect(out[field], `${field} on planet ${index}`).toBeNull();
+        }
+      }
+    }
+  });
+
+  it("3. regression: fully-live get_planet still reports the real campaign_kind", async () => {
+    const kv = fakeKv();
+    const env = seededEnv(kv); // planets live, campaign on Sangis (273) liberation
+    forbidNetwork();
+
+    const lib = (await getPlanet(env, { index: 273 })) as Record<string, any>;
+    expect(lib.campaign_state_known).toBe(true);
+    expect(lib.campaign_kind).toBe("liberation");
+    expect(lib.win_condition).toBe("raw_hp_to_zero");
+
+    // Karlia (185) carries an event → defense, campaign state known.
+    const def = (await getPlanet(env, { index: 185 })) as Record<string, any>;
+    expect(def.campaign_state_known).toBe(true);
+    expect(def.campaign_kind).toBe("defense");
+  });
+});
