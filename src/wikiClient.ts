@@ -4,19 +4,30 @@
  * two sources never share a fetch path, and the `wiki:` KV namespace never
  * collides with the short-lived `raw:` war-state cache.
  *
- * Caching is aggressive because lore changes rarely: a long fresh window
- * plus a much longer stale-fallback retention, mirroring the war-state
- * cache's stale-on-failure semantics (never crash; structured error only
- * when there is no copy at all). This also shields the wiki from rate
- * limits — repeat lookups are served entirely from KV.
+ * Caching is keyed on the CANONICAL page title (lowercased, spaces →
+ * underscores) so casing variants collapse to one entry. Intro extracts are
+ * cached 24h (lore changes rarely); full pages 1h (stat/patch pages move
+ * faster). On any fetch failure this throws a typed WikiError — it never
+ * returns a partial object or a stale copy (the caller decides what to do
+ * with the error; the live war-state tools are unaffected either way).
  */
-import type { Env } from "./types";
+import { buildWikiQueryUrl, shapeWikiPage, wikiCacheKey } from "./wiki";
+import type { Env, WikiPageFound, WikiPageResult } from "./types";
 
-/** Fresh window: serve from KV without touching the wiki for 6 hours. */
-export const WIKI_CACHE_TTL_SECONDS = 21_600;
-/** How long copies survive in KV as a down/rate-limited fallback: 7 days. */
-export const WIKI_STALE_KEEP_TTL_SECONDS = 604_800;
+/** Intro extract cache window: 24 hours. */
+export const INTRO_CACHE_TTL_SECONDS = 86_400;
+/** Full-page (wikitext) cache window: 1 hour. */
+export const FULL_CACHE_TTL_SECONDS = 3_600;
 const FETCH_TIMEOUT_MS = 8_000;
+
+/**
+ * MediaWiki API etiquette requires a descriptive User-Agent identifying the
+ * app and a contact. Fixed string (the repo URL + a one-line description) so
+ * it is always meaningful and never accidentally omitted.
+ */
+export const WIKI_USER_AGENT =
+  "hd2-strategist/1.0 (https://github.com/Hydr0gen1/hd2-strategist; " +
+  "Cloudflare Worker MCP server for Helldivers 2 strategic analysis)";
 
 export class WikiError extends Error {
   constructor(
@@ -28,89 +39,73 @@ export class WikiError extends Error {
   }
 }
 
-interface WikiCacheEnvelope {
-  fetchedAt: number;
-  body: unknown;
-}
-
-export interface WikiFetchResult {
-  body: unknown;
-  /** True when served from an expired cache copy due to wiki failure. */
-  stale: boolean;
-}
-
 /** Injectable fetch so unit tests never touch the network. */
 export type FetchLike = (
   url: string,
   init: { headers: Record<string, string>; signal: AbortSignal },
 ) => Promise<Response>;
 
-/**
- * MediaWiki etiquette: send a descriptive User-Agent identifying the app
- * and a contact. Reuses the SUPER_CLIENT/SUPER_CONTACT secrets in spirit,
- * with non-secret repo fallbacks so the header is always meaningful.
- */
-export function wikiUserAgent(env: Env): string {
-  const client = env.SUPER_CLIENT || "hd2-strategist";
-  const contact =
-    env.SUPER_CONTACT || "https://github.com/Hydr0gen1/hd2-strategist";
-  return `${client} (${contact})`;
+function isFound(result: WikiPageResult): result is WikiPageFound {
+  return !("found" in result);
 }
 
 /**
- * Cache-first wiki GET, same shape as client.ts fetchUpstream:
- * fresh KV copy → return; otherwise fetch the wiki and cache the RAW body
- * (shaping always runs after the cache read, so shaping changes never need
- * invalidation); on failure fall back to any stale copy (stale: true);
- * with no fallback, throw a typed WikiError — never a raw exception.
+ * Cache-first wiki page fetch:
+ *   1. Read KV under the input-normalized key; a hit returns it with
+ *      `cached: true` (its stored `retrieved_at` is the write time). A KV
+ *      read failure is swallowed and falls through to a live fetch.
+ *   2. Live-fetch the Action API with the descriptive User-Agent. Any
+ *      network / HTTP / non-JSON / malformed-shape failure throws a typed
+ *      WikiError — never a partial object, never a stale fallback.
+ *   3. A missing page returns the not-found shape WITHOUT caching (it may be
+ *      created later). A found page is cached under the CANONICAL-title key
+ *      (TTL by mode) and returned with `cached: false`.
  */
-export async function fetchWikiQuery(
+export async function fetchWikiPage(
   env: Env,
-  plan: { url: string; cacheKey: string },
+  args: { title: string; full?: boolean },
   opts: { fetchFn?: FetchLike; nowMs?: number } = {},
-): Promise<WikiFetchResult> {
+): Promise<WikiPageResult> {
   const fetchFn: FetchLike = opts.fetchFn ?? ((url, init) => fetch(url, init));
   const now = opts.nowMs ?? Date.now();
+  const full = args.full === true;
+  const { title } = args;
+  // The read key is derived from the INPUT title (casing-normalized). On a
+  // write we also store under the CANONICAL title; when a redirect makes the
+  // two differ (e.g. "Eruptor" → "R-36 Eruptor") we additionally write this
+  // alias key so repeat calls with the same alias hit cache instead of
+  // refetching (avoids needless wiki traffic / rate limits).
+  const requestKey = wikiCacheKey(title, full);
 
-  let cached: WikiCacheEnvelope | null = null;
+  // 1. Cache read — keyed on the input title (casing-normalized). KV being
+  // unavailable must never fail the call: swallow and live-fetch instead.
   if (env.WAR_CACHE) {
     try {
-      cached = await env.WAR_CACHE.get<WikiCacheEnvelope>(
-        plan.cacheKey,
-        "json",
-      );
+      const cached = await env.WAR_CACHE.get<WikiPageFound>(requestKey, "json");
+      if (cached) return { ...cached, cached: true };
     } catch {
-      cached = null;
+      // KV down — fall through to a live fetch.
     }
   }
-  if (cached && now - cached.fetchedAt < WIKI_CACHE_TTL_SECONDS * 1000) {
-    return { body: cached.body, stale: false };
-  }
 
+  // 2. Live fetch. No stale fallback on failure (the spec is explicit): throw.
   let response: Response;
   try {
-    response = await fetchFn(plan.url, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": wikiUserAgent(env),
-      },
+    response = await fetchFn(buildWikiQueryUrl(title, full), {
+      headers: { Accept: "application/json", "User-Agent": WIKI_USER_AGENT },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (err) {
-    if (cached) return { body: cached.body, stale: true };
     throw new WikiError(
-      `Wiki request failed (${err instanceof Error ? err.message : "network error"}) and no cached copy is available. The live war-state tools are unaffected.`,
+      `Wiki request for "${title}" failed (${err instanceof Error ? err.message : "network error"}). The live war-state tools are unaffected.`,
     );
   }
 
   if (!response.ok) {
-    if (cached) return { body: cached.body, stale: true };
     const reason =
-      response.status === 429
-        ? "rate limited (429)"
-        : `returned ${response.status}`;
+      response.status === 429 ? "rate limited (429)" : `returned ${response.status}`;
     throw new WikiError(
-      `Wiki ${reason} and no cached copy is available. Try again shortly; the live war-state tools are unaffected.`,
+      `Wiki ${reason} for "${title}". Try again shortly; the live war-state tools are unaffected.`,
       response.status,
     );
   }
@@ -119,22 +114,42 @@ export async function fetchWikiQuery(
   try {
     body = await response.json();
   } catch {
-    if (cached) return { body: cached.body, stale: true };
     throw new WikiError(
-      "Wiki returned a non-JSON response and no cached copy is available.",
+      `Wiki returned a non-JSON response for "${title}". The live war-state tools are unaffected.`,
     );
   }
 
-  if (env.WAR_CACHE) {
-    try {
-      await env.WAR_CACHE.put(
-        plan.cacheKey,
-        JSON.stringify({ fetchedAt: now, body } satisfies WikiCacheEnvelope),
-        { expirationTtl: WIKI_STALE_KEEP_TTL_SECONDS },
-      );
-    } catch {
-      // Cache write failures must never break a successful wiki read.
+  let result: WikiPageResult;
+  try {
+    result = shapeWikiPage(body, { title, full }, now);
+  } catch (err) {
+    throw new WikiError(
+      err instanceof Error ? err.message : "Unexpected wiki API response.",
+    );
+  }
+
+  // 3. Cache only FOUND pages. Write under the canonical-title key, plus the
+  // input alias key when a redirect made it differ — so a redirect alias hits
+  // cache on its next call instead of refetching. A missing page is never
+  // cached (it might be created on the wiki later).
+  if (isFound(result) && env.WAR_CACHE) {
+    const serialized = JSON.stringify(result);
+    const ttl = {
+      expirationTtl: full ? FULL_CACHE_TTL_SECONDS : INTRO_CACHE_TTL_SECONDS,
+    };
+    const canonicalKey = wikiCacheKey(result.title, full);
+    const keys =
+      canonicalKey === requestKey
+        ? [canonicalKey]
+        : [canonicalKey, requestKey];
+    for (const key of keys) {
+      try {
+        await env.WAR_CACHE.put(key, serialized, ttl);
+      } catch {
+        // Cache write failures must never break a successful wiki read.
+      }
     }
   }
-  return { body, stale: false };
+
+  return result;
 }

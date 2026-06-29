@@ -35,7 +35,7 @@ The convention is identical for defense campaigns (the tracked health there is t
 | `get_dispatches` | In-fiction war news feed, newest first (`limit` optional, default 10 / cap 25) |
 | `get_patch_notes` | Steam news / patch notes, newest first, verbatim BBCode content (`limit` optional, default 5 / cap 10) |
 | `get_planet_history` | Observed health time-series for one planet by `index` or `name`: retained samples + per-point `delta_health`/`delta_hours` and observed-only aggregates (`rate_min`/`rate_max`/`rate_mean`/`latest_rate`, `samples_span_hours`) — observed values, never a forecast |
-| `get_planet_wiki` | **Lore source (separate from live war state):** community wiki entry from helldivers.wiki.gg for a planet (`name`) or any topic (`title`, e.g. "Jet Brigade") — plain-text lead extract, canonical URL, mandatory attribution (CC BY-NC-SA 4.0). Never authoritative for current war state |
+| `get_wiki_page` | **Lore source (separate from live war state):** community wiki entry from helldivers.wiki.gg for any topic by `title` (weapons, warbonds, stratagems, enemies/subfactions like "Jet Brigade", boosters, passives, missions, biomes, planets). Returns the plain-text intro extract by default; `full: true` returns the raw page wikitext. Carries the canonical URL and mandatory attribution (CC BY-NC-SA 4.0). Never authoritative for current war state |
 | `get_observed_signatures` | Accumulated record of every distinct campaign signature tuple `{campaign_type, event_type, has_event, faction}` this server has observed, newest `last_seen` first — passive raw observation that captures rare states (special-faction events, defense campaign types) with timestamps |
 | `get_global_history` | Global war statistics time-series sampled by this server (player count, missions, deaths, kills): retained points + raw observed deltas — observed values, never a forecast. Accrues on `get_war_status` polls |
 | `get_major_order_history` | Observed Major Order objective-progress time-series: one bounded series per objective (`major_order_id` + `objective_index`) with per-point `delta_progress`/`delta_hours`, latest progress/target, and `progress_pct` — observed samples and deltas only, never a forecast, required pace, or on-track verdict. No args → the active MO(s); a recently ended MO stays queryable by `major_order_id` until it ages out |
@@ -60,7 +60,7 @@ Every response derived from an upstream fetch carries `as_of`, `fetched_at`, and
 
 ### Two sources, never mixed
 
-The live tools answer *what is happening* (verifiable against `api.helldivers2.dev`); `get_planet_wiki` answers *what it means* (community-authored lore from `helldivers.wiki.gg`). The pipelines are physically separate in the code (`wiki.ts`/`wikiClient.ts` vs everything else), wiki prose never appears in a live war-state field, and the wiki payload never carries live numbers. They are joined only by the consumer, in conversation.
+The live tools answer *what is happening* (verifiable against `api.helldivers2.dev`); `get_wiki_page` answers *what it means* (community-authored lore from `helldivers.wiki.gg`). The pipelines are physically separate in the code (`wiki.ts`/`wikiClient.ts` vs everything else), wiki prose never appears in a live war-state field, and the wiki payload never carries live numbers. They are joined only by the consumer, in conversation.
 
 Live event identity rides the live side: `get_planet` and each campaign in `get_campaigns` carry `event_type` (the raw upstream `event.eventType`, passed through) and `modifier` (its decoded special-faction name — e.g. "Jet Brigade" — only for enum values confirmed in `EVENT_MODIFIER_NAMES`). No event → both `null`. Unconfirmed enum value → `event_type` set, `modifier: null`: visible, never named by guess.
 
@@ -178,8 +178,8 @@ src/archive.ts     D1 history archive I/O — best-effort batched write + the lo
 src/invariants.ts  Pure normalization — the five invariants, no I/O
 src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
 src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode, archive points)
-src/wiki.ts        Pure wiki lore logic (query plan, response shaping, attribution) — separate source
-src/wikiClient.ts  Wiki fetch + long-TTL KV cache (`wiki:` namespace) — separate from client.ts
+src/wiki.ts        Pure wiki lore logic (URL/key builders, response shaping, attribution) — separate source
+src/wikiClient.ts  Wiki fetch + canonical-keyed KV cache (`wiki:` namespace) — separate from client.ts
 src/tools.ts       The eighteen tool implementations
 src/types.ts       Raw upstream + normalized types
 migrations/        D1 schema migrations (0001_init.sql) applied via `wrangler d1 migrations apply`

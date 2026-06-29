@@ -32,7 +32,7 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
 - **Exactly eighteen tools**: `get_war_brief`, `get_war_status`,
   `get_campaigns`, `get_major_order`, `get_planet`, `get_supply_graph`,
   `get_dispatches`, `get_patch_notes`, `get_planet_history`,
-  `get_planet_wiki`, `get_observed_signatures`, `get_global_history`,
+  `get_wiki_page`, `get_observed_signatures`, `get_global_history`,
   `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`,
   and the Stage 12 D1 archive trio `get_planet_archive`,
   `get_global_archive`, `get_major_order_archive`. Do not add tools or
@@ -144,11 +144,13 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   existing `samples:planets` write — never a second per-cycle write. (The
   Stage 12 D1 archive write is a separate store, not a KV write, so it does
   not count against this budget; it is one batched D1 call per tick.)
-- **Two sources, never mixed**: everything except `get_planet_wiki` is live
-  war state from `api.helldivers2.dev`; `get_planet_wiki` is community LORE
+- **Two sources, never mixed**: everything except `get_wiki_page` is live
+  war state from `api.helldivers2.dev`; `get_wiki_page` is community LORE
   from `helldivers.wiki.gg` (own pipeline `src/wiki.ts` + `src/wikiClient.ts`,
-  own `wiki:` KV namespace, mandatory attribution on every payload). Wiki
-  prose must never appear in a live war-state field, live tools must never
+  own `wiki:` KV namespace, mandatory attribution on every payload). It takes
+  an arbitrary page `title` (weapons, warbonds, stratagems, enemies, biomes,
+  planets, …) and an optional `full` flag (intro extract vs raw wikitext).
+  Wiki prose must never appear in a live war-state field, live tools must never
   call the wiki, and the wiki payload must never carry live war numbers.
 - **Secrets**: `SUPER_CLIENT` / `SUPER_CONTACT` come from `wrangler secret put`
   and are read from `env`. Never hardcode them, never commit them, never add

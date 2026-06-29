@@ -364,30 +364,40 @@ export interface PlanetArchivePoint {
   delta_hours: number | null;
 }
 
-/** Stage 4: get_planet_wiki payload — LORE source (helldivers.wiki.gg),
+/** Stage 4: get_wiki_page payload — LORE source (helldivers.wiki.gg),
  * physically separate from all live war-state output. Carries mandatory
- * attribution on every outcome and never any live war number. */
-export interface WikiResult {
-  found: boolean;
-  /** What the caller asked for, verbatim (trimmed). */
-  requested: string;
-  /** The wiki page title served (or attempted, when found: false). */
+ * attribution and the lore disclaimer and never any live war number. */
+export interface WikiPageFound {
+  /** Canonical page title as returned by the wiki API (may differ in casing). */
   title: string;
-  /** Plain-text lead extract, capped at WIKI_EXTRACT_MAX_CHARS. */
-  extract: string | null;
-  truncated: boolean;
-  /** Canonical page URL — part of the mandatory attribution. */
-  url: string | null;
-  /** Original title when a MediaWiki redirect was followed — never silent. */
-  redirected_from: string | null;
-  source: string;
+  /** Plain-text intro extract by default; raw wikitext when `full: true`. */
+  extract: string;
+  /** Canonical page URL: https://helldivers.wiki.gg/wiki/{encoded_title}. */
+  url: string;
+  source: "helldivers.wiki.gg";
+  /** The wiki's own verified content license (CC BY-NC-SA 4.0). */
   license: string;
-  license_url: string;
+  /** ISO 8601 UTC; on a cache hit this is when the cache entry was written. */
   retrieved_at: string;
-  /** Lore disclaimer: community-authored; live tools are authoritative. */
+  /** True when served from KV cache, false on a live fetch. */
+  cached: boolean;
+  /** Fixed lore disclaimer: community-authored; live tools are authoritative. */
   notes: string;
-  hint?: string;
+  /** Present ONLY when `full: true` — the extract is raw wikitext, not plain text. */
+  format?: "wikitext";
 }
+
+/** get_wiki_page not-found payload: the page does not exist on the wiki. */
+export interface WikiPageNotFound {
+  found: false;
+  /** The input title as given by the caller. */
+  title: string;
+  /** The canonical URL that was queried. */
+  url: string;
+  source: "helldivers.wiki.gg";
+}
+
+export type WikiPageResult = WikiPageFound | WikiPageNotFound;
 
 /** Context passed into pure normalization — assembled by the handler layer. */
 export interface NormalizeContext {
