@@ -100,8 +100,10 @@ payload). It takes any page `title` (weapons, warbonds, stratagems, enemies,
 subfactions, biomes, planets, …); `full: true` returns raw wikitext (the
 `prop=revisions` endpoint) instead of the `prop=extracts` intro. The cache
 key is the CANONICAL (post-redirect) title, lowercased + underscored, in the
-`wiki:page:{title}:{intro|full}` shape (24h intro / 1h full TTL); a not-found
-page is never cached. The pipelines never touch: live tools must not call
+`wiki:page:{title}:{intro|full}` shape (24h intro / 1h full TTL); when a
+redirect makes the input alias differ from the canonical title the found page
+is ALSO written under the input-alias key, so a repeat alias call hits cache
+instead of refetching. A not-found page is never cached. The pipelines never touch: live tools must not call
 the wiki or embed wiki prose; the wiki payload must not carry HP, rates, or
 ownership. The event/modifier decode (`decodeEventModifier`) is LIVE-side
 only: raw `event.eventType` passed through + a name ONLY when confirmed in

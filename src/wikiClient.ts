@@ -70,15 +70,18 @@ export async function fetchWikiPage(
   const now = opts.nowMs ?? Date.now();
   const full = args.full === true;
   const { title } = args;
+  // The read key is derived from the INPUT title (casing-normalized). On a
+  // write we also store under the CANONICAL title; when a redirect makes the
+  // two differ (e.g. "Eruptor" → "R-36 Eruptor") we additionally write this
+  // alias key so repeat calls with the same alias hit cache instead of
+  // refetching (avoids needless wiki traffic / rate limits).
+  const requestKey = wikiCacheKey(title, full);
 
   // 1. Cache read — keyed on the input title (casing-normalized). KV being
   // unavailable must never fail the call: swallow and live-fetch instead.
   if (env.WAR_CACHE) {
     try {
-      const cached = await env.WAR_CACHE.get<WikiPageFound>(
-        wikiCacheKey(title, full),
-        "json",
-      );
+      const cached = await env.WAR_CACHE.get<WikiPageFound>(requestKey, "json");
       if (cached) return { ...cached, cached: true };
     } catch {
       // KV down — fall through to a live fetch.
@@ -125,21 +128,26 @@ export async function fetchWikiPage(
     );
   }
 
-  // 3. Cache only FOUND pages, under the canonical-title key. A missing page
-  // is never cached (it might be created on the wiki later).
+  // 3. Cache only FOUND pages. Write under the canonical-title key, plus the
+  // input alias key when a redirect made it differ — so a redirect alias hits
+  // cache on its next call instead of refetching. A missing page is never
+  // cached (it might be created on the wiki later).
   if (isFound(result) && env.WAR_CACHE) {
-    try {
-      await env.WAR_CACHE.put(
-        wikiCacheKey(result.title, full),
-        JSON.stringify(result),
-        {
-          expirationTtl: full
-            ? FULL_CACHE_TTL_SECONDS
-            : INTRO_CACHE_TTL_SECONDS,
-        },
-      );
-    } catch {
-      // Cache write failures must never break a successful wiki read.
+    const serialized = JSON.stringify(result);
+    const ttl = {
+      expirationTtl: full ? FULL_CACHE_TTL_SECONDS : INTRO_CACHE_TTL_SECONDS,
+    };
+    const canonicalKey = wikiCacheKey(result.title, full);
+    const keys =
+      canonicalKey === requestKey
+        ? [canonicalKey]
+        : [canonicalKey, requestKey];
+    for (const key of keys) {
+      try {
+        await env.WAR_CACHE.put(key, serialized, ttl);
+      } catch {
+        // Cache write failures must never break a successful wiki read.
+      }
     }
   }
 

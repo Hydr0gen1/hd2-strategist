@@ -405,10 +405,17 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
     expect(calls).toHaveLength(1);
     // Endpoint is the extracts intro query.
     expect(calls[0]!.url).toContain("prop=extracts");
-    // Cache write keyed on the canonical title, not the input "Eruptor".
-    expect(kv.puts).toHaveLength(1);
-    expect(kv.puts[0]!.key).toBe("wiki:page:r-36_eruptor:intro");
-    expect(kv.puts[0]!.ttl).toBe(INTRO_CACHE_TTL_SECONDS);
+    // The input "Eruptor" redirects to the canonical "R-36 Eruptor", so the
+    // page is cached under the canonical key AND the input alias key (so a
+    // repeat alias call hits cache instead of refetching).
+    const keys = kv.puts.map((p) => p.key);
+    expect(keys).toEqual(
+      expect.arrayContaining([
+        "wiki:page:r-36_eruptor:intro",
+        "wiki:page:eruptor:intro",
+      ]),
+    );
+    expect(kv.puts.every((p) => p.ttl === INTRO_CACHE_TTL_SECONDS)).toBe(true);
     expect(INTRO_CACHE_TTL_SECONDS).toBe(86_400);
   });
 
@@ -469,6 +476,30 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
     // retrieved_at reflects the WRITE time, not the read time.
     expect(result.retrieved_at).toBe(stored.retrieved_at);
     expect(kv.puts).toHaveLength(0);
+  });
+
+  it("redirect alias: a repeat call with the same alias hits cache, never refetches", async () => {
+    const kv = fakeKv();
+    let fetchCount = 0;
+    const fetchFn = async () => {
+      fetchCount++;
+      return jsonResponse(INTRO_BODY); // input "Eruptor" → canonical "R-36 Eruptor"
+    };
+    const first = await fetchWikiPage(envWith(kv), { title: "Eruptor" }, {
+      nowMs: NOW,
+      fetchFn,
+    });
+    if ("found" in first) throw new Error("expected found");
+    expect(first.cached).toBe(false);
+
+    const second = await fetchWikiPage(envWith(kv), { title: "Eruptor" }, {
+      nowMs: NOW + 1_000,
+      fetchFn,
+    });
+    if ("found" in second) throw new Error("expected found");
+    expect(fetchCount).toBe(1); // the alias entry served the second call
+    expect(second.cached).toBe(true);
+    expect(second.title).toBe("R-36 Eruptor"); // canonical title preserved
   });
 
   it("intro and full have SEPARATE cache entries (a full request misses an intro hit)", async () => {
