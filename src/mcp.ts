@@ -19,11 +19,11 @@ import {
   getPlanet,
   getPlanetArchive,
   getPlanetHistory,
-  getPlanetWiki,
   getSourceCrossCheck,
   getSupplyGraph,
   getWarBrief,
   getWarStatus,
+  getWikiPage,
   resolvePlanetTool,
 } from "./tools";
 import { WikiError } from "./wikiClient";
@@ -175,23 +175,24 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
-    name: "get_planet_wiki",
+    name: "get_wiki_page",
     description:
-      "Community wiki LORE entry (helldivers.wiki.gg) for a planet or topic — what something means, not what is happening. Returns the plain-text lead extract, canonical page URL, and mandatory attribution (CC BY-NC-SA 4.0). A separate, non-authoritative source: community-authored background only; the live tools (get_planet, get_campaigns, get_war_status) remain authoritative for current war state. Also serves enemy/subfaction lookups like \"Jet Brigade\", \"Predator Strain\", or \"Hive Lord\" via the title argument.",
+      'Fetch a community wiki entry from helldivers.wiki.gg for any game topic: weapons, warbonds, stratagems, enemies, subfactions (e.g. "Jet Brigade"), boosters, passives, missions, biomes, or planets. Returns a plain-text lead extract by default; pass full:true for the complete page. Attribution is included in the response (CC BY-NC-SA 4.0). Non-authoritative for live war state — use get_planet / get_campaigns for current war data.',
     inputSchema: {
       type: "object",
       properties: {
-        name: {
-          type: "string",
-          description:
-            "Planet name as the live tools return it (case-insensitive; resolved to the wiki's title casing).",
-        },
         title: {
           type: "string",
           description:
-            'Explicit wiki page title, tried verbatim (e.g. "Jet Brigade", "Hive Lord"). Takes precedence over name.',
+            'The wiki page title to look up, e.g. "Eruptor", "Democratic Detonation", "Jet Brigade", "Scorcher Biome". Case-insensitive on the first letter (MediaWiki handles it).',
+        },
+        full: {
+          type: "boolean",
+          description:
+            "If true, return the full page text (raw wikitext) instead of just the intro extract. Default: false.",
         },
       },
+      required: ["title"],
       additionalProperties: false,
     },
   },
@@ -422,11 +423,11 @@ async function dispatchTool(
           name: typeof args.name === "string" ? args.name : undefined,
         }),
       );
-    case "get_planet_wiki":
+    case "get_wiki_page":
       return toolText(
-        await getPlanetWiki(env, {
-          name: typeof args.name === "string" ? args.name : undefined,
+        await getWikiPage(env, {
           title: typeof args.title === "string" ? args.title : undefined,
+          full: typeof args.full === "boolean" ? args.full : undefined,
         }),
       );
     case "get_observed_signatures":

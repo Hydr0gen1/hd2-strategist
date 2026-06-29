@@ -9,255 +9,149 @@
  * may import wiki prose into its fields. The two sources are joined only in
  * the conversation layer, by the consumer.
  *
- * Endpoint verified live (2026-06-10): the API entry point is the ROOT
- * /api.php (the /w/api.php path 404s), MediaWiki 1.43.6 with the
- * TextExtracts extension enabled (prop=extracts works; no fallback needed).
+ * Endpoints verified live (2026-06-29):
+ *   - Entry point is the ROOT /api.php (the /w/api.php path 404s).
+ *   - Intro extract: prop=extracts&explaintext=1&exintro=1 (the TextExtracts
+ *     extension IS enabled — plain text, no fallback needed).
+ *   - Full page: prop=revisions&rvprop=content&rvslots=main returns the raw
+ *     wikitext at pages[].revisions[0].slots.main.content (extracts can only
+ *     return rendered text, so a full fetch always uses revisions).
+ *   - redirects=1 resolves redirects silently; the canonical title comes back
+ *     in pages[].title ("Eruptor" → "R-36 Eruptor").
+ *   - A missing page carries a `missing` field on the page object.
+ *   - The wiki's own siteinfo rightsinfo reports CC BY-NC-SA 4.0 (NOT a plain
+ *     CC BY-SA — the NonCommercial clause is real and is reflected here).
  */
-import type { WikiResult } from "./types";
+import type { WikiPageNotFound, WikiPageResult } from "./types";
 
-export const WIKI_HOST = "helldivers.wiki.gg";
+export const WIKI_HOST = "helldivers.wiki.gg" as const;
 /** Confirmed entry point — root /api.php, NOT /w/api.php. */
 export const WIKI_API_URL = "https://helldivers.wiki.gg/api.php";
 /**
- * From the wiki's own siteinfo rightsinfo (verified live): content is
- * Creative Commons Attribution-Non-Commercial-ShareAlike 4.0. Attribution
- * is mandatory on every wiki payload, found or not.
+ * The wiki's own rightsinfo (verified live 2026-06-29): Creative Commons
+ * Attribution-NonCommercial-ShareAlike 4.0. Attribution is mandatory on every
+ * wiki payload. NOTE: the implementation spec's example said "CC BY-SA"; the
+ * live siteinfo says BY-NC-SA, and emitting the accurate license is the whole
+ * point of this correctness layer — so the verified value is what ships.
  */
 export const WIKI_LICENSE = "CC BY-NC-SA 4.0";
-export const WIKI_LICENSE_URL =
-  "https://creativecommons.org/licenses/by-nc-sa/4.0";
-/** Lead-extract length cap: keep the payload lean; the URL has the rest. */
-export const WIKI_EXTRACT_MAX_CHARS = 1_500;
-
+/** Fixed lore disclaimer string, present on every found payload. */
 export const WIKI_LORE_NOTE =
-  "Community-authored lore from the Helldivers wiki — narrative/background " +
-  "context only, not live war state. The live tools (get_planet, " +
-  "get_campaigns, get_war_status, …) are authoritative for current war " +
-  "state; any ownership, status, or numbers in this text are historical or " +
-  "in-fiction. Content license: " +
-  WIKI_LICENSE +
-  " — attribution to " +
-  WIKI_HOST +
-  " required when reusing.";
+  "Community-authored lore. Live tools (get_planet, get_campaigns, etc.) are " +
+  "authoritative for current war state.";
 
-/** A query plan: candidate page titles (preference order) + the request. */
-export interface WikiQueryPlan {
-  /** Exactly what the caller asked for, trimmed. */
-  requested: string;
-  /** Page titles to try, in preference order, deduplicated. */
-  candidates: string[];
-  /** Full Action API URL querying all candidates in one request. */
-  url: string;
-  /** KV key — separate `wiki:` namespace, never collides with `raw:`. */
-  cacheKey: string;
+/**
+ * Cache-key normalization: lowercased, spaces → underscores. Applied to the
+ * INPUT title for the read key and to the CANONICAL API title for the write
+ * key, so casing variants ("eruptor"/"ERUPTOR"/"Eruptor") collapse to one
+ * cache entry.
+ */
+export function normalizeTitle(title: string): string {
+  return title.trim().toLowerCase().replace(/ /g, "_");
+}
+
+/** KV key in the dedicated `wiki:` namespace; separate intro/full entries. */
+export function wikiCacheKey(title: string, full: boolean): string {
+  return `wiki:page:${normalizeTitle(title)}:${full ? "full" : "intro"}`;
+}
+
+/** Canonical page URL: https://helldivers.wiki.gg/wiki/{encoded_title}. */
+export function wikiPageUrl(title: string): string {
+  return `https://helldivers.wiki.gg/wiki/${encodeURIComponent(
+    title.trim().replace(/ /g, "_"),
+  )}`;
 }
 
 /**
- * Mechanical lookup-key conversion: first letter of each whitespace-run word
- * upper, rest lower ("GRAND ERRANT" → "Grand Errant"). Used ONLY to build a
- * wiki title candidate — never to reformat live tool output (display
- * formatting stays the consumer's job, per the roadmap).
+ * Build the single Action API request URL. Intro uses TextExtracts (plain
+ * text); full uses revisions (raw wikitext) because extracts cannot return
+ * wikitext. redirects=1 resolves redirects silently in both modes.
  */
-export function titleCaseWords(name: string): string {
-  return name
-    .trim()
-    .split(/\s+/)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join(" ");
-}
-
-/**
- * Build the single-request query plan. An explicit `title` is tried verbatim
- * and alone (the caller controls it). A planet `name` is tried both as sent
- * and title-cased: upstream sends ALL-CAPS names ("GRAND ERRANT") which the
- * case-sensitive wiki misses, while names like "RD-4" only match as sent —
- * so both candidates go in ONE multi-title query (verified supported) and
- * the first existing page in candidate order wins. No silent substitution
- * beyond this deterministic casing variant.
- */
-export function planWikiQuery(args: {
-  name?: string;
-  title?: string;
-}): WikiQueryPlan {
-  const requested = (args.title ?? args.name ?? "").trim();
-  const candidates =
-    args.title != null
-      ? [requested]
-      : [...new Set([requested, titleCaseWords(requested)])];
-
+export function buildWikiQueryUrl(title: string, full: boolean): string {
   const params = new URLSearchParams({
     action: "query",
     format: "json",
     formatversion: "2",
-    prop: "extracts|info",
-    inprop: "url",
-    explaintext: "1",
-    exintro: "1",
-    exlimit: "max",
     redirects: "1",
-    titles: candidates.join("|"),
+    titles: title,
   });
-
-  return {
-    requested,
-    candidates,
-    url: `${WIKI_API_URL}?${params.toString()}`,
-    cacheKey: `wiki:${candidates.join("|").toLowerCase()}`,
-  };
+  if (full) {
+    params.set("prop", "revisions");
+    params.set("rvprop", "content");
+    params.set("rvslots", "main");
+  } else {
+    params.set("prop", "extracts");
+    params.set("explaintext", "1");
+    params.set("exintro", "1");
+  }
+  return `${WIKI_API_URL}?${params.toString()}`;
 }
 
-/* ---- raw MediaWiki response shapes (only the fields we consume) ---- */
-
-interface RawWikiRename {
-  from?: unknown;
-  to?: unknown;
-}
+/* ---- raw MediaWiki response shapes (formatversion=2; only consumed fields) ---- */
 
 interface RawWikiPage {
   title?: unknown;
   missing?: unknown;
   extract?: unknown;
-  fullurl?: unknown;
-  canonicalurl?: unknown;
+  revisions?: Array<{ slots?: { main?: { content?: unknown } } }>;
 }
 
 interface RawWikiResponse {
-  query?: {
-    normalized?: RawWikiRename[];
-    redirects?: RawWikiRename[];
-    pages?: RawWikiPage[];
-  };
-}
-
-function renameMap(entries: RawWikiRename[] | undefined): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const e of entries ?? []) {
-    if (typeof e.from === "string" && typeof e.to === "string") {
-      map.set(e.from, e.to);
-    }
-  }
-  return map;
-}
-
-/** Mandatory attribution block — present on EVERY wiki payload. */
-function attribution(nowMs: number) {
-  return {
-    source: WIKI_HOST,
-    license: WIKI_LICENSE,
-    license_url: WIKI_LICENSE_URL,
-    retrieved_at: new Date(nowMs).toISOString(),
-    notes: WIKI_LORE_NOTE,
-  };
-}
-
-function notFound(
-  plan: Pick<WikiQueryPlan, "requested" | "candidates">,
-  nowMs: number,
-  url: string | null,
-  hint: string,
-): WikiResult {
-  return {
-    found: false,
-    requested: plan.requested,
-    title: plan.candidates[0] ?? plan.requested,
-    extract: null,
-    truncated: false,
-    url,
-    redirected_from: null,
-    hint,
-    ...attribution(nowMs),
-  };
+  query?: { pages?: RawWikiPage[] };
 }
 
 /**
- * Shape one raw Action API response into the tool payload. Deterministic
- * resolution: each candidate is followed through the API's `normalized` and
- * `redirects` renames to its final page title; the first candidate (in
- * preference order) whose page exists wins. A followed redirect is reported
- * in `redirected_from` — never silent. Missing page or empty extract →
- * found: false with a hint, never a hard error. Attribution is attached to
- * every outcome.
+ * Shape one raw Action API response into the tool payload. The canonical
+ * `title` (post-redirect) governs both the output and the cache write key.
+ * A `missing` page → the not-found shape (never a throw). An existing page
+ * with an empty extract is still a FOUND page (extract: ""). An unexpected
+ * body shape (no pages array) throws — the I/O layer wraps it as a WikiError.
  */
-export function shapeWikiResult(
+export function shapeWikiPage(
   body: unknown,
-  plan: Pick<WikiQueryPlan, "requested" | "candidates">,
+  args: { title: string; full: boolean },
   nowMs: number,
-): WikiResult {
-  const query = (body as RawWikiResponse | null | undefined)?.query;
-  const pages = Array.isArray(query?.pages) ? query.pages : null;
-  if (!pages) {
-    return notFound(
-      plan,
-      nowMs,
-      null,
-      "Unexpected wiki API response shape — the page may exist; try again or open the wiki directly.",
+): WikiPageResult {
+  const pages = (body as RawWikiResponse | null | undefined)?.query?.pages;
+  if (!Array.isArray(pages) || pages.length === 0) {
+    throw new Error(
+      "Unexpected wiki API response shape (no pages array) — the page may exist; try again or open the wiki directly.",
     );
   }
 
-  const normalized = renameMap(query?.normalized);
-  const redirects = renameMap(query?.redirects);
-  const byTitle = new Map<string, RawWikiPage>();
-  for (const p of pages) {
-    if (typeof p.title === "string") byTitle.set(p.title, p);
-  }
-
-  for (const candidate of plan.candidates) {
-    let title = normalized.get(candidate) ?? candidate;
-    let redirectedFrom: string | null = null;
-    // Follow redirect chains defensively (bounded — wikis forbid loops).
-    for (let hop = 0; hop < 5; hop++) {
-      const next = redirects.get(title);
-      if (next == null) break;
-      redirectedFrom = redirectedFrom ?? title;
-      title = next;
-    }
-
-    const page = byTitle.get(title);
-    if (!page || page.missing !== undefined) continue;
-
-    const url =
-      typeof page.canonicalurl === "string"
-        ? page.canonicalurl
-        : typeof page.fullurl === "string"
-          ? page.fullurl
-          : null;
-    const rawExtract =
-      typeof page.extract === "string" ? page.extract.trim() : "";
-    if (rawExtract === "") {
-      // Page exists but TextExtracts produced nothing readable (e.g. a
-      // pure-infobox or disambiguation shell): honest found:false + URL.
-      return notFound(
-        plan,
-        nowMs,
-        url,
-        `The wiki page "${title}" exists but has no plain-text intro extract. See the page URL for the full content.`,
-      );
-    }
-
-    const truncated = rawExtract.length > WIKI_EXTRACT_MAX_CHARS;
-    return {
-      found: true,
-      requested: plan.requested,
-      title,
-      extract: truncated
-        ? `${rawExtract.slice(0, WIKI_EXTRACT_MAX_CHARS).trimEnd()}…`
-        : rawExtract,
-      truncated,
-      url,
-      redirected_from: redirectedFrom,
-      ...attribution(nowMs),
+  const page = pages[0];
+  if (page == null || page.missing !== undefined) {
+    const notFound: WikiPageNotFound = {
+      found: false,
+      title: args.title,
+      url: wikiPageUrl(args.title),
+      source: WIKI_HOST,
     };
+    return notFound;
   }
 
-  // Every candidate missing: report the attempt; never substitute a page.
-  const attempted = plan.candidates[0] ?? plan.requested;
-  const missingPage = byTitle.get(attempted) ?? pages[0];
-  return notFound(
-    plan,
-    nowMs,
-    typeof missingPage?.canonicalurl === "string"
-      ? missingPage.canonicalurl
-      : null,
-    `No wiki page found for "${plan.requested}". Try the exact wiki page title via the \`title\` argument (e.g. "Jet Brigade", "Predator Strain", "Hive Lord") — no alternative page was substituted.`,
-  );
+  const canonicalTitle =
+    typeof page.title === "string" ? page.title : args.title;
+
+  let extract = "";
+  let format: "wikitext" | undefined;
+  if (args.full) {
+    const content = page.revisions?.[0]?.slots?.main?.content;
+    extract = typeof content === "string" ? content : "";
+    format = "wikitext";
+  } else {
+    extract = typeof page.extract === "string" ? page.extract : "";
+  }
+
+  return {
+    title: canonicalTitle,
+    extract,
+    url: wikiPageUrl(canonicalTitle),
+    source: WIKI_HOST,
+    license: WIKI_LICENSE,
+    retrieved_at: new Date(nowMs).toISOString(),
+    cached: false,
+    notes: WIKI_LORE_NOTE,
+    ...(format ? { format } : {}),
+  };
 }

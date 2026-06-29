@@ -3,7 +3,7 @@
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
- * get_planet_wiki, uses its own separate source pipeline (wiki.ts +
+ * get_wiki_page, uses its own separate source pipeline (wiki.ts +
  * wikiClient.ts) — lore never flows into a live war-state field.
  */
 import {
@@ -110,8 +110,7 @@ import {
   unavailableCrossCheck,
   unmatchedCampaigns,
 } from "./crosscheck";
-import { planWikiQuery, shapeWikiResult } from "./wiki";
-import { fetchWikiQuery } from "./wikiClient";
+import { fetchWikiPage } from "./wikiClient";
 import {
   HPC_CAMPAIGN_TYPES,
   campaignKind,
@@ -666,7 +665,7 @@ export async function getCampaigns(
       decay_per_hour:
         "regen_per_second × 3600 — regen in the same units as hp_per_hour. Derived from the invariant-normalized regen, so it is always null on defense campaigns (cosmetic decay stays suppressed) and null when regen is unknown.",
       modifier:
-        "Decoded special-faction name for event_type, only when the enum value is confirmed in EVENT_MODIFIER_NAMES. event_type non-null with modifier null = an active event whose enum value is not yet confirmed — visible, never named by guess. Both null = no event. Identity only, no difficulty judgment; lore/meaning lives in get_planet_wiki.",
+        "Decoded special-faction name for event_type, only when the enum value is confirmed in EVENT_MODIFIER_NAMES. event_type non-null with modifier null = an active event whose enum value is not yet confirmed — visible, never named by guess. Both null = no event. Identity only, no difficulty judgment; lore/meaning lives in get_wiki_page.",
       is_major_order_target:
         "Pure membership join against the current Major Order task planet set (the same set HPC detection consumes). major_order_id is the id of the first assignment naming the planet (upstream array order) when it appears in several; null when the planet is in no MO task. A fact, not a priority score.",
       filters:
@@ -1316,27 +1315,23 @@ export async function getSupplyGraph(
 
 /**
  * Stage 4: the LORE tool — a standalone source (helldivers.wiki.gg), never a
- * field on a live tool. Accepts a planet name (resolved to the wiki's title
- * casing) or an explicit page title (enemy/subfaction/topic lookups). The
- * payload carries mandatory attribution and the lore disclaimer on every
- * outcome and contains no live war-state numbers.
+ * field on a live tool. Fetches any wiki page by `title` (weapon, warbond,
+ * stratagem, enemy/subfaction, booster, passive, mission, biome, planet, …);
+ * `full: true` returns the raw page wikitext instead of the intro extract.
+ * The caller supplies the exact page title — no planet-index resolution. The
+ * payload carries mandatory attribution and contains no live war-state numbers.
  */
-export async function getPlanetWiki(
+export async function getWikiPage(
   env: Env,
-  args: { name?: string; title?: string },
+  args: { title?: string; full?: boolean },
 ): Promise<unknown> {
-  const requested = (args.title ?? args.name)?.trim();
-  if (!requested) {
+  const title = args.title?.trim();
+  if (!title) {
     throw new ToolError(
-      "Provide either a planet `name` (string) or an explicit wiki page `title` (string), e.g. name: \"Gacrux\" or title: \"Jet Brigade\".",
+      'Provide a wiki page `title` (string), e.g. title: "Eruptor", title: "Democratic Detonation", or title: "Jet Brigade".',
     );
   }
-  const plan = planWikiQuery(args);
-  const res = await fetchWikiQuery(env, plan);
-  return {
-    ...shapeWikiResult(res.body, plan, Date.now()),
-    ...(res.stale ? { stale: true } : {}),
-  };
+  return fetchWikiPage(env, { title, full: args.full === true });
 }
 
 export async function getDispatches(

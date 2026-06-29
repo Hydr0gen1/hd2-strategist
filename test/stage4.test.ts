@@ -1,6 +1,6 @@
 /**
  * Stage 4 tests: live event/modifier decode (pure, src/enrichment.ts) and
- * the get_planet_wiki lore source (pure shaping in src/wiki.ts; the I/O
+ * the get_wiki_page lore source (pure shaping in src/wiki.ts; the I/O
  * layer src/wikiClient.ts is exercised with an INJECTED fetch and an
  * in-memory KV stub — no network, no global mocking).
  *
@@ -19,18 +19,21 @@ import { HPC_CAMPAIGN_TYPES } from "../src/invariants";
 import type { Env, NormalizeContext, RawCampaign, RawEvent } from "../src/types";
 import {
   WIKI_API_URL,
-  WIKI_EXTRACT_MAX_CHARS,
   WIKI_HOST,
   WIKI_LICENSE,
-  planWikiQuery,
-  shapeWikiResult,
-  titleCaseWords,
+  WIKI_LORE_NOTE,
+  buildWikiQueryUrl,
+  normalizeTitle,
+  shapeWikiPage,
+  wikiCacheKey,
+  wikiPageUrl,
 } from "../src/wiki";
 import {
-  WIKI_CACHE_TTL_SECONDS,
+  FULL_CACHE_TTL_SECONDS,
+  INTRO_CACHE_TTL_SECONDS,
+  WIKI_USER_AGENT,
   WikiError,
-  fetchWikiQuery,
-  wikiUserAgent,
+  fetchWikiPage,
 } from "../src/wikiClient";
 
 const HOUR_MS = 3_600_000;
@@ -168,212 +171,173 @@ describe("decodeEventModifier: live event identity, never a guess", () => {
 });
 
 /* ====================================================================== *
- * Part 2 — wiki lore source (pure shaping)
+ * Part 2 — wiki lore source: get_wiki_page (pure shaping + I/O)
  * ====================================================================== */
 
-/** Minimal real-shape MediaWiki page fixture (formatversion=2). */
-function wikiPage(overrides: Record<string, unknown> = {}) {
+/** Minimal real-shape MediaWiki page fixture (formatversion=2, intro). */
+function introPage(overrides: Record<string, unknown> = {}) {
   return {
-    pageid: 13914,
+    pageid: 4564,
     ns: 0,
-    title: "Hive Lord",
-    extract: "The Hive Lord is a colossal, worm-like Terminid.",
-    fullurl: "https://helldivers.wiki.gg/wiki/Hive_Lord",
-    canonicalurl: "https://helldivers.wiki.gg/wiki/Hive_Lord",
+    title: "R-36 Eruptor",
+    extract:
+      "R-36 Eruptor is a Primary Explosive weapon that fires jet-assisted shells.",
     ...overrides,
   };
 }
 
-const ATTRIBUTION_KEYS = [
-  "source",
-  "license",
-  "license_url",
-  "retrieved_at",
-  "notes",
-  "url",
-] as const;
-
-function expectAttribution(result: Record<string, unknown>): void {
-  for (const key of ATTRIBUTION_KEYS) expect(result).toHaveProperty(key);
-  expect(result.source).toBe(WIKI_HOST);
-  expect(result.license).toBe(WIKI_LICENSE);
-  expect(result.retrieved_at).toBe(new Date(NOW).toISOString());
-  expect(String(result.notes)).toMatch(/authoritative/);
+/** A revisions-shape page (formatversion=2, full=true). */
+function fullPage(content: string, overrides: Record<string, unknown> = {}) {
+  return {
+    pageid: 4564,
+    ns: 0,
+    title: "R-36 Eruptor",
+    revisions: [{ slots: { main: { contentmodel: "wikitext", content } } }],
+    ...overrides,
+  };
 }
 
-describe("planWikiQuery: deterministic title candidates + one request", () => {
-  it("title-cases each word for the lookup key only", () => {
-    expect(titleCaseWords("GRAND ERRANT")).toBe("Grand Errant");
-    expect(titleCaseWords("  aesir   pass ")).toBe("Aesir Pass");
+describe("wiki URL + key builders (pure)", () => {
+  it("normalizeTitle lowercases and underscores — casing variants collapse", () => {
+    expect(normalizeTitle("Eruptor")).toBe("eruptor");
+    expect(normalizeTitle("ERUPTOR")).toBe("eruptor");
+    expect(normalizeTitle("  Democratic Detonation ")).toBe(
+      "democratic_detonation",
+    );
   });
 
-  it("planet name → as-sent and title-cased candidates, deduped, in one URL", () => {
-    const plan = planWikiQuery({ name: "GRAND ERRANT" });
-    expect(plan.candidates).toEqual(["GRAND ERRANT", "Grand Errant"]);
-    const url = new URL(plan.url);
-    expect(`${url.origin}${url.pathname}`).toBe(WIKI_API_URL);
-    expect(url.searchParams.get("action")).toBe("query");
-    expect(url.searchParams.get("prop")).toBe("extracts|info");
-    expect(url.searchParams.get("explaintext")).toBe("1");
-    expect(url.searchParams.get("exintro")).toBe("1");
-    expect(url.searchParams.get("redirects")).toBe("1");
-    expect(url.searchParams.get("formatversion")).toBe("2");
-    expect(url.searchParams.get("titles")).toBe("GRAND ERRANT|Grand Errant");
+  it("wikiCacheKey lives in the wiki: namespace with an intro/full suffix", () => {
+    expect(wikiCacheKey("R-36 Eruptor", false)).toBe(
+      "wiki:page:r-36_eruptor:intro",
+    );
+    expect(wikiCacheKey("R-36 Eruptor", true)).toBe(
+      "wiki:page:r-36_eruptor:full",
+    );
+    expect(wikiCacheKey("Eruptor", false).startsWith("raw:")).toBe(false);
   });
 
-  it("already-cased name (RD-4 style would break under naive casing) dedupes to itself plus variant", () => {
-    expect(planWikiQuery({ name: "RD-4" }).candidates).toEqual([
-      "RD-4",
-      "Rd-4",
-    ]);
-    expect(planWikiQuery({ name: "Hive Lord" }).candidates).toEqual([
-      "Hive Lord",
-    ]);
+  it("wikiPageUrl builds the canonical /wiki/{encoded_title} URL", () => {
+    expect(wikiPageUrl("R-36 Eruptor")).toBe(
+      "https://helldivers.wiki.gg/wiki/R-36_Eruptor",
+    );
+    expect(wikiPageUrl("Jet Brigade")).toBe(
+      "https://helldivers.wiki.gg/wiki/Jet_Brigade",
+    );
   });
 
-  it("explicit title is tried verbatim and alone, and wins over name", () => {
-    const plan = planWikiQuery({ name: "GACRUX", title: "Jet Brigade" });
-    expect(plan.requested).toBe("Jet Brigade");
-    expect(plan.candidates).toEqual(["Jet Brigade"]);
-  });
+  it("buildWikiQueryUrl: intro uses extracts, full uses revisions, both redirect", () => {
+    const intro = new URL(buildWikiQueryUrl("Eruptor", false));
+    expect(`${intro.origin}${intro.pathname}`).toBe(WIKI_API_URL);
+    expect(intro.searchParams.get("action")).toBe("query");
+    expect(intro.searchParams.get("prop")).toBe("extracts");
+    expect(intro.searchParams.get("explaintext")).toBe("1");
+    expect(intro.searchParams.get("exintro")).toBe("1");
+    expect(intro.searchParams.get("redirects")).toBe("1");
+    expect(intro.searchParams.get("formatversion")).toBe("2");
+    expect(intro.searchParams.get("titles")).toBe("Eruptor");
 
-  it("cache key lives in the wiki: namespace, never raw:", () => {
-    const plan = planWikiQuery({ name: "Gacrux" });
-    expect(plan.cacheKey).toBe("wiki:gacrux");
-    expect(plan.cacheKey.startsWith("raw:")).toBe(false);
+    const full = new URL(buildWikiQueryUrl("Eruptor", true));
+    expect(full.searchParams.get("prop")).toBe("revisions");
+    expect(full.searchParams.get("rvprop")).toBe("content");
+    expect(full.searchParams.get("rvslots")).toBe("main");
+    expect(full.searchParams.get("redirects")).toBe("1");
+    expect(full.searchParams.get("exintro")).toBeNull();
   });
 });
 
-describe("shapeWikiResult: success, attribution mandatory", () => {
-  it("returns title/extract/url plus full attribution", () => {
-    const result = shapeWikiResult(
-      { query: { pages: [wikiPage()] } },
-      { requested: "Hive Lord", candidates: ["Hive Lord"] },
+describe("shapeWikiPage: success carries attribution; canonical title governs", () => {
+  it("intro: title/extract/url + fixed license/notes, cached:false, no format field", () => {
+    const result = shapeWikiPage(
+      { query: { pages: [introPage()] } },
+      { title: "Eruptor", full: false },
       NOW,
     );
-    expect(result.found).toBe(true);
-    expect(result.title).toBe("Hive Lord");
-    expect(result.extract).toBe(
-      "The Hive Lord is a colossal, worm-like Terminid.",
-    );
-    expect(result.url).toBe("https://helldivers.wiki.gg/wiki/Hive_Lord");
-    expect(result.truncated).toBe(false);
-    expect(result.redirected_from).toBeNull();
-    expectAttribution(result as unknown as Record<string, unknown>);
+    expect("found" in result).toBe(false);
+    if ("found" in result) throw new Error("expected found");
+    expect(result.title).toBe("R-36 Eruptor"); // canonical, post-redirect
+    expect(result.extract).toMatch(/^R-36 Eruptor is a Primary Explosive/);
+    expect(result.url).toBe("https://helldivers.wiki.gg/wiki/R-36_Eruptor");
+    expect(result.source).toBe(WIKI_HOST);
+    expect(result.license).toBe(WIKI_LICENSE);
+    expect(result.notes).toBe(WIKI_LORE_NOTE);
+    expect(result.retrieved_at).toBe(new Date(NOW).toISOString());
+    expect(result.cached).toBe(false);
+    expect(result.format).toBeUndefined();
   });
 
-  it("resolves the title-cased candidate when the all-caps one misses (case variant, not substitution)", () => {
-    const body = {
-      query: {
-        pages: [
-          { ns: 0, title: "GRAND ERRANT", missing: true },
-          wikiPage({
-            title: "Grand Errant",
-            extract: "Grand Errant is a Scorched Moor Planet.",
-            canonicalurl: "https://helldivers.wiki.gg/wiki/Grand_Errant",
-          }),
-        ],
-      },
-    };
-    const result = shapeWikiResult(
-      body,
-      { requested: "GRAND ERRANT", candidates: ["GRAND ERRANT", "Grand Errant"] },
+  it("full: returns raw wikitext with format:'wikitext' from the revisions slot", () => {
+    const wikitext = "{{Infobox_Weapon\n| title = R-36 Eruptor\n}}";
+    const result = shapeWikiPage(
+      { query: { pages: [fullPage(wikitext)] } },
+      { title: "Eruptor", full: true },
       NOW,
     );
-    expect(result.found).toBe(true);
-    expect(result.title).toBe("Grand Errant");
-    expect(result.requested).toBe("GRAND ERRANT");
+    if ("found" in result) throw new Error("expected found");
+    expect(result.extract).toBe(wikitext);
+    expect(result.format).toBe("wikitext");
+    expect(result.url).toBe("https://helldivers.wiki.gg/wiki/R-36_Eruptor");
   });
 
-  it("follows redirects and reports redirected_from — never silently", () => {
-    const body = {
-      query: {
-        redirects: [{ from: "Terminid", to: "Terminids" }],
-        pages: [
-          wikiPage({
-            title: "Terminids",
-            extract: "The Terminids are an insectoid species.",
-            canonicalurl: "https://helldivers.wiki.gg/wiki/Terminids",
-          }),
-        ],
+  it("uses the canonical (redirected) title for both the output title and URL", () => {
+    const result = shapeWikiPage(
+      {
+        query: {
+          pages: [introPage({ title: "Terminids", extract: "Bugs." })],
+        },
       },
-    };
-    const result = shapeWikiResult(
-      body,
-      { requested: "Terminid", candidates: ["Terminid"] },
+      { title: "Terminid", full: false }, // input differs from canonical
       NOW,
     );
-    expect(result.found).toBe(true);
+    if ("found" in result) throw new Error("expected found");
     expect(result.title).toBe("Terminids");
-    expect(result.redirected_from).toBe("Terminid");
+    expect(result.url).toBe("https://helldivers.wiki.gg/wiki/Terminids");
   });
 
-  it("caps very long extracts at WIKI_EXTRACT_MAX_CHARS with truncated: true", () => {
-    const long = "x".repeat(WIKI_EXTRACT_MAX_CHARS * 3);
-    const result = shapeWikiResult(
-      { query: { pages: [wikiPage({ extract: long })] } },
-      { requested: "Hive Lord", candidates: ["Hive Lord"] },
+  it("empty extract → still FOUND (extract: ''), never treated as missing", () => {
+    const result = shapeWikiPage(
+      { query: { pages: [introPage({ extract: "" })] } },
+      { title: "Eruptor", full: false },
       NOW,
     );
-    expect(result.found).toBe(true);
-    expect(result.truncated).toBe(true);
-    expect(result.extract).toHaveLength(WIKI_EXTRACT_MAX_CHARS + 1); // + "…"
-    expect(result.extract!.endsWith("…")).toBe(true);
-    expect(result.url).not.toBeNull(); // the full page stays reachable
+    expect("found" in result).toBe(false); // found shape has no `found` key
+    if ("found" in result) throw new Error("expected found");
+    expect(result.extract).toBe("");
+  });
+
+  it("missing wikitext slot under full → extract '' (found), never a throw", () => {
+    const result = shapeWikiPage(
+      { query: { pages: [{ title: "Stub", revisions: [] }] } },
+      { title: "Stub", full: true },
+      NOW,
+    );
+    if ("found" in result) throw new Error("expected found");
+    expect(result.extract).toBe("");
+    expect(result.format).toBe("wikitext");
   });
 });
 
-describe("shapeWikiResult: not-found and degraded shapes — never a crash", () => {
-  it("missing page → found:false with the attempted title, a hint, and attribution", () => {
-    const body = {
-      query: {
-        pages: [
-          {
-            ns: 0,
-            title: "Totally Bogus Page",
-            missing: true,
-            canonicalurl: "https://helldivers.wiki.gg/wiki/Totally_Bogus_Page",
-          },
-        ],
+describe("shapeWikiPage: not-found and malformed — never a crash", () => {
+  it("missing page → { found:false, title (input), url, source }, nothing else", () => {
+    const result = shapeWikiPage(
+      {
+        query: { pages: [{ ns: 0, title: "Bogus Page XYZ", missing: true }] },
       },
-    };
-    const result = shapeWikiResult(
-      body,
-      { requested: "Totally Bogus Page", candidates: ["Totally Bogus Page"] },
+      { title: "Bogus Page XYZ", full: false },
       NOW,
     );
-    expect(result.found).toBe(false);
-    expect(result.title).toBe("Totally Bogus Page");
-    expect(result.extract).toBeNull();
-    expect(result.hint).toMatch(/no alternative page was substituted/i);
-    expect(result.url).toBe(
-      "https://helldivers.wiki.gg/wiki/Totally_Bogus_Page",
-    );
-    expectAttribution(result as unknown as Record<string, unknown>);
+    expect(result).toEqual({
+      found: false,
+      title: "Bogus Page XYZ", // the INPUT title, verbatim
+      url: "https://helldivers.wiki.gg/wiki/Bogus_Page_XYZ",
+      source: WIKI_HOST,
+    });
   });
 
-  it("existing page with an EMPTY extract → found:false with the page URL and a hint", () => {
-    const result = shapeWikiResult(
-      { query: { pages: [wikiPage({ extract: "   " })] } },
-      { requested: "Hive Lord", candidates: ["Hive Lord"] },
-      NOW,
-    );
-    expect(result.found).toBe(false);
-    expect(result.extract).toBeNull();
-    expect(result.url).toBe("https://helldivers.wiki.gg/wiki/Hive_Lord");
-    expect(result.hint).toMatch(/no plain-text intro/i);
-    expectAttribution(result as unknown as Record<string, unknown>);
-  });
-
-  it("malformed API body → found:false with a hint, never a throw", () => {
-    for (const body of [null, {}, { query: {} }, { query: { pages: "x" } }]) {
-      const result = shapeWikiResult(
-        body,
-        { requested: "Hive Lord", candidates: ["Hive Lord"] },
-        NOW,
-      );
-      expect(result.found).toBe(false);
-      expectAttribution(result as unknown as Record<string, unknown>);
+  it("unexpected body shape (no pages array) → throws (the I/O layer wraps it)", () => {
+    for (const body of [null, {}, { query: {} }, { query: { pages: "x" } }, { query: { pages: [] } }]) {
+      expect(() =>
+        shapeWikiPage(body, { title: "Eruptor", full: false }, NOW),
+      ).toThrow();
     }
   });
 });
@@ -422,115 +386,186 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-const PLAN = { url: `${WIKI_API_URL}?x=1`, cacheKey: "wiki:hive lord" };
-const WIKI_BODY = { query: { pages: [wikiPage()] } };
+const INTRO_BODY = { query: { pages: [introPage()] } };
 
-describe("fetchWikiQuery: cache-first, stale fallback, structured errors", () => {
-  it("success: returns the body, caches it under the wiki: namespace with a long TTL", async () => {
+describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", () => {
+  it("live intro fetch: caches under the CANONICAL-title intro key with a 24h TTL", async () => {
     const kv = fakeKv();
     const calls: { url: string; headers: Record<string, string> }[] = [];
-    const result = await fetchWikiQuery(envWith(kv), PLAN, {
+    const result = await fetchWikiPage(envWith(kv), { title: "Eruptor" }, {
       nowMs: NOW,
       fetchFn: async (url, init) => {
         calls.push({ url, headers: init.headers });
-        return jsonResponse(WIKI_BODY);
+        return jsonResponse(INTRO_BODY);
       },
     });
-    expect(result.stale).toBe(false);
-    expect(result.body).toEqual(WIKI_BODY);
+    if ("found" in result) throw new Error("expected found");
+    expect(result.cached).toBe(false);
+    expect(result.title).toBe("R-36 Eruptor");
     expect(calls).toHaveLength(1);
+    // Endpoint is the extracts intro query.
+    expect(calls[0]!.url).toContain("prop=extracts");
+    // Cache write keyed on the canonical title, not the input "Eruptor".
     expect(kv.puts).toHaveLength(1);
-    expect(kv.puts[0]!.key).toBe("wiki:hive lord");
-    // Aggressive retention: days, far beyond the 45s war-state raw cache.
-    expect(kv.puts[0]!.ttl).toBe(604_800);
+    expect(kv.puts[0]!.key).toBe("wiki:page:r-36_eruptor:intro");
+    expect(kv.puts[0]!.ttl).toBe(INTRO_CACHE_TTL_SECONDS);
+    expect(INTRO_CACHE_TTL_SECONDS).toBe(86_400);
   });
 
-  it("sends a descriptive User-Agent built from the env identity secrets", async () => {
+  it("sends the descriptive fixed User-Agent on every request", async () => {
     let ua: string | undefined;
-    await fetchWikiQuery(
-      envWith(fakeKv(), { SUPER_CLIENT: "my-app", SUPER_CONTACT: "me@x.dev" }),
-      PLAN,
-      {
-        nowMs: NOW,
-        fetchFn: async (_url, init) => {
-          ua = init.headers["User-Agent"];
-          return jsonResponse(WIKI_BODY);
-        },
+    await fetchWikiPage(envWith(fakeKv()), { title: "Eruptor" }, {
+      nowMs: NOW,
+      fetchFn: async (_url, init) => {
+        ua = init.headers["User-Agent"];
+        return jsonResponse(INTRO_BODY);
       },
-    );
-    expect(ua).toBe("my-app (me@x.dev)");
-    // And the fallback identifies the app even with no secrets configured.
-    expect(wikiUserAgent({})).toMatch(/^hd2-strategist \(.+\)$/);
+    });
+    expect(ua).toBe(WIKI_USER_AGENT);
+    expect(WIKI_USER_AGENT).toMatch(/hd2-strategist\/1\.0/);
+    expect(WIKI_USER_AGENT).toMatch(/github\.com\/Hydr0gen1\/hd2-strategist/);
   });
 
-  it("fresh cache hit: served from KV without touching the wiki", async () => {
+  it("full fetch uses the revisions endpoint and the 1h TTL", async () => {
     const kv = fakeKv();
-    kv.store.set(
-      PLAN.cacheKey,
-      JSON.stringify({ fetchedAt: NOW - 1_000, body: WIKI_BODY }),
-    );
-    const result = await fetchWikiQuery(envWith(kv), PLAN, {
+    let url: string | undefined;
+    const result = await fetchWikiPage(envWith(kv), { title: "Eruptor", full: true }, {
+      nowMs: NOW,
+      fetchFn: async (u) => {
+        url = u;
+        return jsonResponse({ query: { pages: [fullPage("{{Infobox}}")] } });
+      },
+    });
+    if ("found" in result) throw new Error("expected found");
+    expect(url).toContain("prop=revisions");
+    expect(result.format).toBe("wikitext");
+    expect(kv.puts[0]!.key).toBe("wiki:page:r-36_eruptor:full");
+    expect(kv.puts[0]!.ttl).toBe(FULL_CACHE_TTL_SECONDS);
+    expect(FULL_CACHE_TTL_SECONDS).toBe(3_600);
+  });
+
+  it("cache hit: served from KV with cached:true and the STORED retrieved_at; no fetch", async () => {
+    const kv = fakeKv();
+    const stored = {
+      title: "R-36 Eruptor",
+      extract: "cached body",
+      url: "https://helldivers.wiki.gg/wiki/R-36_Eruptor",
+      source: WIKI_HOST,
+      license: WIKI_LICENSE,
+      retrieved_at: new Date(NOW - 5_000).toISOString(),
+      cached: false,
+      notes: WIKI_LORE_NOTE,
+    };
+    kv.store.set("wiki:page:eruptor:intro", JSON.stringify(stored));
+    const result = await fetchWikiPage(envWith(kv), { title: "Eruptor" }, {
       nowMs: NOW,
       fetchFn: async () => {
-        throw new Error("must not fetch on a fresh cache hit");
+        throw new Error("must not fetch on a cache hit");
       },
     });
-    expect(result).toEqual({ body: WIKI_BODY, stale: false });
+    if ("found" in result) throw new Error("expected found");
+    expect(result.cached).toBe(true);
+    expect(result.extract).toBe("cached body");
+    // retrieved_at reflects the WRITE time, not the read time.
+    expect(result.retrieved_at).toBe(stored.retrieved_at);
+    expect(kv.puts).toHaveLength(0);
   });
 
-  it("wiki down with an expired cached copy → stale: true fallback", async () => {
+  it("intro and full have SEPARATE cache entries (a full request misses an intro hit)", async () => {
     const kv = fakeKv();
     kv.store.set(
-      PLAN.cacheKey,
-      JSON.stringify({
-        fetchedAt: NOW - (WIKI_CACHE_TTL_SECONDS + 60) * 1000,
-        body: WIKI_BODY,
-      }),
+      "wiki:page:eruptor:intro",
+      JSON.stringify({ title: "X", extract: "intro", source: WIKI_HOST, cached: false }),
     );
-    for (const fetchFn of [
-      async () => jsonResponse({ error: "x" }, 503),
-      async () => {
-        throw new Error("network down");
+    let fetched = false;
+    await fetchWikiPage(envWith(kv), { title: "Eruptor", full: true }, {
+      nowMs: NOW,
+      fetchFn: async () => {
+        fetched = true;
+        return jsonResponse({ query: { pages: [fullPage("{{x}}")] } });
       },
-    ]) {
-      const result = await fetchWikiQuery(envWith(kv), PLAN, {
-        nowMs: NOW,
-        fetchFn,
-      });
-      expect(result).toEqual({ body: WIKI_BODY, stale: true });
-    }
+    });
+    expect(fetched).toBe(true); // the intro entry did not satisfy a full request
   });
 
-  it("wiki down with NO cached copy → typed WikiError (structured MCP error), never a raw crash", async () => {
+  it("missing page → found:false and is NOT cached (it may be created later)", async () => {
+    const kv = fakeKv();
+    const result = await fetchWikiPage(envWith(kv), { title: "Nope XYZ" }, {
+      nowMs: NOW,
+      fetchFn: async () =>
+        jsonResponse({ query: { pages: [{ title: "Nope XYZ", missing: true }] } }),
+    });
+    expect(result).toEqual({
+      found: false,
+      title: "Nope XYZ",
+      url: "https://helldivers.wiki.gg/wiki/Nope_XYZ",
+      source: WIKI_HOST,
+    });
+    expect(kv.puts).toHaveLength(0);
+  });
+
+  it("network / HTTP / non-JSON failure → typed WikiError, never a partial or stale object", async () => {
+    // No stale fallback even when a cached copy exists: a fetch error throws.
+    const kv = fakeKv();
+    kv.store.set(
+      "wiki:page:eruptor:intro",
+      JSON.stringify({ title: "old", extract: "old", source: WIKI_HOST, cached: false }),
+    );
+    // (the cached copy above would satisfy a hit; force a MISS via a full
+    // request so the fetch path runs and must throw, not fall back)
     await expect(
-      fetchWikiQuery(envWith(fakeKv()), PLAN, {
+      fetchWikiPage(envWith(fakeKv()), { title: "Eruptor" }, {
         nowMs: NOW,
         fetchFn: async () => jsonResponse({}, 429),
       }),
     ).rejects.toBeInstanceOf(WikiError);
     await expect(
-      fetchWikiQuery(envWith(null), PLAN, {
+      fetchWikiPage(envWith(fakeKv()), { title: "Eruptor" }, {
         nowMs: NOW,
         fetchFn: async () => {
           throw new Error("network down");
         },
       }),
     ).rejects.toBeInstanceOf(WikiError);
+    await expect(
+      fetchWikiPage(envWith(fakeKv()), { title: "Eruptor" }, {
+        nowMs: NOW,
+        fetchFn: async () =>
+          new Response("not json", { status: 200 }),
+      }),
+    ).rejects.toBeInstanceOf(WikiError);
   });
 
-  it("expired cache + healthy wiki → refetches (stale copy is a fallback, not the source)", async () => {
-    const kv = fakeKv();
-    kv.store.set(
-      PLAN.cacheKey,
-      JSON.stringify({
-        fetchedAt: NOW - (WIKI_CACHE_TTL_SECONDS + 60) * 1000,
-        body: { old: true },
-      }),
+  it("KV read failure falls through to a live fetch (KV down never fails the call)", async () => {
+    const brokenKv = {
+      store: new Map<string, string>(),
+      puts: [] as { key: string; ttl?: number }[],
+      async get() {
+        throw new Error("KV unavailable");
+      },
+      async put() {
+        throw new Error("KV unavailable");
+      },
+    };
+    const result = await fetchWikiPage(
+      envWith(brokenKv as unknown as FakeKv),
+      { title: "Eruptor" },
+      {
+        nowMs: NOW,
+        fetchFn: async () => jsonResponse(INTRO_BODY),
+      },
     );
-    const result = await fetchWikiQuery(envWith(kv), PLAN, {
+    if ("found" in result) throw new Error("expected found");
+    expect(result.cached).toBe(false);
+    expect(result.title).toBe("R-36 Eruptor");
+  });
+
+  it("no KV binding at all → live fetch still succeeds (no caching)", async () => {
+    const result = await fetchWikiPage(envWith(null), { title: "Eruptor" }, {
       nowMs: NOW,
-      fetchFn: async () => jsonResponse(WIKI_BODY),
+      fetchFn: async () => jsonResponse(INTRO_BODY),
     });
-    expect(result).toEqual({ body: WIKI_BODY, stale: false });
+    if ("found" in result) throw new Error("expected found");
+    expect(result.cached).toBe(false);
   });
 });

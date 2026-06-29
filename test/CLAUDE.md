@@ -76,18 +76,25 @@ the project's definition of done:
     both null; additive over `normalizeCampaign` (invariant 1 untouched).
   - `EVENT_MODIFIER_NAMES` ships EMPTY — pinned by test. When a live event
     confirms an enum value, seed the map AND update that test together.
-  - Wiki pure (`wiki.ts`): candidate planning (as-sent + title-cased, deduped,
-    one multi-title URL, `wiki:` cache key); success carries title/extract/
-    canonical URL; redirect followed and reported via `redirected_from`;
-    missing page and empty extract → `found: false` + hint, no throw;
-    malformed body → `found: false`, no throw; long extract capped at
-    `WIKI_EXTRACT_MAX_CHARS` with `truncated: true`.
-  - **Attribution always present** (source/license/license_url/retrieved_at/
-    notes/url) on every wiki outcome, found or not.
-  - Wiki I/O (`wikiClient.ts`, injected fetch + in-memory KV): fresh cache hit
-    never fetches; success caches under `wiki:` with the long TTL; failure →
-    stale fallback when a copy exists, typed `WikiError` when not; descriptive
-    User-Agent built from SUPER_CLIENT/SUPER_CONTACT with safe fallbacks.
+  - Wiki pure (`wiki.ts`, `get_wiki_page`): `normalizeTitle`/`wikiCacheKey`
+    (lowercased + underscored, `wiki:page:{title}:{intro|full}`), `wikiPageUrl`
+    (`/wiki/{encoded_title}`), `buildWikiQueryUrl` (intro `prop=extracts`,
+    full `prop=revisions` + slots, both `redirects=1`); `shapeWikiPage` success
+    carries the CANONICAL title/extract/url + fixed license/notes (`cached:
+    false`, no `format` for intro; raw wikitext + `format: "wikitext"` for
+    full); an empty extract stays FOUND (`extract: ""`); a missing page →
+    `{ found:false, title (input), url, source }`; an unexpected body shape
+    THROWS (the I/O layer wraps it).
+  - **Attribution + license** (source = host, license = the verified `CC
+    BY-NC-SA 4.0`, notes = fixed disclaimer) on every found payload.
+  - Wiki I/O (`wikiClient.ts`, injected fetch + in-memory KV): a cache hit is
+    served with `cached: true` and the STORED `retrieved_at`, no fetch; a live
+    fetch caches FOUND pages under the canonical-title key with the right TTL
+    (24h intro / 1h full); intro and full are separate entries; a missing page
+    is NOT cached; any network/HTTP/non-JSON failure throws a typed `WikiError`
+    (no stale fallback, no partial object); a KV read failure (or absent KV)
+    falls through to a live fetch; the fixed descriptive `User-Agent` rides
+    every request.
 
 - Stage 5 (`stage5.test.ts`):
   - `foldSignatures`: new tuple appended with `first_seen`; repeat tuple bumps
