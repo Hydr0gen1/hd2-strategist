@@ -150,8 +150,14 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
   own `wiki:` KV namespace, mandatory attribution on every payload). It takes
   an arbitrary page `title` (weapons, warbonds, stratagems, enemies, biomes,
   planets, …) and an optional `full` flag (intro extract vs raw wikitext).
-  Wiki prose must never appear in a live war-state field, live tools must never
-  call the wiki, and the wiki payload must never carry live war numbers.
+  The DEFAULT (intro) response also carries a structured `infobox` (`{ type,
+  fields }`) parsed from the page wikitext (its own `wiki:page:{title}:wikitext`
+  cache key, 1h TTL, fetched separately and NEVER baked into the 24h intro
+  entry); a wikitext outage degrades to `{ type: null, fields: {} }`, never a
+  failed call. `infobox` is community LORE like the rest of the payload — never
+  a live war number, and absent under `full: true`. Wiki prose must never appear
+  in a live war-state field, live tools must never call the wiki, and the wiki
+  payload must never carry live war numbers.
 - **Secrets**: `SUPER_CLIENT` / `SUPER_CONTACT` come from `wrangler secret put`
   and are read from `env`. Never hardcode them, never commit them, never add
   them to `wrangler.toml`.

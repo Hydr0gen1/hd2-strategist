@@ -96,6 +96,21 @@ the project's definition of done:
     (no stale fallback, no partial object); a KV read failure (or absent KV)
     falls through to a live fetch; the fixed descriptive `User-Agent` rides
     every request.
+  - Infobox (`parseInfobox`, pure + its I/O wiring): the two spec examples
+    (R-36 Eruptor weapon, Democratic Detonation warbond) parse byte-exact;
+    `cleanInfoboxValue` per-rule (Damage 2nd-segment-first-token, Armor
+    type+number, Currency amount+kind, `{{*}}`→", ", `<br>`→" / ", link
+    display-text, `<small>`/italic strip, unmatched `{{` stripped never thrown);
+    type detection across the four families (underscore/space, case-insensitive)
+    and `null` for unrecognized/absent; brace-depth block boundary (closing `}}`
+    sharing a line with nested templates); first-infobox-only; `image`/
+    `caption-image` skipped; hyphenated keys (`credit-claim`) keep the hyphen.
+    Wiring: a default request makes a SECOND (revisions) fetch and caches the
+    raw wikitext under `wiki:page:{title}:wikitext` (1h TTL, canonical + alias),
+    NEVER baked into the intro entry (asserted infobox-free); the intro/wikitext
+    aliases both serve a repeat call; `full: true` is UNCHANGED (no infobox, no
+    extra fetch, no `:wikitext` put); a wikitext network/HTTP failure degrades
+    to `{ type: null, fields: {} }` and never fails the intro response.
 
 - Stage 5 (`stage5.test.ts`):
   - `foldSignatures`: new tuple appended with `first_seen`; repeat tuple bumps

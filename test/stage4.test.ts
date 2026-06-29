@@ -29,8 +29,15 @@ import {
   wikiPageUrl,
 } from "../src/wiki";
 import {
+  cleanInfoboxValue,
+  extractWikitextContent,
+  parseInfobox,
+  wikiWikitextCacheKey,
+} from "../src/wiki";
+import {
   FULL_CACHE_TTL_SECONDS,
   INTRO_CACHE_TTL_SECONDS,
+  WIKITEXT_CACHE_TTL_SECONDS,
   WIKI_USER_AGENT,
   WikiError,
   fetchWikiPage,
@@ -374,7 +381,7 @@ describe("shapeWikiPage: not-found and malformed — never a crash", () => {
 interface FakeKv {
   store: Map<string, string>;
   puts: { key: string; ttl?: number }[];
-  get(key: string, type: "json"): Promise<unknown>;
+  get(key: string, type?: "json" | "text"): Promise<unknown>;
   put(
     key: string,
     value: string,
@@ -386,9 +393,11 @@ function fakeKv(): FakeKv {
   return {
     store: new Map<string, string>(),
     puts: [],
-    async get(key: string) {
+    // Mirrors KV's typed get: "text" returns the raw string, "json" parses.
+    async get(key: string, type: "json" | "text" = "json") {
       const raw = this.store.get(key);
-      return raw == null ? null : JSON.parse(raw);
+      if (raw == null) return null;
+      return type === "text" ? raw : JSON.parse(raw);
     },
     async put(key: string, value: string, opts?: { expirationTtl?: number }) {
       this.store.set(key, value);
@@ -413,6 +422,69 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const INTRO_BODY = { query: { pages: [introPage()] } };
 
+/* Real-shape wikitext fixtures from the spec's concrete examples. */
+const ERUPTOR_WIKITEXT = `{{Infobox_Weapon
+| title = R-36 Eruptor
+| damage = {{Damage|Ballistic|230 Projectile|notext}}<br> {{Damage|Explosion|225}}
+| penetration = {{Armor|4|AP}} (Projectile)<br> {{Armor|3|AP}} (Explosion)
+| capacity = 5
+| recoil = 75
+| fire_rate = 32 rpm
+| dps = 853.12
+| weapon_traits = Explosive {{*}} Heavy Armor Penetrating
+| source = [[Democratic Detonation Premium Warbond#Page 2|Democratic Detonation]] <small>{{Tooltip|P2|Page 2}}</small>
+| cost = {{Currency|Medals|60}}
+| spare_mags = 6
+| firing_modes = Bolt-Action
+| scope_options = 50m {{*}} 100m {{*}} 200m
+| weapon_category = Primary Weapons
+| weapon_type = Explosives
+| supply_box_refill = 6
+| ammo_box_refill = 3
+| image = R-36 Eruptor.png
+}}
+
+The '''R-36 Eruptor''' is a primary weapon.`;
+
+const ERUPTOR_FIELDS: Record<string, string> = {
+  title: "R-36 Eruptor",
+  damage: "230 / 225",
+  penetration: "AP4 (Projectile) / AP3 (Explosion)",
+  capacity: "5",
+  recoil: "75",
+  fire_rate: "32 rpm",
+  dps: "853.12",
+  weapon_traits: "Explosive, Heavy Armor Penetrating",
+  source: "Democratic Detonation",
+  cost: "60 Medals",
+  spare_mags: "6",
+  firing_modes: "Bolt-Action",
+  scope_options: "50m, 100m, 200m",
+  weapon_category: "Primary Weapons",
+  weapon_type: "Explosives",
+  supply_box_refill: "6",
+  ammo_box_refill: "3",
+};
+
+const WARBOND_WIKITEXT = `{{Infobox Warbond
+|title=Democratic Detonation
+|date=April 11th, 2024
+|cost={{Currency|SC|1,000}}
+|credit-claim={{Currency|SC|300}}
+|all-pages={{Currency|Medals|230}}
+|all-items={{Currency|Medals|699}}
+|image=Democratic Detonation.png
+}}`;
+
+const WARBOND_FIELDS: Record<string, string> = {
+  title: "Democratic Detonation",
+  date: "April 11th, 2024",
+  cost: "1,000 SC",
+  "credit-claim": "300 SC",
+  "all-pages": "230 Medals",
+  "all-items": "699 Medals",
+};
+
 describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", () => {
   it("live intro fetch: caches under the CANONICAL-title intro key with a 24h TTL", async () => {
     const kv = fakeKv();
@@ -421,27 +493,51 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
       nowMs: NOW,
       fetchFn: async (url, init) => {
         calls.push({ url, headers: init.headers });
-        return jsonResponse(INTRO_BODY);
+        // A default request now also pulls the wikitext (for the infobox).
+        return url.includes("prop=revisions")
+          ? jsonResponse({ query: { pages: [fullPage(ERUPTOR_WIKITEXT)] } })
+          : jsonResponse(INTRO_BODY);
       },
     });
     if ("found" in result) throw new Error("expected found");
     expect(result.cached).toBe(false);
     expect(result.title).toBe("R-36 Eruptor");
-    expect(calls).toHaveLength(1);
-    // Endpoint is the extracts intro query.
+    // Two fetches now: the extracts intro AND the revisions wikitext (infobox).
+    expect(calls).toHaveLength(2);
     expect(calls[0]!.url).toContain("prop=extracts");
+    expect(calls[1]!.url).toContain("prop=revisions");
     // The input "Eruptor" redirects to the canonical "R-36 Eruptor", so the
     // page is cached under the canonical key AND the input alias key (so a
     // repeat alias call hits cache instead of refetching).
-    const keys = kv.puts.map((p) => p.key);
-    expect(keys).toEqual(
+    const introPuts = kv.puts.filter((p) => p.key.endsWith(":intro"));
+    expect(introPuts.map((p) => p.key)).toEqual(
       expect.arrayContaining([
         "wiki:page:r-36_eruptor:intro",
         "wiki:page:eruptor:intro",
       ]),
     );
-    expect(kv.puts.every((p) => p.ttl === INTRO_CACHE_TTL_SECONDS)).toBe(true);
+    expect(introPuts.every((p) => p.ttl === INTRO_CACHE_TTL_SECONDS)).toBe(true);
     expect(INTRO_CACHE_TTL_SECONDS).toBe(86_400);
+    // The raw wikitext is cached separately under the :wikitext key (1h TTL),
+    // NOT baked into the intro entry.
+    const wikitextPuts = kv.puts.filter((p) => p.key.endsWith(":wikitext"));
+    expect(wikitextPuts.map((p) => p.key)).toEqual(
+      expect.arrayContaining([
+        "wiki:page:r-36_eruptor:wikitext",
+        "wiki:page:eruptor:wikitext",
+      ]),
+    );
+    expect(wikitextPuts.every((p) => p.ttl === WIKITEXT_CACHE_TTL_SECONDS)).toBe(
+      true,
+    );
+    expect(WIKITEXT_CACHE_TTL_SECONDS).toBe(3_600);
+    // The intro cache entry stays infobox-free (the field is assembled per call
+    // from the wikitext cache).
+    expect(JSON.parse(kv.store.get("wiki:page:r-36_eruptor:intro")!)).not.toHaveProperty(
+      "infobox",
+    );
+    // The served response carries the parsed weapon infobox.
+    expect(result.infobox).toEqual({ type: "weapon", fields: ERUPTOR_FIELDS });
   });
 
   it("sends the descriptive fixed User-Agent on every request", async () => {
@@ -489,6 +585,9 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
       notes: WIKI_LORE_NOTE,
     };
     kv.store.set("wiki:page:eruptor:intro", JSON.stringify(stored));
+    // Pre-seed the wikitext cache too, so the infobox is assembled with NO
+    // network at all (the intro and its infobox both come from KV).
+    kv.store.set("wiki:page:eruptor:wikitext", ERUPTOR_WIKITEXT);
     const result = await fetchWikiPage(envWith(kv), { title: "Eruptor" }, {
       nowMs: NOW,
       fetchFn: async () => {
@@ -500,14 +599,21 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
     expect(result.extract).toBe("cached body");
     // retrieved_at reflects the WRITE time, not the read time.
     expect(result.retrieved_at).toBe(stored.retrieved_at);
+    // Infobox assembled from the cached wikitext, no fetch, no write.
+    expect(result.infobox).toEqual({ type: "weapon", fields: ERUPTOR_FIELDS });
     expect(kv.puts).toHaveLength(0);
   });
 
   it("redirect alias: a repeat call with the same alias hits cache, never refetches", async () => {
     const kv = fakeKv();
-    let fetchCount = 0;
-    const fetchFn = async () => {
-      fetchCount++;
+    let introFetches = 0;
+    let wikitextFetches = 0;
+    const fetchFn = async (url: string) => {
+      if (url.includes("prop=revisions")) {
+        wikitextFetches++;
+        return jsonResponse({ query: { pages: [fullPage(ERUPTOR_WIKITEXT)] } });
+      }
+      introFetches++;
       return jsonResponse(INTRO_BODY); // input "Eruptor" → canonical "R-36 Eruptor"
     };
     const first = await fetchWikiPage(envWith(kv), { title: "Eruptor" }, {
@@ -522,9 +628,13 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
       fetchFn,
     });
     if ("found" in second) throw new Error("expected found");
-    expect(fetchCount).toBe(1); // the alias entry served the second call
+    // Both the intro alias AND the wikitext alias entry serve the second call.
+    expect(introFetches).toBe(1);
+    expect(wikitextFetches).toBe(1);
     expect(second.cached).toBe(true);
     expect(second.title).toBe("R-36 Eruptor"); // canonical title preserved
+    // The infobox is reassembled from the cached wikitext, identical both times.
+    expect(second.infobox).toEqual({ type: "weapon", fields: ERUPTOR_FIELDS });
   });
 
   it("intro and full have SEPARATE cache entries (a full request misses an intro hit)", async () => {
@@ -641,9 +751,241 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
   it("no KV binding at all → live fetch still succeeds (no caching)", async () => {
     const result = await fetchWikiPage(envWith(null), { title: "Eruptor" }, {
       nowMs: NOW,
-      fetchFn: async () => jsonResponse(INTRO_BODY),
+      // Route: extracts → intro, revisions → wikitext.
+      fetchFn: async (url) =>
+        url.includes("prop=revisions")
+          ? jsonResponse({ query: { pages: [fullPage(ERUPTOR_WIKITEXT)] } })
+          : jsonResponse(INTRO_BODY),
     });
     if ("found" in result) throw new Error("expected found");
     expect(result.cached).toBe(false);
+    // Infobox still parsed (from the live wikitext fetch), just not cached.
+    expect(result.infobox).toEqual({ type: "weapon", fields: ERUPTOR_FIELDS });
+  });
+});
+
+/* ====================================================================== *
+ * Part 3 — infobox parsing (pure) + its I/O wiring
+ * ====================================================================== */
+
+describe("wikiWikitextCacheKey + extractWikitextContent (pure)", () => {
+  it("wikitext key lives in the wiki: namespace with a :wikitext suffix", () => {
+    expect(wikiWikitextCacheKey("R-36 Eruptor")).toBe(
+      "wiki:page:r-36_eruptor:wikitext",
+    );
+    expect(wikiWikitextCacheKey("ERUPTOR")).toBe("wiki:page:eruptor:wikitext");
+  });
+
+  it("extractWikitextContent pulls the revisions slot content, '' when absent", () => {
+    expect(
+      extractWikitextContent({ query: { pages: [fullPage("{{Infobox}}")] } }),
+    ).toBe("{{Infobox}}");
+    expect(extractWikitextContent({ query: { pages: [] } })).toBe("");
+    expect(extractWikitextContent({ query: { pages: [{ revisions: [] }] } })).toBe(
+      "",
+    );
+    expect(extractWikitextContent(null)).toBe("");
+    expect(extractWikitextContent({})).toBe("");
+  });
+});
+
+describe("parseInfobox: the concrete spec examples (must be exact)", () => {
+  it("R-36 Eruptor weapon infobox → every documented field value", () => {
+    const result = parseInfobox(ERUPTOR_WIKITEXT);
+    expect(result.type).toBe("weapon");
+    expect(result.fields).toEqual(ERUPTOR_FIELDS);
+    // image/caption-image filenames are skipped, never surfaced.
+    expect(result.fields).not.toHaveProperty("image");
+  });
+
+  it("Democratic Detonation warbond infobox → every documented field value", () => {
+    const result = parseInfobox(WARBOND_WIKITEXT);
+    expect(result.type).toBe("warbond");
+    expect(result.fields).toEqual(WARBOND_FIELDS);
+    // The hyphenated key keeps its hyphen (never normalized to underscore).
+    expect(result.fields["credit-claim"]).toBe("300 SC");
+  });
+});
+
+describe("parseInfobox: type detection", () => {
+  it("recognizes the four families, underscore or space, case-insensitive", () => {
+    expect(parseInfobox("{{Infobox_Weapon\n|a=1\n}}").type).toBe("weapon");
+    expect(parseInfobox("{{Infobox Weapon\n|a=1\n}}").type).toBe("weapon");
+    expect(parseInfobox("{{infobox armor\n|a=1\n}}").type).toBe("armor");
+    expect(parseInfobox("{{Infobox Stratagem\n|a=1\n}}").type).toBe("stratagem");
+    expect(parseInfobox("{{Infobox Warbond\n|a=1\n}}").type).toBe("warbond");
+  });
+
+  it("unrecognized infobox or no infobox → { type: null, fields: {} }", () => {
+    expect(parseInfobox("{{Infobox Planet\n|a=1\n}}")).toEqual({
+      type: null,
+      fields: {},
+    });
+    expect(parseInfobox("Just prose, no template.")).toEqual({
+      type: null,
+      fields: {},
+    });
+    expect(parseInfobox("")).toEqual({ type: null, fields: {} });
+  });
+});
+
+describe("parseInfobox: edge cases", () => {
+  it("brace-depth boundary: closing }} shares a line with nested templates", () => {
+    const wt =
+      "{{Infobox_Weapon|title=X|cost={{Currency|Medals|60}}}}\nbody {{Other}}";
+    const result = parseInfobox(wt);
+    expect(result.type).toBe("weapon");
+    // The block ends at the matched depth-0 }}, not the first }} (inside Currency).
+    expect(result.fields).toEqual({ title: "X", cost: "60 Medals" });
+  });
+
+  it("only the FIRST infobox is used", () => {
+    const wt =
+      "{{Infobox_Weapon\n|title=First\n}}\n{{Infobox Warbond\n|title=Second\n}}";
+    const result = parseInfobox(wt);
+    expect(result.type).toBe("weapon");
+    expect(result.fields).toEqual({ title: "First" });
+  });
+
+  it("recognized type with no usable fields → fields {} (never a throw)", () => {
+    expect(parseInfobox("{{Infobox_Weapon\n|image=foo.png\n}}")).toEqual({
+      type: "weapon",
+      fields: {},
+    });
+  });
+
+  it("unmatched {{ in a value → stripped to next }} or end, never throws", () => {
+    expect(() => parseInfobox("{{Infobox_Weapon\n|a={{Broken\n}}")).not.toThrow();
+    const result = parseInfobox("{{Infobox_Weapon\n|title=X\n|a={{Broken\n}}");
+    // The dangling {{Broken cleans to empty and is dropped; title survives.
+    expect(result.fields).toEqual({ title: "X" });
+  });
+
+  it("empty wikitext → { type: null, fields: {} }", () => {
+    expect(parseInfobox("")).toEqual({ type: null, fields: {} });
+  });
+});
+
+describe("cleanInfoboxValue: each transform rule", () => {
+  it("Damage → second segment first token; <br> joins with ' / '", () => {
+    expect(
+      cleanInfoboxValue(
+        "{{Damage|Ballistic|230 Projectile|notext}}<br> {{Damage|Explosion|225}}",
+      ),
+    ).toBe("230 / 225");
+  });
+
+  it("Armor → type+number; Currency → amount + kind", () => {
+    expect(cleanInfoboxValue("{{Armor|4|AP}}")).toBe("AP4");
+    expect(cleanInfoboxValue("{{Currency|Medals|60}}")).toBe("60 Medals");
+    expect(cleanInfoboxValue("{{Currency|SC|1,000}}")).toBe("1,000 SC");
+  });
+
+  it("{{*}} → ', ' list separator with surrounding whitespace absorbed", () => {
+    expect(cleanInfoboxValue("Explosive {{*}} Heavy Armor Penetrating")).toBe(
+      "Explosive, Heavy Armor Penetrating",
+    );
+    expect(cleanInfoboxValue("50m {{*}} 100m {{*}} 200m")).toBe(
+      "50m, 100m, 200m",
+    );
+  });
+
+  it("[[Link|Display]] keeps display; [[Link]] keeps target", () => {
+    expect(cleanInfoboxValue("[[Foo Bar#Sec|Foo Bar]]")).toBe("Foo Bar");
+    expect(cleanInfoboxValue("[[Plain Link]]")).toBe("Plain Link");
+  });
+
+  it("strips <small> wrapper, italic markup, and unmatched templates", () => {
+    expect(cleanInfoboxValue("[[A|B]] <small>{{Tooltip|P2|Page 2}}</small>")).toBe(
+      "B",
+    );
+    expect(cleanInfoboxValue("''italic'' and '''bold'''")).toBe("italic and bold");
+    expect(cleanInfoboxValue("{{UnknownTemplate|x|y}}")).toBe("");
+  });
+});
+
+describe("fetchWikiPage infobox wiring (injected fetch + KV stub)", () => {
+  it("full: true is UNCHANGED — no infobox, no wikitext fetch", async () => {
+    const kv = fakeKv();
+    let revisionsForInfobox = 0;
+    const result = await fetchWikiPage(
+      envWith(kv),
+      { title: "Eruptor", full: true },
+      {
+        nowMs: NOW,
+        fetchFn: async (url) => {
+          if (url.includes("prop=revisions")) revisionsForInfobox++;
+          return jsonResponse({ query: { pages: [fullPage(ERUPTOR_WIKITEXT)] } });
+        },
+      },
+    );
+    if ("found" in result) throw new Error("expected found");
+    expect(result.format).toBe("wikitext");
+    expect(result).not.toHaveProperty("infobox");
+    // Exactly ONE revisions fetch — the full request itself; none for infobox.
+    expect(revisionsForInfobox).toBe(1);
+    // No wikitext cache entry written on a full request.
+    expect(kv.puts.some((p) => p.key.endsWith(":wikitext"))).toBe(false);
+  });
+
+  it("default: warbond page surfaces a warbond infobox + caches wikitext", async () => {
+    const kv = fakeKv();
+    const result = await fetchWikiPage(
+      envWith(kv),
+      { title: "Democratic Detonation" },
+      {
+        nowMs: NOW,
+        fetchFn: async (url) =>
+          url.includes("prop=revisions")
+            ? jsonResponse({
+                query: {
+                  pages: [
+                    fullPage(WARBOND_WIKITEXT, { title: "Democratic Detonation" }),
+                  ],
+                },
+              })
+            : jsonResponse({
+                query: {
+                  pages: [
+                    introPage({ title: "Democratic Detonation", extract: "A warbond." }),
+                  ],
+                },
+              }),
+      },
+    );
+    if ("found" in result) throw new Error("expected found");
+    expect(result.infobox).toEqual({ type: "warbond", fields: WARBOND_FIELDS });
+    expect(kv.store.get("wiki:page:democratic_detonation:wikitext")).toBe(
+      WARBOND_WIKITEXT,
+    );
+  });
+
+  it("wikitext fetch failure → empty infobox, the intro response still succeeds", async () => {
+    const kv = fakeKv();
+    const result = await fetchWikiPage(envWith(kv), { title: "Eruptor" }, {
+      nowMs: NOW,
+      fetchFn: async (url) => {
+        if (url.includes("prop=revisions")) throw new Error("wikitext down");
+        return jsonResponse(INTRO_BODY);
+      },
+    });
+    if ("found" in result) throw new Error("expected found");
+    expect(result.title).toBe("R-36 Eruptor");
+    expect(result.infobox).toEqual({ type: null, fields: {} });
+    // The intro page is still cached; no wikitext entry (nothing to cache).
+    expect(kv.store.has("wiki:page:r-36_eruptor:intro")).toBe(true);
+    expect(kv.store.has("wiki:page:r-36_eruptor:wikitext")).toBe(false);
+  });
+
+  it("wikitext HTTP error → empty infobox, never throws", async () => {
+    const result = await fetchWikiPage(envWith(fakeKv()), { title: "Eruptor" }, {
+      nowMs: NOW,
+      fetchFn: async (url) =>
+        url.includes("prop=revisions")
+          ? jsonResponse({}, 500)
+          : jsonResponse(INTRO_BODY),
+    });
+    if ("found" in result) throw new Error("expected found");
+    expect(result.infobox).toEqual({ type: null, fields: {} });
   });
 });
