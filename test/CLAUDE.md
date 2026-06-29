@@ -82,9 +82,10 @@ the project's definition of done:
     full `prop=revisions` + slots, both `redirects=1`); `shapeWikiPage` success
     carries the CANONICAL title/extract/url + fixed license/notes (`cached:
     false`, no `format` for intro; raw wikitext + `format: "wikitext"` for
-    full); an empty extract stays FOUND (`extract: ""`); a missing page →
-    `{ found:false, title (input), url, source }`; an unexpected body shape
-    THROWS (the I/O layer wraps it).
+    full); an empty extract stays FOUND (`extract: ""`); a missing page OR an
+    `invalid` title (illegal chars → `invalid`/`invalidreason`, no extract) →
+    `{ found:false, title (input), url, source }` (never an empty-extract
+    success); an unexpected body shape THROWS (the I/O layer wraps it).
   - **Attribution + license** (source = host, license = the verified `CC
     BY-NC-SA 4.0`, notes = fixed disclaimer) on every found payload.
   - Wiki I/O (`wikiClient.ts`, injected fetch + in-memory KV): a cache hit is

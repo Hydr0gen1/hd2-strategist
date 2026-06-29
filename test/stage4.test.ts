@@ -333,6 +333,31 @@ describe("shapeWikiPage: not-found and malformed — never a crash", () => {
     });
   });
 
+  it("invalid title (illegal chars) → not-found shape, never an empty-extract success", () => {
+    const result = shapeWikiPage(
+      {
+        query: {
+          pages: [
+            {
+              title: "Foo<bar>",
+              invalid: true,
+              invalidreason:
+                'The requested page title contains invalid characters: "<".',
+            },
+          ],
+        },
+      },
+      { title: "Foo<bar>", full: false },
+      NOW,
+    );
+    expect(result).toEqual({
+      found: false,
+      title: "Foo<bar>",
+      url: "https://helldivers.wiki.gg/wiki/Foo%3Cbar%3E",
+      source: WIKI_HOST,
+    });
+  });
+
   it("unexpected body shape (no pages array) → throws (the I/O layer wraps it)", () => {
     for (const body of [null, {}, { query: {} }, { query: { pages: "x" } }, { query: { pages: [] } }]) {
       expect(() =>
@@ -532,6 +557,28 @@ describe("fetchWikiPage: cache-first, canonical-key writes, structured errors", 
       url: "https://helldivers.wiki.gg/wiki/Nope_XYZ",
       source: WIKI_HOST,
     });
+    expect(kv.puts).toHaveLength(0);
+  });
+
+  it("invalid title → found:false and is NOT cached (no empty-extract success in KV)", async () => {
+    const kv = fakeKv();
+    const result = await fetchWikiPage(envWith(kv), { title: "{{Template}}" }, {
+      nowMs: NOW,
+      fetchFn: async () =>
+        jsonResponse({
+          query: {
+            pages: [
+              {
+                title: "{{Template}}",
+                invalid: true,
+                invalidreason:
+                  'The requested page title contains invalid characters: "{".',
+              },
+            ],
+          },
+        }),
+    });
+    expect("found" in result && result.found === false).toBe(true);
     expect(kv.puts).toHaveLength(0);
   });
 

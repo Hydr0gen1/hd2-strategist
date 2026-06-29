@@ -92,6 +92,8 @@ export function buildWikiQueryUrl(title: string, full: boolean): string {
 interface RawWikiPage {
   title?: unknown;
   missing?: unknown;
+  /** Set (with `invalidreason`) when the title contains illegal characters. */
+  invalid?: unknown;
   extract?: unknown;
   revisions?: Array<{ slots?: { main?: { content?: unknown } } }>;
 }
@@ -103,9 +105,12 @@ interface RawWikiResponse {
 /**
  * Shape one raw Action API response into the tool payload. The canonical
  * `title` (post-redirect) governs both the output and the cache write key.
- * A `missing` page → the not-found shape (never a throw). An existing page
- * with an empty extract is still a FOUND page (extract: ""). An unexpected
- * body shape (no pages array) throws — the I/O layer wraps it as a WikiError.
+ * A `missing` OR `invalid` page → the not-found shape (never a throw): an
+ * invalid title (illegal characters like `<`, `{`, `[`, or a bare namespace
+ * prefix) carries an `invalid` attribute and no extract, and must NOT be
+ * shaped/cached as an empty-extract success. An existing page with an empty
+ * extract is still a FOUND page (extract: ""). An unexpected body shape (no
+ * pages array) throws — the I/O layer wraps it as a WikiError.
  */
 export function shapeWikiPage(
   body: unknown,
@@ -120,7 +125,11 @@ export function shapeWikiPage(
   }
 
   const page = pages[0];
-  if (page == null || page.missing !== undefined) {
+  if (
+    page == null ||
+    page.missing !== undefined ||
+    page.invalid !== undefined
+  ) {
     const notFound: WikiPageNotFound = {
       found: false,
       title: args.title,
