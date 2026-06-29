@@ -364,6 +364,22 @@ export interface PlanetArchivePoint {
   delta_hours: number | null;
 }
 
+/**
+ * Stage 4: structured infobox parsed from a page's wikitext. Lore/context
+ * data ONLY — community-authored, possibly outdated, and (like every wiki
+ * field) NEVER mixed with live war-state numbers. Present only on the default
+ * (intro) response of a found page; absent under `full: true`.
+ *
+ * `type` is the detected template family (`weapon` | `warbond` | `armor` |
+ * `stratagem`) or null when the page has no infobox or an unrecognized one.
+ * `fields` are the raw `| key = value` pairs lightly cleaned (inner template
+ * calls resolved or stripped); empty when no recognized infobox is present.
+ */
+export interface WikiInfobox {
+  type: "weapon" | "warbond" | "armor" | "stratagem" | null;
+  fields: Record<string, string>;
+}
+
 /** Stage 4: get_wiki_page payload — LORE source (helldivers.wiki.gg),
  * physically separate from all live war-state output. Carries mandatory
  * attribution and the lore disclaimer and never any live war number. */
@@ -385,6 +401,12 @@ export interface WikiPageFound {
   notes: string;
   /** Present ONLY when `full: true` — the extract is raw wikitext, not plain text. */
   format?: "wikitext";
+  /**
+   * Present ONLY on the default (intro) response — structured infobox parsed
+   * from the page wikitext. Always present there (even as `{ type: null,
+   * fields: {} }`); never emitted under `full: true`. Lore/context, never live.
+   */
+  infobox?: WikiInfobox;
 }
 
 /** get_wiki_page not-found payload: the page does not exist on the wiki. */

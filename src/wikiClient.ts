@@ -11,13 +11,25 @@
  * returns a partial object or a stale copy (the caller decides what to do
  * with the error; the live war-state tools are unaffected either way).
  */
-import { buildWikiQueryUrl, shapeWikiPage, wikiCacheKey } from "./wiki";
+import {
+  buildWikiQueryUrl,
+  extractWikitextContent,
+  parseInfobox,
+  shapeWikiPage,
+  wikiCacheKey,
+  wikiWikitextCacheKey,
+} from "./wiki";
 import type { Env, WikiPageFound, WikiPageResult } from "./types";
 
 /** Intro extract cache window: 24 hours. */
 export const INTRO_CACHE_TTL_SECONDS = 86_400;
 /** Full-page (wikitext) cache window: 1 hour. */
 export const FULL_CACHE_TTL_SECONDS = 3_600;
+/**
+ * Raw-wikitext (infobox source) cache window: 1 hour — independent of the 24h
+ * intro entry so the parsed infobox refreshes faster than the intro prose.
+ */
+export const WIKITEXT_CACHE_TTL_SECONDS = 3_600;
 const FETCH_TIMEOUT_MS = 8_000;
 
 /**
@@ -77,18 +89,50 @@ export async function fetchWikiPage(
   // refetching (avoids needless wiki traffic / rate limits).
   const requestKey = wikiCacheKey(title, full);
 
+  // The bare intro/full result (no infobox); a default found page gets its
+  // infobox attached at the single exit below.
+  let result: WikiPageResult | null = null;
+
   // 1. Cache read — keyed on the input title (casing-normalized). KV being
   // unavailable must never fail the call: swallow and live-fetch instead.
   if (env.WAR_CACHE) {
     try {
       const cached = await env.WAR_CACHE.get<WikiPageFound>(requestKey, "json");
-      if (cached) return { ...cached, cached: true };
+      if (cached) result = { ...cached, cached: true };
     } catch {
       // KV down — fall through to a live fetch.
     }
   }
 
-  // 2. Live fetch. No stale fallback on failure (the spec is explicit): throw.
+  // 2. Live fetch (only when the cache did not satisfy the request). No stale
+  // fallback on failure (the spec is explicit): throw.
+  if (result === null) {
+    result = await liveFetchWikiPage(env, { title, full }, fetchFn, now, requestKey);
+  }
+
+  // 3. Default (intro) found pages carry a parsed `infobox` derived from the
+  // page wikitext — its own cache key + best-effort live fetch, NEVER baked
+  // into the intro cache entry (so it refreshes on the shorter wikitext TTL).
+  // A wikitext failure degrades to an empty infobox, never a failed call.
+  if (!full && isFound(result)) {
+    const wikitext = await loadWikitext(env, title, result.title, fetchFn);
+    return { ...result, infobox: parseInfobox(wikitext) };
+  }
+  return result;
+}
+
+/**
+ * Live-fetch + shape + cache a single intro/full wiki page (the original
+ * fetchWikiPage body, extracted so the infobox attachment has one exit point).
+ */
+async function liveFetchWikiPage(
+  env: Env,
+  args: { title: string; full: boolean },
+  fetchFn: FetchLike,
+  now: number,
+  requestKey: string,
+): Promise<WikiPageResult> {
+  const { title, full } = args;
   let response: Response;
   try {
     response = await fetchFn(buildWikiQueryUrl(title, full), {
@@ -152,4 +196,79 @@ export async function fetchWikiPage(
   }
 
   return result;
+}
+
+/**
+ * Cache-first load of a page's RAW WIKITEXT (the infobox source), separate
+ * from the intro/full entries. Read under the input-normalized key; on a miss,
+ * live-fetch the revisions endpoint and cache the wikitext under the canonical
+ * key (plus the input alias when a redirect made it differ), TTL 1h.
+ *
+ * UNLIKE the primary page fetch, every failure here is SWALLOWED and returns
+ * "" — a wikitext outage must degrade to an empty infobox, never fail the
+ * surrounding (already-successful) intro response. KV being unavailable simply
+ * falls through to a live fetch.
+ */
+async function loadWikitext(
+  env: Env,
+  inputTitle: string,
+  canonicalTitle: string,
+  fetchFn: FetchLike,
+): Promise<string> {
+  const requestKey = wikiWikitextCacheKey(inputTitle);
+
+  if (env.WAR_CACHE) {
+    try {
+      const cached = await env.WAR_CACHE.get(requestKey, "text");
+      if (cached != null) return cached;
+    } catch {
+      // KV down — fall through to a live fetch.
+    }
+  }
+
+  let response: Response;
+  try {
+    response = await fetchFn(buildWikiQueryUrl(inputTitle, true), {
+      headers: { Accept: "application/json", "User-Agent": WIKI_USER_AGENT },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    console.error(
+      `Wiki wikitext fetch for "${inputTitle}" failed (${err instanceof Error ? err.message : "network error"}); infobox omitted.`,
+    );
+    return "";
+  }
+
+  if (!response.ok) {
+    console.error(
+      `Wiki wikitext fetch for "${inputTitle}" returned ${response.status}; infobox omitted.`,
+    );
+    return "";
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    console.error(
+      `Wiki wikitext fetch for "${inputTitle}" returned a non-JSON response; infobox omitted.`,
+    );
+    return "";
+  }
+
+  const wikitext = extractWikitextContent(body);
+  if (wikitext && env.WAR_CACHE) {
+    const ttl = { expirationTtl: WIKITEXT_CACHE_TTL_SECONDS };
+    const canonicalKey = wikiWikitextCacheKey(canonicalTitle);
+    const keys =
+      canonicalKey === requestKey ? [canonicalKey] : [canonicalKey, requestKey];
+    for (const key of keys) {
+      try {
+        await env.WAR_CACHE.put(key, wikitext, ttl);
+      } catch {
+        // Cache write failure must never break a successful wiki read.
+      }
+    }
+  }
+  return wikitext;
 }
