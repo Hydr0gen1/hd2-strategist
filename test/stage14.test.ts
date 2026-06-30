@@ -572,6 +572,43 @@ describe("exportArchive (MCP metadata tool)", () => {
     expect(meta.url).toContain("bucket=hourly");
   });
 
+  it("pins a watermark even for an empty snapshot (row_count 0 stays 0 on fetch)", async () => {
+    const db = new ExportFakeD1(); // no rows
+    const meta = (await exportArchive(envWith(db), "https://w.example", {
+      table: "global",
+    })) as Record<string, unknown>;
+    expect(meta.row_count).toBe(0);
+    expect(meta.url).toContain("max_id=0"); // pinned even though MAX(id) was null
+
+    // A tick commits into the frozen window after the (zero) count.
+    db.rows.global_samples.push({
+      id: 1,
+      sampled_at: NOW - HOUR / 2,
+      player_count: 1,
+      impact_multiplier: 1,
+      active_campaign_count: 1,
+      missions_won: 1,
+      missions_lost: 1,
+      deaths: 1,
+      terminid_kills: 1,
+      automaton_kills: 1,
+      illuminate_kills: 1,
+    });
+    // Fetching the URL must still yield zero data rows (id <= 0 excludes it).
+    const res = handleExportArchive(new Request(meta.url as string), envWith(db));
+    expect((await res.text()).trimEnd().split("\n").length - 1).toBe(0);
+  });
+
+  it("rejects a future `since` once `until` is frozen (no 400-on-fetch pointer)", async () => {
+    const db = new ExportFakeD1();
+    await expect(
+      exportArchive(envWith(db), "https://w.example", {
+        table: "global",
+        since: "2099-01-01T00:00:00Z", // after the snapshot instant
+      }),
+    ).rejects.toThrow(/future|window is empty/i);
+  });
+
   it("pins a committed-row watermark so a late-committing tick can't desync the file", async () => {
     const db = new ExportFakeD1();
     seed(db, 5); // ids 1..5

@@ -685,12 +685,25 @@ export async function exportArchive(
   // baked into the URL (below), so the streamed dump matches the metadata.
   if (params.untilMs == null) params.untilMs = nowMs;
 
+  // Re-validate now that `until` is frozen: a future `since` with an omitted
+  // `until` parses as open-ended, but freezing `until` to now makes since > until.
+  // Reject it here so the tool returns a parameter error instead of a pointer
+  // whose URL would 400 (`since` is after `until`) when the agent fetches it.
+  if (params.sinceMs != null && params.sinceMs > params.untilMs) {
+    throw new ExportParamError(
+      "`since` is in the future (after the snapshot instant): the window is empty. Pass a `since` in the past.",
+    );
+  }
+
   // Count the window AND capture the committed-row watermark (MAX(id)) in one
   // query, then pin both the metadata and the streamed CSV to `id <= maxId` by
   // baking it into the URL. A sampling tick that commits after this point gets a
   // higher id and is excluded from both, so the file always matches row_count.
+  // An EMPTY window has no MAX(id) — pin the watermark to 0 anyway (ids start at
+  // 1, so `id <= 0` streams nothing), so a row committing into the frozen window
+  // after the count can't appear in the CSV while row_count reported 0.
   const { rowCount, maxId } = await countArchiveSnapshot(env, params);
-  if (maxId != null) params.maxId = maxId;
+  params.maxId = maxId ?? 0;
   const columns = exportColumns(params.table, params.bucket);
   const header = columns.join(",").length + 1;
 
