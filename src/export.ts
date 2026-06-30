@@ -343,15 +343,16 @@ interface RawRow {
   [col: string]: number | string | null;
 }
 
-/** Stream every matching row in ascending (sampled_at, id) order, one page at a
- * time, invoking `onPage` per page. Keyset cursor on (sampled_at, id) — `id` is
- * the tiebreaker so rows sharing a sample tick (many planets per tick) are never
- * skipped at a page boundary. */
-async function paginate(
+/** Yield every matching row in ascending (sampled_at, id) order, one page at a
+ * time. Keyset cursor on (sampled_at, id) — `id` is the tiebreaker so rows
+ * sharing a sample tick (many planets per tick) are never skipped at a page
+ * boundary. As a generator, the NEXT page's D1 query only fires when the
+ * consumer pulls the next page — so a backpressure-aware reader (a slow client)
+ * never makes us read ahead and queue the whole archive in memory. */
+async function* paginatePages(
   env: Env,
   params: ExportParams,
-  onPage: (rows: RawRow[]) => void,
-): Promise<void> {
+): AsyncGenerator<RawRow[]> {
   const db = requireDb(env);
   const cfg = TABLE_CONFIG[params.table];
   const selectCols = [
@@ -378,7 +379,7 @@ async function paginate(
       .all<RawRow>();
     const rows = res.results ?? [];
     if (rows.length === 0) break;
-    onPage(rows);
+    yield rows;
     const last = rows[rows.length - 1]!;
     curTs = last.sampled_at;
     curId = last.id;
@@ -517,76 +518,97 @@ const CSV_HEADERS = {
   "content-disposition": 'attachment; filename="archive.csv"',
 };
 
-/** Build a streamed CSV Response. Raw mode writes each page straight through
- * (true streaming, O(1) memory in row count). Bucket mode also streams: because
- * rows arrive in ascending sampled_at order, a time bucket is COMPLETE once the
- * cursor advances past it, so each completed bucket is flushed and evicted as we
- * go. Memory is therefore bounded by the keys within a SINGLE time bucket (≈ the
- * planet/objective count), never by the whole archive — so a multi-week bucketed
- * planet/MO export cannot blow the Worker's memory. */
-export function streamArchiveCsv(env: Env, params: ExportParams): Response {
+/** Produce the CSV as a sequence of encoded chunks (header first, then one chunk
+ * per page in raw mode, or one chunk per completed time bucket in bucket mode).
+ * Being a generator, it is PULL-driven: the next chunk — and therefore the next
+ * D1 page — is only produced when the consumer asks for it, so a slow client
+ * applies natural backpressure instead of letting us read the whole archive
+ * ahead into memory.
+ *
+ * Raw mode is O(1) memory in row count (one page at a time). Bucket mode also
+ * stays bounded: rows arrive sampled_at-ascending, so a time bucket is COMPLETE
+ * once the cursor passes it — completed buckets are flushed and evicted as we
+ * go, so memory is bounded by the keys within a SINGLE time bucket (≈ the
+ * planet/objective count), never the whole archive. */
+async function* csvChunks(
+  env: Env,
+  params: ExportParams,
+): AsyncGenerator<Uint8Array> {
   const cfg = TABLE_CONFIG[params.table];
-  const header = exportColumns(params.table, params.bucket);
   const encoder = new TextEncoder();
+  yield encoder.encode(csvLine(exportColumns(params.table, params.bucket)));
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
-        controller.enqueue(encoder.encode(csvLine(header)));
-        if (params.bucket === "raw") {
-          await paginate(env, params, (rows) => {
-            let buf = "";
-            for (const row of rows) {
-              buf += csvLine([
-                isoFromMs(row.sampled_at),
-                ...cfg.keyCols.map((c) => row[c.name]),
-                ...cfg.valueCols.map((c) => row[c.name]),
-              ]);
-            }
-            controller.enqueue(encoder.encode(buf));
-          });
-        } else {
-          const bucket = params.bucket;
-          const groups = new Map<string, BucketGroup>();
-          let currentBucket = -Infinity;
-          // Flush (and evict) every group whose time bucket is fully behind the
-          // cursor. Each flush emits exactly one completed bucket's groups,
-          // sorted by key, keeping output ordered bucket-ascending then key.
-          const flushBelow = (threshold: number) => {
-            if (groups.size === 0) return;
-            const ready: BucketGroup[] = [];
-            for (const [k, g] of groups) {
-              if (g.bucketStart < threshold) {
-                ready.push(g);
-                groups.delete(k);
-              }
-            }
-            if (ready.length > 0) {
-              controller.enqueue(
-                encoder.encode(renderBucketGroups(cfg, ready).join("")),
-              );
-            }
-          };
-          await paginate(env, params, (rows) => {
-            for (const row of rows) {
-              const bs = bucketStartMs(row.sampled_at, bucket);
-              if (bs > currentBucket) {
-                // The cursor moved to a later bucket; every earlier bucket is
-                // now complete (rows are globally sampled_at-ascending).
-                flushBelow(bs);
-                currentBucket = bs;
-              }
-              foldRow(cfg, bucket, groups, row);
-            }
-          });
-          flushBelow(Infinity); // emit the final, still-open bucket
+  if (params.bucket === "raw") {
+    for await (const rows of paginatePages(env, params)) {
+      let buf = "";
+      for (const row of rows) {
+        buf += csvLine([
+          isoFromMs(row.sampled_at),
+          ...cfg.keyCols.map((c) => row[c.name]),
+          ...cfg.valueCols.map((c) => row[c.name]),
+        ]);
+      }
+      yield encoder.encode(buf);
+    }
+    return;
+  }
+
+  const bucket = params.bucket;
+  const groups = new Map<string, BucketGroup>();
+  let currentBucket = -Infinity;
+  // Take (and evict) every group whose time bucket is fully behind the cursor.
+  const takeReady = (threshold: number): BucketGroup[] => {
+    const ready: BucketGroup[] = [];
+    for (const [k, g] of groups) {
+      if (g.bucketStart < threshold) {
+        ready.push(g);
+        groups.delete(k);
+      }
+    }
+    return ready;
+  };
+  for await (const rows of paginatePages(env, params)) {
+    for (const row of rows) {
+      const bs = bucketStartMs(row.sampled_at, bucket);
+      if (bs > currentBucket) {
+        // The cursor moved to a later bucket; every earlier bucket is now
+        // complete (rows are globally sampled_at-ascending).
+        const ready = takeReady(bs);
+        if (ready.length > 0) {
+          yield encoder.encode(renderBucketGroups(cfg, ready).join(""));
         }
-        controller.close();
+        currentBucket = bs;
+      }
+      foldRow(cfg, bucket, groups, row);
+    }
+  }
+  const finalReady = takeReady(Infinity); // emit the final, still-open bucket
+  if (finalReady.length > 0) {
+    yield encoder.encode(renderBucketGroups(cfg, finalReady).join(""));
+  }
+}
+
+/** Build a streamed CSV Response driven by a backpressure-aware `pull()`: each
+ * `pull` advances the chunk generator by one chunk, so the runtime only asks for
+ * (and only then fetches/builds) the next chunk when the consumer has demand. A
+ * slow client therefore cannot make us queue the whole archive in memory. */
+export function streamArchiveCsv(env: Env, params: ExportParams): Response {
+  const iterator = csvChunks(env, params)[Symbol.asyncIterator]();
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await iterator.next();
+        if (done) controller.close();
+        else controller.enqueue(value);
       } catch (err) {
-        // The header may already be on the wire, so we can't change the status;
-        // erroring the stream surfaces the failure to the fetching client.
+        // A mid-stream D1 failure surfaces to the fetching client (the header
+        // may already be on the wire, so the HTTP status can't change).
         controller.error(err);
       }
+    },
+    async cancel() {
+      // Client went away — let the generator run its finally blocks.
+      await iterator.return?.(undefined);
     },
   });
 

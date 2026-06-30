@@ -292,6 +292,26 @@ describe("streamArchiveCsv", () => {
     expect(text.trimEnd().split("\n").length - 1).toBe(12_345);
   });
 
+  it("honors backpressure — does not eagerly fetch every page up front", async () => {
+    const db = new ExportFakeD1();
+    seed(db, 12_345); // 3 pages of 5000
+    const res = streamArchiveCsv(envWith(db), {
+      table: "global",
+      planetIndex: null,
+      sinceMs: null,
+      untilMs: null,
+      bucket: "raw",
+    });
+    const reader = res.body!.getReader();
+    await reader.read(); // header chunk (no query)
+    await reader.read(); // first data page (one query)
+    // A backpressure-aware (pull-driven) producer must NOT have run all three
+    // page queries just because we read the first chunks. The old eager
+    // start()-based producer would have issued all 3 before returning.
+    expect(db.selectSqls.length).toBeLessThan(3);
+    await reader.cancel();
+  });
+
   it("bounds both window edges (June 18–20)", async () => {
     const db = new ExportFakeD1();
     // one row per hour over a wide span
