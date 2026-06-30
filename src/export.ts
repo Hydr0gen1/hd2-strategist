@@ -671,11 +671,16 @@ const APPROX_BYTES_PER_ROW: Record<ExportTable, number> = {
 
 export interface ExportArchiveArgs {
   table?: string;
-  planet_index?: number;
+  // The numeric fields accept a string too: an MCP client/model may serialize a
+  // number as a string (e.g. planet_index: "185"). The shared string-based
+  // parser (`parseExportParams`) coerces and VALIDATES every value, so a
+  // string-encoded number is honored and a non-numeric string is a parameter
+  // error — never a silently dropped filter.
+  planet_index?: number | string;
   since?: string;
   until?: string;
-  since_hours?: number;
-  until_hours?: number;
+  since_hours?: number | string;
+  until_hours?: number | string;
   bucket?: string;
 }
 

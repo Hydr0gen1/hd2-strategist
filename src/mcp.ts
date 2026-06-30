@@ -519,21 +519,26 @@ async function dispatchTool(
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
-    case "export_archive":
+    case "export_archive": {
+      // Accept number OR string for the numeric fields: a model may serialize
+      // them as strings, and exportArchive's shared parser coerces + validates,
+      // so a string-encoded value is honored (and a bad one errors) instead of
+      // being silently dropped — which for planet_index would widen a
+      // single-planet export to every planet.
+      const numOrStr = (v: unknown): number | string | undefined =>
+        typeof v === "number" || typeof v === "string" ? v : undefined;
       return toolText(
         await exportArchive(env, origin, {
           table: typeof args.table === "string" ? args.table : undefined,
-          planet_index:
-            typeof args.planet_index === "number" ? args.planet_index : undefined,
+          planet_index: numOrStr(args.planet_index),
           since: typeof args.since === "string" ? args.since : undefined,
           until: typeof args.until === "string" ? args.until : undefined,
-          since_hours:
-            typeof args.since_hours === "number" ? args.since_hours : undefined,
-          until_hours:
-            typeof args.until_hours === "number" ? args.until_hours : undefined,
+          since_hours: numOrStr(args.since_hours),
+          until_hours: numOrStr(args.until_hours),
           bucket: typeof args.bucket === "string" ? args.bucket : undefined,
         }),
       );
+    }
     case "get_major_order_history":
       return toolText(
         await getMajorOrderHistory(env, {

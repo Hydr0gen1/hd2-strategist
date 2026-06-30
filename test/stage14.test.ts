@@ -579,6 +579,39 @@ describe("exportArchive (MCP metadata tool)", () => {
     ).rejects.toThrow(/migration/i);
   });
 
+  it("honors a string-encoded planet_index (model serialization) and errors on a bad one", async () => {
+    const db = new ExportFakeD1();
+    let id = 1;
+    for (const idx of [185, 64, 185]) {
+      db.rows.planet_samples.push({
+        id: id++,
+        sampled_at: NOW - id * HOUR,
+        planet_index: idx,
+        health: 1000,
+        max_health: 1_000_000,
+        hp_per_hour: 5,
+        campaign_id: 1,
+        campaign_kind: "liberation",
+        faction: "Terminids",
+      });
+    }
+    // planet_index arrives as the string "185" (as a model may serialize it).
+    const meta = (await exportArchive(envWith(db), "https://w.example", {
+      table: "planet",
+      planet_index: "185",
+    })) as Record<string, unknown>;
+    expect(meta.planet_index).toBe(185); // honored, not silently dropped
+    expect(meta.row_count).toBe(2); // only the two Karlia rows, not all 3
+    expect(meta.url).toContain("planet_index=185");
+    // A non-numeric string is a parameter error, never a silent all-planets export.
+    await expect(
+      exportArchive(envWith(db), "https://w.example", {
+        table: "planet",
+        planet_index: "not-a-number",
+      }),
+    ).rejects.toThrow(/planet_index/);
+  });
+
   it("surfaces planet_index and bucket in the metadata + url", async () => {
     const db = new ExportFakeD1();
     const meta = (await exportArchive(envWith(db), "https://w.example", {
