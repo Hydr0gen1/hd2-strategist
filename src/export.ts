@@ -165,13 +165,23 @@ function parseBucket(raw: string | null): Bucket {
 }
 
 /** Resolve one window edge: an ISO-8601 string OR an `*_hours` integer
- * (hours-back-from-now). Returns null when neither is present (open edge). */
+ * (hours-back-from-now). Returns null when neither is present (open edge). The
+ * two forms are mutually exclusive (the tool schema says so); supplying both is
+ * a parameter error rather than a silent pick, so a model-generated call that
+ * accidentally sends both can't quietly export a different window. */
 function parseEdge(
   iso: string | null,
   hours: string | null,
   edge: string,
   nowMs: number,
 ): number | null {
+  const hasIso = iso != null && iso !== "";
+  const hasHours = hours != null && hours !== "";
+  if (hasIso && hasHours) {
+    throw new ExportParamError(
+      `Ambiguous \`${edge}\`: pass either \`${edge}\` (ISO-8601) or \`${edge}_hours\` (hours-back-from-now), not both.`,
+    );
+  }
   if (iso != null && iso !== "") {
     const ms = Date.parse(iso);
     if (!Number.isFinite(ms)) {
@@ -440,7 +450,7 @@ function foldRow(
   {
     const bs = bucketStartMs(row.sampled_at, bucket);
     const keyVals = cfg.keyCols.map((c) => row[c.name] ?? null);
-    const gkey = keyVals.join(" ") + " " + bs;
+    const gkey = keyVals.join("\u0000") + "\u0000" + bs;
     let g = groups.get(gkey);
     if (!g) {
       g = { bucketStart: bs, keyVals, acc: {} };

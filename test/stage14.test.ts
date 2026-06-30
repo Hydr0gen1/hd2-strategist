@@ -187,6 +187,21 @@ describe("parseExportParams", () => {
     expect(p.untilMs).toBeNull();
   });
 
+  it("rejects supplying both ISO and *_hours for the same edge", () => {
+    expect(() =>
+      parseExportParams(
+        get({ table: "global", since: "2026-06-18T00:00:00Z", since_hours: "48" }),
+        NOW,
+      ),
+    ).toThrow(/Ambiguous .*since/);
+    expect(() =>
+      parseExportParams(
+        get({ table: "global", until: "2026-06-18T00:00:00Z", until_hours: "1" }),
+        NOW,
+      ),
+    ).toThrow(/Ambiguous .*until/);
+  });
+
   it("rejects planet_index on a non-planet table, accepts it on planet", () => {
     expect(() =>
       parseExportParams(get({ table: "global", planet_index: "185" }), NOW),
