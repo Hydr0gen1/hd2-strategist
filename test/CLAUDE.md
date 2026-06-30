@@ -25,6 +25,14 @@ budget) and the SELECT SQL (proving values are bound, never interpolated). No
 network, no real SQLite. The KV stub still proves the KV write budget is
 UNCHANGED by Stage 12 (the D1 write is a separate store).
 
+A fifth sanctioned exception (stage14.test.ts): a small in-memory D1 stub
+(`ExportFakeD1`) for the bulk CSV export — same spirit again. It answers the
+export's keyset SELECT (cursor on `(sampled_at, id)`) and COUNT over rows held
+in arrays, and records the SELECT SQL so the parameterized-SQL pin holds (`?`
+placeholders, no interpolated values). The streamed `Response` is read with
+`await res.text()` — no Workers runtime. Read-only: there is no write path to
+prove, so no `db.batch` counter.
+
 ## Coverage that must never regress
 
 Each of these maps to a spec requirement; removing or weakening one breaks

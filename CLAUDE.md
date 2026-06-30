@@ -29,15 +29,30 @@ wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets h
 
 ## Hard rules (project-wide)
 
-- **Exactly eighteen tools**: `get_war_brief`, `get_war_status`,
+- **Exactly nineteen tools**: `get_war_brief`, `get_war_status`,
   `get_campaigns`, `get_major_order`, `get_planet`, `get_supply_graph`,
   `get_dispatches`, `get_patch_notes`, `get_planet_history`,
   `get_wiki_page`, `get_observed_signatures`, `get_global_history`,
   `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`,
-  and the Stage 12 D1 archive trio `get_planet_archive`,
-  `get_global_archive`, `get_major_order_archive`. Do not add tools or
-  rename them. (`get_supply_graph` was the eighteenth, added by the Fabel
-  supply-graph/gambit pass; the count was seventeen before it.)
+  the Stage 12 D1 archive trio `get_planet_archive`,
+  `get_global_archive`, `get_major_order_archive`, and the bulk CSV export
+  `export_archive`. Do not add tools or rename them. (`get_supply_graph` was
+  the eighteenth, added by the Fabel supply-graph/gambit pass; the count was
+  seventeen before it. `export_archive` is the nineteenth, added by the
+  bulk-archive-CSV-export pass.)
+- **`export_archive` is transport, not a new data source** (`src/export.ts` +
+  the `GET /export/archive` route): a FAITHFUL bulk CSV dump of the existing D1
+  archive, READ-ONLY (only SELECTs; no binding, no write, never touches KV or
+  the live rate path). It exists to bypass the 1000-row context cap on the
+  `*_archive` tools, so the MCP tool returns ONLY a metadata pointer (`url`,
+  `row_count`, `columns`, `range`, …) and the bytes come over a streamed,
+  keyset-paginated HTTP response (never inlined — that would re-hit the context
+  wall). Same prime directive as the rest of the archive: no derived/trend
+  columns, no re-normalization, no verdict — the `hourly`/`daily` buckets are
+  deterministic arithmetic (mean of rates/multiplier, last value of counts), not
+  a forecast. CSV columns mirror the D1 schema EXACTLY (no invented columns);
+  parameterized SQL only; the table schema, the row-capped JSON tools, and the
+  KV/live path are untouched.
 - **Fabel additive-fact rule** (supply graph, gambit, per-player rates,
   regions, warm cache): every new field is a raw upstream value or a
   deterministic transform of values already in the payload — never a verdict.
