@@ -184,7 +184,7 @@ src/wiki.ts        Pure wiki lore logic (URL/key builders, response shaping, att
 src/wikiClient.ts  Wiki fetch + canonical-keyed KV cache (`wiki:` namespace) — separate from client.ts
 src/tools.ts       The war-state/archive tool implementations (export_archive lives in src/export.ts)
 src/types.ts       Raw upstream + normalized types
-migrations/        D1 schema migrations (0001_init.sql) applied via `wrangler d1 migrations apply`
+migrations/        D1 schema migrations (0001_init.sql, 0002 planet_samples time index) applied via `wrangler d1 migrations apply`
 ```
 
 Raw upstream responses are cached in KV (`WAR_CACHE`) for ~45s; on upstream 429/5xx/timeouts the server falls back to a stale copy (marked `stale: true`) and only errors — with a structured MCP error — when no copy exists. Normalization runs **after** the cache read, so invariant changes never require cache invalidation.

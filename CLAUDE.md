@@ -23,7 +23,7 @@ Local dev secrets go in `.dev.vars` (gitignored): `SUPER_CLIENT`, `SUPER_CONTACT
 src/         Worker source — see src/CLAUDE.md for the domain invariants (read
              it before touching anything in src/)
 test/        Unit tests — see test/CLAUDE.md for required coverage
-migrations/  D1 schema (0001_init.sql) — applied via `wrangler d1 migrations apply`
+migrations/  D1 schema (0001_init.sql + 0002 planet_samples sampled_at index) — applied via `wrangler d1 migrations apply`
 wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets here.
 ```
 
