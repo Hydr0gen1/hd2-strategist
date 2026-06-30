@@ -28,6 +28,7 @@
  * buffer or the live rate logic. Parameterized SQL ONLY — every value via
  * `.bind()`.
  */
+import { ArchiveError } from "./archive";
 import type { Env } from "./types";
 
 export type ExportTable = "global" | "planet" | "mo";
@@ -360,8 +361,20 @@ export async function countArchiveRows(
   const sql =
     `SELECT COUNT(*) AS n FROM ${cfg.sqlTable}` +
     (clause ? ` WHERE ${clause}` : "");
-  const res = await db.prepare(sql).bind(...binds).first<{ n: number }>();
-  return res?.n ?? 0;
+  try {
+    const res = await db.prepare(sql).bind(...binds).first<{ n: number }>();
+    return res?.n ?? 0;
+  } catch (err) {
+    // Mirror archive.ts's read-failure wrapping: a bound-but-unmigrated
+    // HISTORY_DB throws a raw "no such table" here. Surface it as an
+    // ArchiveError (which mcp.ts renders as an actionable tool error) instead
+    // of letting it fall through to the generic "Internal error" message.
+    throw new ArchiveError(
+      `Failed to count rows in the history archive (${
+        err instanceof Error ? err.message : String(err)
+      }). If the KV-backed tools still work, the D1 migration was likely not applied to production — run \`wrangler d1 migrations apply hd2-strategist-history --remote\`.`,
+    );
+  }
 }
 
 /* ------------------------------------------------------------------------
@@ -582,6 +595,14 @@ export async function exportArchive(
     return v == null ? null : String(v);
   };
   const params = parseExportParams(get, nowMs);
+
+  // Freeze an omitted upper bound to the tool-call instant so the returned URL,
+  // row_count, and byte_size_estimate describe ONE consistent snapshot. Without
+  // this the URL stays open-ended while the count was taken at nowMs, so a cron
+  // or request poll appending rows before/during the client's HTTP fetch would
+  // return a CSV that disagrees with the reported size. The frozen `until` is
+  // baked into the URL (below), so the streamed dump matches the metadata.
+  if (params.untilMs == null) params.untilMs = nowMs;
 
   const rowCount = await countArchiveRows(env, params);
   const columns = exportColumns(params.table, params.bucket);

@@ -41,6 +41,8 @@ class ExportFakeD1 {
     mo_progress_samples: [],
   };
   selectSqls: string[] = [];
+  /** Simulate a bound-but-unmigrated D1: every query throws "no such table". */
+  failQueries = false;
 
   prepare(sql: string) {
     return new ExportPrepared(this, sql);
@@ -101,11 +103,13 @@ class ExportPrepared {
   }
 
   async all<T>(): Promise<{ results: T[] }> {
+    if (this.db.failQueries) throw new Error("no such table: " + this.table());
     this.db.selectSqls.push(this.sql);
     return { results: this.matches(this.tableRows()) as unknown as T[] };
   }
 
   async first<T>(): Promise<T> {
+    if (this.db.failQueries) throw new Error("no such table: " + this.table());
     return { n: this.matches(this.tableRows()).length } as unknown as T;
   }
 }
@@ -454,6 +458,34 @@ describe("exportArchive (MCP metadata tool)", () => {
     })) as Record<string, unknown>;
     expect(meta.row_count).toBe(10);
     expect((meta.range as Record<string, unknown>).from).toBe(sinceIso);
+  });
+
+  it("freezes an omitted `until` to the call instant for a consistent snapshot", async () => {
+    const db = new ExportFakeD1();
+    seed(db, 5);
+    const before = Date.now();
+    const meta = (await exportArchive(envWith(db), "https://w.example", {
+      table: "global",
+    })) as Record<string, unknown>;
+    const after = Date.now();
+    // range.to is no longer null — it pins the upper bound at call time …
+    const to = (meta.range as Record<string, unknown>).to as string;
+    expect(to).not.toBeNull();
+    const toMs = Date.parse(to);
+    expect(toMs).toBeGreaterThanOrEqual(before);
+    expect(toMs).toBeLessThanOrEqual(after);
+    // … and that bound is baked into the URL, so the streamed CSV matches the
+    // counted snapshot even if rows are appended afterward.
+    expect(meta.url).toContain("until=");
+    expect(decodeURIComponent(meta.url as string)).toContain(`until=${to}`);
+  });
+
+  it("wraps a D1 read failure as an actionable archive error (not a generic one)", async () => {
+    const db = new ExportFakeD1();
+    db.failQueries = true; // bound HISTORY_DB, migrations not applied
+    await expect(
+      exportArchive(envWith(db), "https://w.example", { table: "global" }),
+    ).rejects.toThrow(/migration/i);
   });
 
   it("surfaces planet_index and bucket in the metadata + url", async () => {
