@@ -20,8 +20,9 @@
  * SCALING: the route NEVER loads the whole table into memory. It keyset-
  * paginates on (sampled_at, id) and writes CSV chunks to a streamed Response as
  * each page returns, so it scales past any single-query D1 row/memory ceiling.
- * (Bucket mode folds pages into a bounded per-(key,bucket) aggregator — bounded
- * by the number of buckets, never the number of rows.)
+ * Bucket mode also streams: rows arrive sampled_at-ascending, so a time bucket
+ * is complete once the cursor passes it and is flushed+evicted then — memory is
+ * bounded by the keys within ONE time bucket, never the whole archive.
  *
  * READ-ONLY: this module only ever SELECTs the existing archive (`archive.ts`'s
  * D1 store). It adds no binding, no write path, and never touches the KV ring
@@ -133,6 +134,13 @@ export interface ExportParams {
   sinceMs: number | null;
   untilMs: number | null;
   bucket: Bucket;
+  /** Committed-row watermark: an upper bound on the AUTOINCREMENT `id`, set by
+   * the metadata tool so the streamed CSV matches the counted snapshot exactly.
+   * A row that commits AFTER the count (e.g. an in-flight sampling tick whose
+   * sampled_at falls within the window but whose D1 write lands late) gets a
+   * higher id and is excluded from BOTH the count and the stream. Absent on a
+   * direct route hit. */
+  maxId?: number | null;
 }
 
 /* ------------------------------------------------------------------------
@@ -219,7 +227,19 @@ export function parseExportParams(
     );
   }
 
-  return { table, planetIndex, sinceMs, untilMs, bucket };
+  let maxId: number | null = null;
+  const rawMaxId = get("max_id");
+  if (rawMaxId != null && rawMaxId !== "") {
+    const n = Number(rawMaxId);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new ExportParamError(
+        `Invalid \`max_id\` "${rawMaxId}": expected a non-negative integer.`,
+      );
+    }
+    maxId = n;
+  }
+
+  return { table, planetIndex, sinceMs, untilMs, bucket, maxId };
 }
 
 /* ------------------------------------------------------------------------
@@ -297,6 +317,13 @@ function windowPredicate(params: ExportParams): {
     parts.push("planet_index = ?");
     binds.push(params.planetIndex);
   }
+  if (params.maxId != null) {
+    // Committed-row watermark: pin the snapshot to rows that existed when the
+    // count was taken, so a later-committing tick can't appear in the stream
+    // but not the count.
+    parts.push("id <= ?");
+    binds.push(params.maxId);
+  }
   return { clause: parts.length ? parts.join(" AND ") : "", binds };
 }
 
@@ -349,21 +376,29 @@ async function paginate(
   }
 }
 
-/** Total rows matching the window predicate (the raw row count, before any
- * bucketing) — so the agent knows the size before fetching. */
-export async function countArchiveRows(
+/**
+ * Snapshot the window in ONE query: the raw row count (before any bucketing, so
+ * the agent knows the size before fetching) AND the committed-row watermark
+ * `MAX(id)` over the same predicate. Counting and the later stream both bound on
+ * `id <= maxId`, so rows that commit after this call (a late sampling tick) get
+ * a higher id and appear in neither — the metadata and the CSV describe exactly
+ * the same set. `maxId` is null only when the window is empty (count 0). */
+export async function countArchiveSnapshot(
   env: Env,
   params: ExportParams,
-): Promise<number> {
+): Promise<{ rowCount: number; maxId: number | null }> {
   const db = requireDb(env);
   const cfg = TABLE_CONFIG[params.table];
   const { clause, binds } = windowPredicate(params);
   const sql =
-    `SELECT COUNT(*) AS n FROM ${cfg.sqlTable}` +
+    `SELECT COUNT(*) AS n, MAX(id) AS max_id FROM ${cfg.sqlTable}` +
     (clause ? ` WHERE ${clause}` : "");
   try {
-    const res = await db.prepare(sql).bind(...binds).first<{ n: number }>();
-    return res?.n ?? 0;
+    const res = await db
+      .prepare(sql)
+      .bind(...binds)
+      .first<{ n: number; max_id: number | null }>();
+    return { rowCount: res?.n ?? 0, maxId: res?.max_id ?? null };
   } catch (err) {
     // Mirror archive.ts's read-failure wrapping: a bound-but-unmigrated
     // HISTORY_DB throws a raw "no such table" here. Surface it as an
@@ -394,13 +429,15 @@ interface BucketGroup {
   acc: Record<string, { sum: number; count: number; last: number | string | null }>;
 }
 
-function foldBucketPage(
+/** Fold one row into its `(key, bucket)` group within `groups`, creating the
+ * group on first sight. Rows arrive ascending, so `last` is overwrite-each-time. */
+function foldRow(
   cfg: TableConfig,
   bucket: Bucket,
   groups: Map<string, BucketGroup>,
-  rows: RawRow[],
+  row: RawRow,
 ): void {
-  for (const row of rows) {
+  {
     const bs = bucketStartMs(row.sampled_at, bucket);
     const keyVals = cfg.keyCols.map((c) => row[c.name] ?? null);
     const gkey = keyVals.join(" ") + " " + bs;
@@ -434,10 +471,12 @@ function aggValue(spec: ColSpec, a: { sum: number; count: number; last: number |
   }
 }
 
-/** Emit bucket rows ordered by (keys…, bucket_start) ascending for a
- * deterministic file. */
-function emitBucketLines(cfg: TableConfig, groups: Map<string, BucketGroup>): string[] {
-  const sorted = [...groups.values()].sort((x, y) => {
+/** Render a set of bucket groups as CSV lines, ordered by (keys…, bucket_start)
+ * ascending for a deterministic file. Operates on whatever groups are handed in
+ * — the streamer flushes one completed time bucket at a time, so this never sees
+ * the whole archive at once. */
+function renderBucketGroups(cfg: TableConfig, groups: BucketGroup[]): string[] {
+  const sorted = [...groups].sort((x, y) => {
     for (let i = 0; i < cfg.keyCols.length; i++) {
       const a = x.keyVals[i];
       const b = y.keyVals[i];
@@ -469,8 +508,12 @@ const CSV_HEADERS = {
 };
 
 /** Build a streamed CSV Response. Raw mode writes each page straight through
- * (true streaming, O(1) memory in row count); bucket mode folds pages into a
- * bounded aggregator and emits the (small) rolled-up table at the end. */
+ * (true streaming, O(1) memory in row count). Bucket mode also streams: because
+ * rows arrive in ascending sampled_at order, a time bucket is COMPLETE once the
+ * cursor advances past it, so each completed bucket is flushed and evicted as we
+ * go. Memory is therefore bounded by the keys within a SINGLE time bucket (≈ the
+ * planet/objective count), never by the whole archive — so a multi-week bucketed
+ * planet/MO export cannot blow the Worker's memory. */
 export function streamArchiveCsv(env: Env, params: ExportParams): Response {
   const cfg = TABLE_CONFIG[params.table];
   const header = exportColumns(params.table, params.bucket);
@@ -493,13 +536,40 @@ export function streamArchiveCsv(env: Env, params: ExportParams): Response {
             controller.enqueue(encoder.encode(buf));
           });
         } else {
+          const bucket = params.bucket;
           const groups = new Map<string, BucketGroup>();
-          await paginate(env, params, (rows) =>
-            foldBucketPage(cfg, params.bucket, groups, rows),
-          );
-          for (const line of emitBucketLines(cfg, groups)) {
-            controller.enqueue(encoder.encode(line));
-          }
+          let currentBucket = -Infinity;
+          // Flush (and evict) every group whose time bucket is fully behind the
+          // cursor. Each flush emits exactly one completed bucket's groups,
+          // sorted by key, keeping output ordered bucket-ascending then key.
+          const flushBelow = (threshold: number) => {
+            if (groups.size === 0) return;
+            const ready: BucketGroup[] = [];
+            for (const [k, g] of groups) {
+              if (g.bucketStart < threshold) {
+                ready.push(g);
+                groups.delete(k);
+              }
+            }
+            if (ready.length > 0) {
+              controller.enqueue(
+                encoder.encode(renderBucketGroups(cfg, ready).join("")),
+              );
+            }
+          };
+          await paginate(env, params, (rows) => {
+            for (const row of rows) {
+              const bs = bucketStartMs(row.sampled_at, bucket);
+              if (bs > currentBucket) {
+                // The cursor moved to a later bucket; every earlier bucket is
+                // now complete (rows are globally sampled_at-ascending).
+                flushBelow(bs);
+                currentBucket = bs;
+              }
+              foldRow(cfg, bucket, groups, row);
+            }
+          });
+          flushBelow(Infinity); // emit the final, still-open bucket
         }
         controller.close();
       } catch (err) {
@@ -555,6 +625,7 @@ export function buildExportUrl(origin: string, params: ExportParams): string {
   if (params.sinceMs != null) q.set("since", isoFromMs(params.sinceMs));
   if (params.untilMs != null) q.set("until", isoFromMs(params.untilMs));
   if (params.bucket !== "raw") q.set("bucket", params.bucket);
+  if (params.maxId != null) q.set("max_id", String(params.maxId));
   return `${origin}/export/archive?${q.toString()}`;
 }
 
@@ -604,7 +675,12 @@ export async function exportArchive(
   // baked into the URL (below), so the streamed dump matches the metadata.
   if (params.untilMs == null) params.untilMs = nowMs;
 
-  const rowCount = await countArchiveRows(env, params);
+  // Count the window AND capture the committed-row watermark (MAX(id)) in one
+  // query, then pin both the metadata and the streamed CSV to `id <= maxId` by
+  // baking it into the URL. A sampling tick that commits after this point gets a
+  // higher id and is excluded from both, so the file always matches row_count.
+  const { rowCount, maxId } = await countArchiveSnapshot(env, params);
+  if (maxId != null) params.maxId = maxId;
   const columns = exportColumns(params.table, params.bucket);
   const header = columns.join(",").length + 1;
 

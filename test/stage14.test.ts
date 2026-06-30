@@ -81,9 +81,11 @@ class ExportPrepared {
     let since = -Infinity;
     let until = Infinity;
     let planet: number | null = null;
+    let maxId = Infinity;
     if (this.sql.includes("sampled_at >=")) since = b.shift() as number;
     if (this.sql.includes("sampled_at <=")) until = b.shift() as number;
     if (this.sql.includes("planet_index =")) planet = b.shift() as number;
+    if (this.sql.includes("id <=")) maxId = b.shift() as number;
 
     let out = rows.filter((r) => {
       if (isKeyset && !(r.sampled_at > curTs || (r.sampled_at === curTs && r.id > curId)))
@@ -91,6 +93,7 @@ class ExportPrepared {
       if (r.sampled_at < since) return false;
       if (r.sampled_at > until) return false;
       if (planet != null && r.planet_index !== planet) return false;
+      if (r.id > maxId) return false;
       return true;
     });
     out = out.sort((x, y) => x.sampled_at - y.sampled_at || x.id - y.id);
@@ -110,7 +113,11 @@ class ExportPrepared {
 
   async first<T>(): Promise<T> {
     if (this.db.failQueries) throw new Error("no such table: " + this.table());
-    return { n: this.matches(this.tableRows()).length } as unknown as T;
+    const matched = this.matches(this.tableRows());
+    const maxId = matched.length
+      ? matched.reduce((m, r) => Math.max(m, r.id), -Infinity)
+      : null;
+    return { n: matched.length, max_id: maxId } as unknown as T;
   }
 }
 
@@ -391,6 +398,55 @@ describe("streamArchiveCsv", () => {
     const row1 = lines[2]!.split(",");
     expect(row1[cols.indexOf("missions_won")]).toBe("1023"); // last of day 1
   });
+
+  it("daily bucket over multiple keys streams bucket-ascending then key (incremental flush)", async () => {
+    const db = new ExportFakeD1();
+    let id = 1;
+    // Two planets, two days, interleaved within each day's sample ticks — the
+    // shape that would force a non-streaming aggregator to hold every group.
+    for (let day = 0; day < 2; day++) {
+      for (let h = 0; h < 4; h++) {
+        for (const idx of [64, 185]) {
+          db.rows.planet_samples.push({
+            id: id++,
+            sampled_at: Date.parse(`2026-06-${18 + day}T0${h}:00:00Z`),
+            planet_index: idx,
+            health: idx * 100 + day, // last per (planet, day)
+            max_health: 1_000_000,
+            hp_per_hour: h, // mean over 0..3 = 1.5
+            campaign_id: 1,
+            campaign_kind: "liberation",
+            faction: "Terminids",
+          });
+        }
+      }
+    }
+    const text = await csvText(envWith(db), {
+      table: "planet",
+      planetIndex: null,
+      sinceMs: null,
+      untilMs: null,
+      bucket: "daily",
+    });
+    const cols = exportColumns("planet", "daily");
+    const lines = text.trimEnd().split("\n");
+    expect(lines[0]).toBe(cols.join(","));
+    const dataRows = lines.slice(1).map((l) => l.split(","));
+    expect(dataRows.length).toBe(4); // 2 planets × 2 days
+    // Ordering: bucket-ascending, then key — [day0/64, day0/185, day1/64, day1/185]
+    const bs = (r: string[]) => r[cols.indexOf("bucket_start")]!;
+    const pidx = (r: string[]) => r[cols.indexOf("planet_index")]!;
+    expect(dataRows.map((r) => `${bs(r)}|${pidx(r)}`)).toEqual([
+      "2026-06-18T00:00:00.000Z|64",
+      "2026-06-18T00:00:00.000Z|185",
+      "2026-06-19T00:00:00.000Z|64",
+      "2026-06-19T00:00:00.000Z|185",
+    ]);
+    // Aggregations per group: hp_per_hour mean = 1.5, health = last value.
+    expect(Number(dataRows[0]![cols.indexOf("hp_per_hour")])).toBeCloseTo(1.5);
+    expect(dataRows[0]![cols.indexOf("health")]).toBe("6400"); // planet 64, day 0
+    expect(dataRows[3]![cols.indexOf("health")]).toBe("18501"); // planet 185, day 1
+  });
 });
 
 /* ====================================================================== *
@@ -499,6 +555,40 @@ describe("exportArchive (MCP metadata tool)", () => {
     expect(meta.bucket).toBe("hourly");
     expect(meta.url).toContain("planet_index=185");
     expect(meta.url).toContain("bucket=hourly");
+  });
+
+  it("pins a committed-row watermark so a late-committing tick can't desync the file", async () => {
+    const db = new ExportFakeD1();
+    seed(db, 5); // ids 1..5
+    const meta = (await exportArchive(envWith(db), "https://w.example", {
+      table: "global",
+    })) as Record<string, unknown>;
+    expect(meta.row_count).toBe(5);
+    expect(meta.url).toContain("max_id=5");
+
+    // A new tick commits AFTER the count, with a sampled_at inside the frozen
+    // window (so `until` alone would include it) but a higher id.
+    db.rows.global_samples.push({
+      id: 6,
+      sampled_at: NOW - HOUR / 2,
+      player_count: 9999,
+      impact_multiplier: 2,
+      active_campaign_count: 9,
+      missions_won: 999,
+      missions_lost: 9,
+      deaths: 9,
+      terminid_kills: 9,
+      automaton_kills: 9,
+      illuminate_kills: 9,
+    });
+
+    // Fetching the metadata URL must still yield exactly the 5 counted rows —
+    // the id watermark excludes the row that arrived after the snapshot.
+    const res = handleExportArchive(
+      new Request(meta.url as string),
+      envWith(db),
+    );
+    expect((await res.text()).trimEnd().split("\n").length - 1).toBe(5);
   });
 });
 
