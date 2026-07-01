@@ -3,6 +3,7 @@
  * Headless: no UI, no other routes. No auth on the MCP endpoint in this
  * version (single-user, URL-based connection) — noted as a future extension.
  */
+import { handleExportArchive } from "./export";
 import { handleMcpRequest } from "./mcp";
 import { runScheduledSample } from "./tools";
 import type { Env } from "./types";
@@ -20,6 +21,12 @@ export default {
         "hd2-strategist: Helldivers 2 Galactic War MCP server. POST JSON-RPC to this URL (MCP Streamable HTTP).",
         { headers: { "content-type": "text/plain" } },
       );
+    }
+    // Bulk archive CSV export (the transport half of the export_archive tool):
+    // a streamed, keyset-paginated dump of the D1 archive that bypasses the
+    // 1000-row context cap on the JSON archive tools. READ-ONLY.
+    if (url.pathname === "/export/archive" && request.method === "GET") {
+      return handleExportArchive(request, env);
     }
     return new Response("Not found", { status: 404 });
   },

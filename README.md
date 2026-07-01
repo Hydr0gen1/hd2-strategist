@@ -1,6 +1,6 @@
 # hd2-strategist — "Strategist"
 
-A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through eighteen MCP tools.
+A headless Galactic War **MCP server** running as a single Cloudflare Worker. It sits between an MCP client (e.g. Claude) and the Helldivers 2 community API (`api.helldivers2.dev`) as a **correctness layer**: it fetches raw war data, strips known deceptive/cosmetic fields, and exposes clean, strategy-ready data through nineteen MCP tools.
 
 ## The five invariants (the reason this server exists)
 
@@ -44,6 +44,7 @@ The convention is identical for defense campaigns (the tracked health there is t
 | `get_planet_archive` | **Long-range (D1 archive):** the unbounded counterpart to `get_planet_history` — a planet's observed health series read from the durable D1 store (`index` or `name`, optional `since_hours` default 168 / `limit` cap 1000), with per-point `delta_health`/`delta_hours` and the stored signed `hp_per_hour`. Observed points and deltas only, never a forecast |
 | `get_global_archive` | **Long-range (D1 archive):** the unbounded counterpart to `get_global_history` — global war statistics over days/weeks (player count, `impact_multiplier`, `active_campaign_count`, missions, deaths, kills) with raw observed deltas. The view that answers impact-multiplier-vs-population and the daily population cycle; no correlation or model, ever |
 | `get_major_order_archive` | **Long-range (D1 archive):** the unbounded counterpart to `get_major_order_history` — Major Order objective progress across a whole order, one series per objective with `delta_progress`/`delta_hours` and `progress_pct`. Optional `major_order_id`/`objective_index`. Observed samples and deltas only, never a forecast, required pace, or verdict (`objective_kind` is `null` here — the raw task type is not archived; use `get_major_order_history` for the label) |
+| `export_archive` | **Bulk CSV export (bypasses the 1000-row cap):** pull the *whole* D1 archive (or an arbitrary window) for off-context analysis. Pick `table` (`global`/`planet`/`mo`); optional `since`/`until` (ISO-8601) or `since_hours`/`until_hours` bound an arbitrary window (both edges); `planet_index` filters the planet table; `bucket` (`raw`/`hourly`/`daily`) server-side rolls up long ranges (mean of rates/multiplier, last value of counts). Returns **metadata only** — `{ url, table, bucket, row_count, byte_size_estimate, range, columns, format, generated_at }` — and the rows stream over HTTP from the returned `url` (`GET /export/archive`), never inlined. A faithful verbatim dump of stored rows: no derived/trend columns, analysis stays in the conversation layer |
 
 ### Two stores: KV (recent, fast) + D1 (unbounded archive) — Stage 12
 
@@ -171,18 +172,19 @@ After a deploy, verify it end-to-end by leaving the server idle and checking tha
 ## Architecture
 
 ```
-src/index.ts       Worker entry — routes POST / and /mcp; `scheduled` cron entry
+src/index.ts       Worker entry — routes POST / and /mcp, GET /export/archive; `scheduled` cron entry
 src/mcp.ts         JSON-RPC 2.0: initialize, tools/list, tools/call
 src/client.ts      Upstream fetch + KV cache (raw responses) + rate sampling; triggers the D1 archive write
 src/archive.ts     D1 history archive I/O — best-effort batched write + the long-range read queries (Stage 12)
+src/export.ts      Bulk archive CSV export — the export_archive tool (metadata) + the streamed GET /export/archive route (read-only)
 src/invariants.ts  Pure normalization — the five invariants, no I/O
 src/sampling.ts    Pure sample-series ring buffer behind hp_per_hour + history
 src/enrichment.ts  Pure fact pass-throughs (stats, timing, dispatches, history deltas, event decode, archive points)
 src/wiki.ts        Pure wiki lore logic (URL/key builders, response shaping, attribution) — separate source
 src/wikiClient.ts  Wiki fetch + canonical-keyed KV cache (`wiki:` namespace) — separate from client.ts
-src/tools.ts       The eighteen tool implementations
+src/tools.ts       The war-state/archive tool implementations (export_archive lives in src/export.ts)
 src/types.ts       Raw upstream + normalized types
-migrations/        D1 schema migrations (0001_init.sql) applied via `wrangler d1 migrations apply`
+migrations/        D1 schema migrations (0001_init.sql, 0002 planet_samples time index) applied via `wrangler d1 migrations apply`
 ```
 
 Raw upstream responses are cached in KV (`WAR_CACHE`) for ~45s; on upstream 429/5xx/timeouts the server falls back to a stale copy (marked `stale: true`) and only errors — with a structured MCP error — when no copy exists. Normalization runs **after** the cache read, so invariant changes never require cache invalidation.

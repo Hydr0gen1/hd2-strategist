@@ -5,6 +5,7 @@
  */
 import { ArchiveError } from "./archive";
 import { UpstreamError } from "./client";
+import { ExportParamError, exportArchive } from "./export";
 import {
   ToolError,
   getCampaigns,
@@ -322,6 +323,53 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "export_archive",
+    description:
+      "Bulk CSV export of the UNBOUNDED D1 archive, bypassing the 1000-row cap on the get_*_archive tools so the WHOLE history (or an arbitrary window) can be pulled off-context for trend analysis. Returns metadata ONLY — { url, table, bucket, row_count, byte_size_estimate, range, columns, format, generated_at } — NOT the rows: web_fetch the returned `url` to a file to get the streamed CSV. Pick table (global | planet | mo). Optional since/until (ISO-8601) or since_hours/until_hours bound an arbitrary window (both edges, which the JSON tools lack); planet_index filters the planet table to one planet; bucket (raw | hourly | daily) server-side rolls up long ranges (mean of rates/multiplier, last value of counts) into one row per bucket. A faithful verbatim dump of stored rows — no derived/trend columns; trend synthesis stays in the conversation layer. For live rate/ETA/projection use the live tools; this is history.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        table: {
+          type: "string",
+          enum: ["global", "planet", "mo"],
+          description:
+            "Which archive table to export: global (war statistics), planet (per-planet health), or mo (Major Order objective progress).",
+        },
+        planet_index: {
+          type: "number",
+          description:
+            "Planet table only: filter to one planet by index (e.g. 185).",
+        },
+        since: {
+          type: "string",
+          description:
+            "Window start as an ISO-8601 datetime (e.g. 2026-06-18T00:00:00Z). Omit for open-ended. Mutually exclusive with since_hours.",
+        },
+        until: {
+          type: "string",
+          description:
+            "Window end as an ISO-8601 datetime. Omit for open-ended (up to now). Mutually exclusive with until_hours.",
+        },
+        since_hours: {
+          type: "number",
+          description: "Window start expressed as hours-back-from-now (alternative to since).",
+        },
+        until_hours: {
+          type: "number",
+          description: "Window end expressed as hours-back-from-now (alternative to until).",
+        },
+        bucket: {
+          type: "string",
+          enum: ["raw", "hourly", "daily"],
+          description:
+            "raw (default) = every stored row; hourly/daily = server-side rollup to one row per bucket (mean of rates/multiplier, last value of counts) for long ranges.",
+        },
+      },
+      required: ["table"],
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 interface JsonRpcRequest {
@@ -354,6 +402,7 @@ async function dispatchTool(
   env: Env,
   name: string,
   args: Record<string, unknown>,
+  origin: string,
 ): Promise<unknown> {
   switch (name) {
     case "get_war_brief":
@@ -470,6 +519,26 @@ async function dispatchTool(
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
+    case "export_archive": {
+      // Accept number OR string for the numeric fields: a model may serialize
+      // them as strings, and exportArchive's shared parser coerces + validates,
+      // so a string-encoded value is honored (and a bad one errors) instead of
+      // being silently dropped — which for planet_index would widen a
+      // single-planet export to every planet.
+      const numOrStr = (v: unknown): number | string | undefined =>
+        typeof v === "number" || typeof v === "string" ? v : undefined;
+      return toolText(
+        await exportArchive(env, origin, {
+          table: typeof args.table === "string" ? args.table : undefined,
+          planet_index: numOrStr(args.planet_index),
+          since: typeof args.since === "string" ? args.since : undefined,
+          until: typeof args.until === "string" ? args.until : undefined,
+          since_hours: numOrStr(args.since_hours),
+          until_hours: numOrStr(args.until_hours),
+          bucket: typeof args.bucket === "string" ? args.bucket : undefined,
+        }),
+      );
+    }
     case "get_major_order_history":
       return toolText(
         await getMajorOrderHistory(env, {
@@ -536,7 +605,8 @@ export async function handleMcpRequest(
           ? (params.arguments as Record<string, unknown>)
           : {};
       try {
-        const result = await dispatchTool(env, name, args);
+        const origin = new URL(request.url).origin;
+        const result = await dispatchTool(env, name, args, origin);
         if (result === null) {
           return rpcError(id, -32602, `Unknown tool: "${name}".`);
         }
@@ -546,7 +616,8 @@ export async function handleMcpRequest(
           err instanceof ToolError ||
           err instanceof UpstreamError ||
           err instanceof WikiError ||
-          err instanceof ArchiveError
+          err instanceof ArchiveError ||
+          err instanceof ExportParamError
         ) {
           return rpcResult(id, toolText({ error: err.message }, true));
         }
