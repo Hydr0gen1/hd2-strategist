@@ -586,6 +586,41 @@ describe("buildWarDiff (item 6, pure)", () => {
     expect(diff.global.deltas!.delta_illuminate_kills).toBeNull();
   });
 
+  it("health-only movement on an ongoing campaign is listed per-planet (health_changed)", () => {
+    // Same campaign/faction across the window — only health moved.
+    const ongoingLast: PlanetArchiveRow = {
+      ...karliaFirst,
+      sampled_at: T1,
+      health: 60_000,
+    };
+    const diff = buildWarDiff({
+      planetFirst: [karliaFirst],
+      planetLast: [ongoingLast],
+      moFirst: [],
+      moLast: [],
+      globalFirst: null,
+      globalLast: null,
+      planetNames: new Map([[185, "KARLIA"]]),
+    });
+    expect(diff.planets_changed).toHaveLength(1);
+    const change = diff.planets_changed[0]!;
+    expect(change.health_changed).toBe(true);
+    expect(change.faction_changed).toBe(false);
+    expect(change.campaign_id_changed).toBe(false);
+    expect(change.delta_health).toBe(-40_000);
+    // An unchanged planet (identical rows apart from time) is NOT listed.
+    const still = buildWarDiff({
+      planetFirst: [karliaFirst],
+      planetLast: [{ ...karliaFirst, sampled_at: T1 }],
+      moFirst: [],
+      moLast: [],
+      globalFirst: null,
+      globalLast: null,
+    });
+    expect(still.planets_changed).toHaveLength(0);
+    expect(still.subjects_with_two_observations).toBe(1);
+  });
+
   it("a single-observation window computes no deltas and reports zero two-observation subjects", () => {
     // One sample in the window: both edge reads return the SAME row.
     const diff = buildWarDiff({

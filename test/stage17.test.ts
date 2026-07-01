@@ -201,9 +201,16 @@ class WriteFakeD1 {
     return stmt;
   }
 
-  select(sql: string, _binds: unknown[]): Record<string, unknown>[] {
+  select(sql: string, binds: unknown[]): Record<string, unknown>[] {
     const table = (sql.match(/FROM (\w+)/) ?? [])[1] ?? "";
-    const rows = this.tables[table] ?? [];
+    let rows = this.tables[table] ?? [];
+    const b = [...binds];
+    let limit = Infinity;
+    if (sql.includes("LIMIT ?")) limit = b.pop() as number;
+    if (sql.includes("sampled_at >=")) {
+      const since = b.shift() as number;
+      rows = rows.filter((r) => (r.sampled_at as number) >= since);
+    }
     if (sql.includes("COUNT(*)") && sql.includes("GROUP BY reason")) {
       const byReason = new Map<string, number>();
       for (const r of rows) {
@@ -224,10 +231,11 @@ class WriteFakeD1 {
         },
       ];
     }
-    // Plain selects (timestamps / recent quarantine): newest-first.
-    return [...rows].sort(
-      (a, b) => (b.sampled_at as number) - (a.sampled_at as number),
+    // Plain selects (timestamps / recent quarantine): newest-first + LIMIT.
+    const sorted = [...rows].sort(
+      (x, y) => (y.sampled_at as number) - (x.sampled_at as number),
     );
+    return limit === Infinity ? sorted : sorted.slice(0, limit);
   }
 
   async batch(stmts: { sql: string; vals: unknown[] }[]) {
@@ -461,5 +469,32 @@ describe("get_health (item 8)", () => {
     expect(out.quarantine.recent[0].reason).toBe("delta_exceeds_sigma_bound");
     // Read-only: zero KV writes.
     expect(kv.puts).toHaveLength(0);
+    // Under the cap: the analysis covered the full window and says so.
+    expect(out.cadence.analysis_window_capped).toBe(false);
+    expect(out.cadence.analysis_covers_from).toBe(
+      new Date(times[0]!).toISOString(),
+    );
+  });
+
+  it("a window holding more samples than the analysis cap is flagged, with the covered span stated", async () => {
+    const kv = fakeKv();
+    const db = new WriteFakeD1();
+    const base = Date.now();
+    // 2,100 ten-minute samples (> the 2,000-row analysis cap).
+    db.tables.global_samples = Array.from({ length: 2_100 }, (_, i) => ({
+      id: i + 1,
+      sampled_at: base - (2_100 - i) * 10 * MINUTE,
+    }));
+
+    const out = (await getHealth(envWith(kv, db), {
+      since_hours: 24 * 30,
+    })) as Record<string, any>;
+    expect(out.cadence.samples).toBe(2_000); // newest rows kept
+    expect(out.cadence.analysis_window_capped).toBe(true);
+    expect(out.cadence.analysis_cap_note).toMatch(/analysis cap/i);
+    // The covered span starts at the 101st sample, NOT the window start.
+    expect(out.cadence.analysis_covers_from).toBe(
+      new Date(base - 2_000 * 10 * MINUTE).toISOString(),
+    );
   });
 });

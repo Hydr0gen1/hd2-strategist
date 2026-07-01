@@ -2237,6 +2237,10 @@ export function buildWarDiff(args: {
     faction_changed: boolean;
     campaign_kind_changed: boolean;
     campaign_id_changed: boolean;
+    /** True when the archived health moved across the window — an ongoing
+     * campaign's per-planet delta_health is listed here too, not only in the
+     * faction aggregate. */
+    health_changed: boolean;
     delta_health: number | null;
   }[];
   planets_first_observed: { planet_index: number; planet_name: string | null; last: PlanetEdgeObservation }[];
@@ -2292,7 +2296,11 @@ export function buildWarDiff(args: {
         first.health != null && last.health != null
           ? last.health - first.health
           : null;
-      if (factionChanged || kindChanged || idChanged) {
+      const healthChanged = deltaHealth != null && deltaHealth !== 0;
+      // Health movement alone lists a planet too: an ongoing campaign's
+      // per-planet delta is a first-class diff fact, not only the faction
+      // aggregate's input (codex-review fix).
+      if (factionChanged || kindChanged || idChanged || healthChanged) {
         planets_changed.push({
           planet_index: idx,
           planet_name: nameOf(idx),
@@ -2301,6 +2309,7 @@ export function buildWarDiff(args: {
           faction_changed: factionChanged,
           campaign_kind_changed: kindChanged,
           campaign_id_changed: idChanged,
+          health_changed: healthChanged,
           delta_health: deltaHealth,
         });
       }
@@ -2446,4 +2455,4 @@ export function buildWarDiff(args: {
 }
 
 export const WAR_DIFF_NOTE =
-  "Deterministic archive arithmetic between each subject's FIRST and LAST archived observation inside the window — raw before/after pairs and their subtractions, nothing more. faction is the campaign-tracked faction the archive stores (the event attacker on a defense, the planet owner otherwise — the same derivation the live campaign payloads use), so faction_changed means exactly that tracked value changed; an owner flip typically also shows as campaign_kind_changed (defense → liberation) with the campaign_id turning over. delta_health follows the raw stored orientation (last − first; negative = health fell). net_health_delta_by_faction groups planets by their LAST-observed faction and sums known delta_health values (planets_counted states coverage). planets_first_observed / _no_longer_observed report archive-set membership — a planet enters the archive when sampling observes it (campaign start or a direct probe) and stops accruing when it leaves the campaign set, which is evidence, not proof, of a campaign opening/closing. No significance ranking, cause attribution, or went-well/badly verdict exists here by design.";
+  "Deterministic archive arithmetic between each subject's FIRST and LAST archived observation inside the window — raw before/after pairs and their subtractions, nothing more. faction is the campaign-tracked faction the archive stores (the event attacker on a defense, the planet owner otherwise — the same derivation the live campaign payloads use), so faction_changed means exactly that tracked value changed; an owner flip typically also shows as campaign_kind_changed (defense → liberation) with the campaign_id turning over. delta_health follows the raw stored orientation (last − first; negative = health fell); a planet whose health alone moved (an ongoing campaign) is listed in planets_changed with health_changed: true, so per-planet movement is never visible only through the faction aggregate. net_health_delta_by_faction groups planets by their LAST-observed faction and sums known delta_health values (planets_counted states coverage). planets_first_observed / _no_longer_observed report archive-set membership — a planet enters the archive when sampling observes it (campaign start or a direct probe) and stops accruing when it leaves the campaign set, which is evidence, not proof, of a campaign opening/closing. No significance ranking, cause attribution, or went-well/badly verdict exists here by design.";

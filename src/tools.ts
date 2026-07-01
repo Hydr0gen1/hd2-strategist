@@ -2513,6 +2513,12 @@ export async function getHealth(
     HEALTH_EXPECTED_INTERVAL_MS,
     HEALTH_GAP_THRESHOLD_MS,
   );
+  // The timestamp read keeps the NEWEST rows when the window holds more than
+  // the cap (~14 days at the 10-minute cadence) — say so, and state the
+  // window the gap/cadence arithmetic ACTUALLY covered, instead of silently
+  // analyzing a shorter span than the echoed since_hours (codex-review fix).
+  const analysisCapped = timestamps.length >= HEALTH_TIMESTAMP_LIMIT;
+  const analysisFrom = timestamps[0] ?? null;
 
   return {
     source: "d1_archive",
@@ -2532,6 +2538,16 @@ export async function getHealth(
       expected_interval_minutes: HEALTH_EXPECTED_INTERVAL_MS / 60_000,
       gap_threshold_minutes: HEALTH_GAP_THRESHOLD_MS / 60_000,
       ...cadence,
+      // The span the gap/adherence arithmetic actually covered. When capped,
+      // it is SHORTER than the requested since_hours window (newest rows kept).
+      analysis_covers_from:
+        analysisFrom != null ? new Date(analysisFrom).toISOString() : null,
+      analysis_window_capped: analysisCapped,
+      ...(analysisCapped
+        ? {
+            analysis_cap_note: `The window holds more archived samples than the ${HEALTH_TIMESTAMP_LIMIT}-row analysis cap, so gaps/adherence cover only the NEWEST samples back to analysis_covers_from — older gaps are not visible here. Narrow since_hours (or query in slices) for full coverage.`,
+          }
+        : {}),
     },
     gap_count: gaps.length,
     gaps,
@@ -2554,7 +2570,7 @@ export async function getHealth(
     },
     notes: {
       cadence:
-        "Deterministic spacing facts over the archived global sample timestamps in the window (the cron-driven record). A gap or an expected-vs-archived shortfall means NOTHING WAS RECORDED there — which, by the persistence gate's design, covers both a genuine outage and a degraded-provenance tick that correctly recorded nothing; the archive cannot (and does not) attribute the cause.",
+        "Deterministic spacing facts over the archived global sample timestamps in the ANALYZED window (analysis_covers_from onward; analysis_window_capped states when the requested window held more samples than the analysis cap and older spacings are therefore not covered). A gap or an expected-vs-archived shortfall means NOTHING WAS RECORDED there — which, by the persistence gate's design, covers both a genuine outage and a degraded-provenance tick that correctly recorded nothing; the archive cannot (and does not) attribute the cause.",
       quarantine:
         "Rows the item-7 plausibility screen diverted from the live archive (the known sentinel signature, or a delta outside the recent mean ± 6σ delta band). Each entry carries the reason, both sides of the comparison (detail), and the excluded row verbatim — flagged, never corrected, never silently dropped. Quarantined observations were still SERVED live at the time; they are only absent from the durable record.",
       row_counts:
