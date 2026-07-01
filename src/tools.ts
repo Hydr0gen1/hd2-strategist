@@ -1,5 +1,5 @@
 /**
- * The eighteen MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The twenty-two MCP tools (the twenty-third, export_archive, lives in export.ts). Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
@@ -10,11 +10,21 @@ import {
   ARCHIVE_DEFAULT_SINCE_HOURS,
   ARCHIVE_MAX_LIMIT,
   clampLimit,
+  readArchiveCounts,
+  readArchiveCoverage,
   readGlobalArchive,
+  readGlobalEdgeRow,
+  readGlobalSampleTimestamps,
   readMoArchive,
+  readMoEdgeRows,
+  readMoOutcomes,
   readPlanetArchive,
+  readPlanetEdgeRows,
+  readQuarantineSummary,
   sinceCutoffMs,
+  untilCutoffMs,
 } from "./archive";
+import { buildGapList, cadenceStats } from "./integrity";
 import {
   cacheBulkPlanets,
   commitSampleTick,
@@ -43,13 +53,17 @@ import {
   buildGlobalHistoryPoints,
   buildHistoryPoints,
   buildInboundNeighbors,
+  buildIsolationRisk,
   buildMajorOrderTargets,
   buildMoArchiveSeries,
   buildMoHistorySeries,
+  buildMoPace,
   buildNeighbors,
   buildPlanetArchivePoints,
+  buildReverseAdjacency,
   buildSectorRollup,
   buildSupplyGraph,
+  buildWarDiff,
   decayPerHour,
   decodeEventModifier,
   DEFENSE_ETA_NOTE,
@@ -65,8 +79,11 @@ import {
   historyRateAggregates,
   hpRemainingToObjective,
   INBOUND_NEIGHBORS_NOTE,
+  ISOLATION_RISK_NOTE,
   LIBERATION_PCT_NOTE,
   MO_OBJECTIVE_DECODE_NOTE,
+  MO_PACE_NOTE,
+  WAR_DIFF_NOTE,
   moIntervalRates,
   moPlanetAssignmentMap,
   moProgressObservations,
@@ -973,6 +990,17 @@ export async function getPlanet(
     inbound_neighbors,
   );
 
+  // Item 4: which active campaigns lose their sole Super Earth warp link if
+  // this planet flips owner — a deterministic one-hop fact over the same
+  // observed edge set the supply graph serves, read through the tri-state
+  // accessor (null, never [], when campaign state is unknown).
+  const isolation_risk = buildIsolationRisk(
+    planet,
+    planetByIndex,
+    buildReverseAdjacency(planets),
+    view,
+  );
+
   // Feature 2: defense gambit origin(s) — the planet(s) attacking this defense,
   // from the inverted source→target pairs. Raw state + tri-state MO membership
   // (null, never false, when campaign state is unknown).
@@ -1107,6 +1135,8 @@ export async function getPlanet(
     // (outbound) is unchanged.
     inbound_neighbors,
     adjacency_summary,
+    // Item 4: the sole-Super-Earth-link dependency fact (see notes).
+    isolation_risk,
     // Stage 10: normalized-vs-raw verification block — surfaced
     // disagreement is data; no side is ever picked or averaged.
     cross_check,
@@ -1130,6 +1160,7 @@ export async function getPlanet(
       frontline:
         "Deterministic adjacency fact: true iff at least one neighbor has a known owner different from this planet's current_owner — 'borders territory of a different owner', nothing more. Not a strategic judgment; neighbors with unknown owners never set it.",
       inbound_neighbors: INBOUND_NEIGHBORS_NOTE,
+      isolation_risk: ISOLATION_RISK_NOTE,
       ...(planet.event ? { gambit_origin: GAMBIT_ORIGIN_NOTE } : {}),
       per_player_rates: PER_PLAYER_RATES_NOTE,
       regions: REGIONS_NOTE,
@@ -1919,6 +1950,28 @@ const ARCHIVE_RETENTION_NOTE =
 const ARCHIVE_SAMPLING_NOTE =
   "Observed data points and deterministic consecutive deltas only — no smoothing, no forecast, no trend verdict. Sample timestamps use the Worker clock (upstream war time is game-epoch and not comparable). These are the SAME observations the KV history tools serve, persisted durably; the two views can differ only by time range, never by interpretation.";
 
+const ARCHIVE_WINDOW_NOTE =
+  "The window has BOTH edges: since_hours (start, hours back from now — default 168) and optional until_hours (end, hours back from now; omit for 'up to now'). since_hours must be LARGER than until_hours (further back). With more rows in the window than `limit`, the NEWEST rows are returned — page backward through older history by walking until_hours outward (e.g. since_hours: 400, until_hours: 200, then 600/400, …); adjacent slices reconstruct the full table.";
+
+/**
+ * Item 2: resolve the two-edged archive window from the tool args. The upper
+ * edge is optional (absent = up to now); an inverted pair (until further back
+ * than since) is an empty window and rejected loudly rather than returning [].
+ */
+function archiveWindow(
+  args: { since_hours?: number; until_hours?: number },
+  nowMs: number,
+): { sinceMs: number; untilMs: number | null } {
+  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
+  const untilMs = untilCutoffMs(args.until_hours, nowMs);
+  if (untilMs != null && sinceMs > untilMs) {
+    throw new ToolError(
+      `Empty window: since_hours (${args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS}) must be LARGER than until_hours (${args.until_hours}) — both count hours back from now, so the window start must lie further back than its end.`,
+    );
+  }
+  return { sinceMs, untilMs };
+}
+
 /**
  * Stage 12: a planet's UNBOUNDED observed health series from the D1 archive —
  * the long-range counterpart to get_planet_history's recent KV window. Resolves
@@ -1928,7 +1981,13 @@ const ARCHIVE_SAMPLING_NOTE =
  */
 export async function getPlanetArchive(
   env: Env,
-  args: { index?: number; name?: string; since_hours?: number; limit?: number },
+  args: {
+    index?: number;
+    name?: string;
+    since_hours?: number;
+    until_hours?: number;
+    limit?: number;
+  },
 ): Promise<unknown> {
   assertPlanetArgs(args);
 
@@ -1948,8 +2007,14 @@ export async function getPlanetArchive(
 
   const nowMs = Date.now();
   const limit = clampLimit(args.limit);
-  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
-  const rows = await readPlanetArchive(env, planet.index, sinceMs, limit);
+  const { sinceMs, untilMs } = archiveWindow(args, nowMs);
+  const rows = await readPlanetArchive(
+    env,
+    planet.index,
+    sinceMs,
+    limit,
+    untilMs,
+  );
   const points = buildPlanetArchivePoints(rows);
   const first = rows[0];
   const last = rows[rows.length - 1];
@@ -1959,6 +2024,7 @@ export async function getPlanetArchive(
     planet_name: planet.name,
     source: "d1_archive",
     since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    ...(args.until_hours != null ? { until_hours: args.until_hours } : {}),
     limit,
     max_limit: ARCHIVE_MAX_LIMIT,
     truncated: rows.length === limit,
@@ -1981,6 +2047,7 @@ export async function getPlanetArchive(
       delta_health:
         "Raw observed change per point: current − previous health (negative = health depleting). hp_per_hour stored on each point uses the opposite orientation, (previous − current) / hours, positive = progressing toward resolution. Both conventions apply to defense campaigns identically (the tracked health is the EVENT health, which depletes toward zero while the defense is won).",
       hp_per_hour: RATE_SIGN_NOTE,
+      window: ARCHIVE_WINDOW_NOTE,
       sampling: ARCHIVE_SAMPLING_NOTE,
       retention: ARCHIVE_RETENTION_NOTE,
       freshness: FRESHNESS_NOTE,
@@ -1999,12 +2066,12 @@ export async function getPlanetArchive(
  */
 export async function getGlobalArchive(
   env: Env,
-  args: { since_hours?: number; limit?: number },
+  args: { since_hours?: number; until_hours?: number; limit?: number },
 ): Promise<unknown> {
   const nowMs = Date.now();
   const limit = clampLimit(args.limit);
-  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
-  const rows = await readGlobalArchive(env, sinceMs, limit);
+  const { sinceMs, untilMs } = archiveWindow(args, nowMs);
+  const rows = await readGlobalArchive(env, sinceMs, limit, untilMs);
   const points = buildGlobalArchivePoints(rows);
   const first = rows[0];
   const last = rows[rows.length - 1];
@@ -2012,6 +2079,7 @@ export async function getGlobalArchive(
   return {
     source: "d1_archive",
     since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    ...(args.until_hours != null ? { until_hours: args.until_hours } : {}),
     limit,
     max_limit: ARCHIVE_MAX_LIMIT,
     truncated: rows.length === limit,
@@ -2032,6 +2100,7 @@ export async function getGlobalArchive(
       : {}),
     notes: {
       sampling: ARCHIVE_SAMPLING_NOTE,
+      window: ARCHIVE_WINDOW_NOTE,
       impact_multiplier:
         "The raw upstream war.impactMultiplier observed at sample time, with active_campaign_count co-sampled beside it. Over a multi-day window the daily population cycle and the multiplier relationship become legible — but any correlation, model, or prediction relating them is for the consumer to read off the curves; the server computes none.",
       retention: ARCHIVE_RETENTION_NOTE,
@@ -2053,22 +2122,35 @@ export async function getMajorOrderArchive(
     major_order_id?: number;
     objective_index?: number;
     since_hours?: number;
+    until_hours?: number;
     limit?: number;
   },
 ): Promise<unknown> {
   const nowMs = Date.now();
   const limit = clampLimit(args.limit);
-  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
-  const rows = await readMoArchive(env, sinceMs, limit, {
-    majorOrderId: args.major_order_id,
-    objectiveIndex: args.objective_index,
-  });
+  const { sinceMs, untilMs } = archiveWindow(args, nowMs);
+  const [rows, outcomes] = await Promise.all([
+    readMoArchive(env, sinceMs, limit, {
+      majorOrderId: args.major_order_id,
+      objectiveIndex: args.objective_index,
+      untilMs,
+    }),
+    // Item 10: past-order outcomes ride the same archive read, honoring the
+    // SAME narrowing as the series (a narrowed response never mixes in other
+    // objectives' final states). Null when the mo_outcomes migration is not
+    // applied yet (noted, never an error).
+    readMoOutcomes(env, {
+      majorOrderId: args.major_order_id,
+      objectiveIndex: args.objective_index,
+    }),
+  ]);
   const series = buildMoArchiveSeries(rows);
   const retainedIds = [...new Set(rows.map((r) => r.major_order_id))];
 
   return {
     source: "d1_archive",
     since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    ...(args.until_hours != null ? { until_hours: args.until_hours } : {}),
     limit,
     max_limit: ARCHIVE_MAX_LIMIT,
     truncated: rows.length === limit,
@@ -2087,6 +2169,19 @@ export async function getMajorOrderArchive(
     archived_major_order_ids: retainedIds,
     series_count: series.length,
     series,
+    // Item 10: the outcome log — each completed order's final observed state
+    // per objective (recorded when the order left the live assignments set).
+    outcomes: outcomes?.map((o) => ({
+      ...o,
+      recorded_at_iso: new Date(o.recorded_at).toISOString(),
+      target_reached: o.target_reached == null ? null : o.target_reached === 1,
+    })),
+    ...(outcomes == null
+      ? {
+          outcomes_note:
+            "The mo_outcomes table is not readable — migration 0004_mo_outcomes.sql has likely not been applied. Run `wrangler d1 migrations apply hd2-strategist-history --remote`.",
+        }
+      : {}),
     ...(series.length === 0
       ? {
           note: "No archived Major Order progress in the requested window. Samples accrue whenever the server polls campaigns (request polls + the 10-minute cron); a cold start, a too-narrow since_hours, or a major_order_id never sampled is expected to be empty, not an error.",
@@ -2094,14 +2189,401 @@ export async function getMajorOrderArchive(
       : {}),
     notes: {
       sampling: ARCHIVE_SAMPLING_NOTE,
+      window: ARCHIVE_WINDOW_NOTE,
       deltas:
         "delta_progress / delta_hours are raw differences between consecutive OBSERVATIONS — never a projection. No forecast, completion estimate, required pace, or on-track/behind verdict exists anywhere in this payload by design; pace judgment belongs to the consumer, grounded on these observed points.",
       progress_pct:
         "latest_progress / target × 100, from the newest archived sample — deterministic; null when the target is 0 or unknown or progress is unknown.",
       objective_kind:
         "Always null in the archive: the D1 schema does not store the raw task_type, so the objective-kind label is not decoded here. get_major_order_history (the recent KV view) carries it. progress/target are identical between the two.",
+      outcomes:
+        "One row per objective of each COMPLETED Major Order, recorded when the order was observed to leave the live assignments set: the final retained progress/target sample, final_progress_pct, and target_reached — the plain comparison final_progress >= target at the last observation (null when either side is unknown). A deterministic record of observed final state; no success-trend analysis or cause attribution is derived from it. Detection is observational: an order that ended inside a sampling gap is recorded on the next poll with its last-seen state.",
       retention: ARCHIVE_RETENTION_NOTE,
     },
     queried_at: new Date(nowMs).toISOString(),
   };
+}
+
+/* ------------------------------------------------------------------------
+ * Next-features wave, Tier 2: the three new analysis tools. All three follow
+ * the enrich-never-conclude discipline — observed numbers and deterministic
+ * transforms side by side, judgment stays in the conversation layer.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Item 3: get_mo_pace — per Major Order objective, the OBSERVED progress rate
+ * (from the retained MO progress series) and the REQUIRED rate (remaining ÷
+ * time left) side by side, with their inputs. Two numbers, no verdict — the
+ * reader decides "on track". Read-only: one assignments fetch (shared 45s
+ * cache) + one KV read, ZERO sample-store writes (the get_major_order
+ * discipline).
+ */
+export async function getMoPace(env: Env): Promise<unknown> {
+  const [res, moSeries] = await Promise.all([
+    fetchUpstream<RawAssignment[]>(env, "/api/v1/assignments"),
+    readMoSeries(env),
+  ]);
+  const assignments = res.data ?? [];
+  const nowMs = Date.now();
+  const freshness = freshnessFrom([res.fetchedAt], nowMs);
+  if (assignments.length === 0) {
+    return {
+      active: false,
+      message: "No active Major Order at this time — no pace to report.",
+      ...freshness,
+      ...(res.stale ? { stale: true } : {}),
+    };
+  }
+
+  const orders = shapeMajorOrders(assignments, nowMs);
+  return {
+    active: true,
+    major_orders: orders.map((order) => ({
+      id: order.id,
+      title: order.title,
+      expires_in_seconds: order.expires_in_seconds,
+      expires_in: order.expires_in,
+      expiration: order.expiration,
+      objectives: buildMoPace(order, moSeries),
+    })),
+    notes: {
+      pace: MO_PACE_NOTE,
+      observed_rates:
+        "Observed rates come from the same retained progress series get_major_order_history serves (samples accrue on every campaign poll + the 10-minute cron; a cold start reports insufficient_history, not 0). _latest is the newest per-interval delta; _mean is the unweighted mean over the retained window.",
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshness,
+    ...(res.stale ? { stale: true } : {}),
+  };
+}
+
+/**
+ * Item 5: get_gambits — the gambit board: every active defense with its
+ * attack-origin planet(s) (the inverted source→target attack pairs), each
+ * origin joined with its live liberation state and MO membership. Facts only —
+ * no viability score, no clear-the-origin-in-time verdict. READ-ONLY like
+ * get_supply_graph: the loader is side-effect-free and this tool never commits
+ * the tick.
+ */
+export async function getGambits(env: Env): Promise<unknown> {
+  const [planetsResult, bundle] = await Promise.all([
+    fetchPlanetsWithFallback(env),
+    loadCampaignsResilient(env),
+  ]);
+  const planets = planetsResult.planets;
+  const planetByIndex = new Map<number, RawPlanet>(
+    planets.map((p) => [p.index, p]),
+  );
+  const view = bundle.view;
+  const campaignByIndex = new Map(
+    bundle.campaigns.map((c) => [c.planet_index, c]),
+  );
+
+  // Under a campaign outage the defense set is UNKNOWN, never "no defenses" —
+  // serve null with the reason instead of an empty board.
+  const campaignStateKnown = view.known;
+  const defenses = campaignStateKnown
+    ? bundle.campaigns.filter((c) => c.campaign_kind === "defense")
+    : null;
+
+  const board = defenses?.map((d) => {
+    const planet = planetByIndex.get(d.planet_index);
+    const origins = planet
+      ? buildGambitOrigins(planet, planetByIndex, view)
+      : [];
+    return {
+      planet_index: d.planet_index,
+      planet_name: d.planet_name,
+      attacker: d.faction,
+      is_major_order_target: d.is_major_order_target,
+      raw_hp: d.raw_hp,
+      max_hp: d.max_hp,
+      hp_per_hour: d.hp_per_hour,
+      liberation_pct_display_only: d.liberation_pct_display_only,
+      defense_ends_at: d.defense_ends_at ?? null,
+      defense_hours_remaining: d.defense_hours_remaining ?? null,
+      gambit_origins: origins.map((o) => {
+        // Join the origin's live campaign trajectory when one is active —
+        // the SAME normalized values get_campaigns returns, never recomputed.
+        const oc = campaignByIndex.get(o.index);
+        return {
+          ...o,
+          max_hp: oc?.max_hp ?? null,
+          liberation_pct_display_only: oc?.liberation_pct_display_only ?? null,
+          hp_per_hour: oc?.hp_per_hour ?? null,
+          direction: oc?.direction ?? null,
+        };
+      }),
+    };
+  });
+
+  return {
+    campaign_state_known: campaignStateKnown,
+    defense_count: defenses?.length ?? null,
+    defenses: board ?? null,
+    ...(campaignStateKnown
+      ? defenses!.length === 0
+        ? { note: "No active defense campaigns right now — an empty board, not an error." }
+        : {}
+      : {
+          note: "Campaign state could not be fetched this request (outage), so the defense set is UNKNOWN — defenses is null, never an asserted-empty board. Retry when upstream recovers.",
+        }),
+    notes: {
+      gambit_origin: GAMBIT_ORIGIN_NOTE,
+      board:
+        "One entry per active defense: the defended planet's live event trajectory (the same normalized values get_campaigns returns) plus its attack origin(s) with each origin's live liberation state (raw_hp / max_hp / liberation_pct_display_only / signed hp_per_hour, joined from the origin's active campaign when one exists — null otherwise, never fabricated) and is_major_order_target (a pure membership join). Facts only: there is deliberately NO gambit-viability score or clear-in-time verdict — that judgment is the consumer's.",
+      liberation_pct_display_only: LIBERATION_PCT_NOTE,
+      hp_per_hour: RATE_SIGN_NOTE,
+      freshness: FRESHNESS_NOTE,
+    },
+    ...freshnessFrom(
+      [planetsResult.fetchedAt, ...bundle.fetchedAts],
+      Date.now(),
+    ),
+    ...(anyDegraded(planetsResult.planet_provenance, bundle.campaign_provenance)
+      ? { stale: true }
+      : {}),
+  };
+}
+
+/** Item 6: default look-back for get_war_diff when the caller gives none. */
+export const WAR_DIFF_DEFAULT_SINCE_HOURS = 24;
+
+/**
+ * Item 6: get_war_diff — "what changed since N hours ago" as deterministic
+ * archive arithmetic: each subject's FIRST vs LAST archived observation inside
+ * the window, with raw before/after values and subtractions. Reads ONLY the D1
+ * archive (plus one cached planets fetch to join names); zero KV writes.
+ */
+export async function getWarDiff(
+  env: Env,
+  args: { since_hours?: number; until_hours?: number } = {},
+): Promise<unknown> {
+  const nowMs = Date.now();
+  const sinceHours =
+    args.since_hours != null &&
+    Number.isFinite(args.since_hours) &&
+    args.since_hours > 0
+      ? args.since_hours
+      : WAR_DIFF_DEFAULT_SINCE_HOURS;
+  const sinceMs = nowMs - sinceHours * 3_600_000;
+  const untilMs = untilCutoffMs(args.until_hours, nowMs) ?? nowMs;
+  if (sinceMs > untilMs) {
+    throw new ToolError(
+      `Empty window: since_hours (${sinceHours}) must be LARGER than until_hours (${args.until_hours}) — both count hours back from now.`,
+    );
+  }
+
+  const [
+    planetFirst,
+    planetLast,
+    moFirst,
+    moLast,
+    globalFirst,
+    globalLast,
+    coverage,
+  ] = await Promise.all([
+    readPlanetEdgeRows(env, sinceMs, untilMs, "first"),
+    readPlanetEdgeRows(env, sinceMs, untilMs, "last"),
+    readMoEdgeRows(env, sinceMs, untilMs, "first"),
+    readMoEdgeRows(env, sinceMs, untilMs, "last"),
+    readGlobalEdgeRow(env, sinceMs, untilMs, "first"),
+    readGlobalEdgeRow(env, sinceMs, untilMs, "last"),
+    readArchiveCoverage(env),
+  ]);
+
+  // Names are cosmetic joins — a planets-fetch failure degrades to indices
+  // only, never blocks the archive diff.
+  let planetNames = new Map<number, string>();
+  let namesJoined = true;
+  try {
+    const planetsRes = await fetchUpstream<RawPlanet[]>(env, "/api/v1/planets");
+    planetNames = new Map(
+      (planetsRes.data ?? [])
+        .filter((p) => typeof p.name === "string")
+        .map((p) => [p.index, p.name]),
+    );
+  } catch {
+    namesJoined = false;
+  }
+
+  const diff = buildWarDiff({
+    planetFirst,
+    planetLast,
+    moFirst,
+    moLast,
+    globalFirst,
+    globalLast,
+    planetNames,
+  });
+
+  // Insufficient unless at least ONE subject has two distinct observations in
+  // the window (the same >= 2 samples rule every history surface applies): a
+  // cold archive OR a window holding a single tick both yield no computable
+  // delta, and neither may read as an apparently-valid empty diff.
+  const anyRows =
+    planetFirst.length > 0 || globalFirst != null || moFirst.length > 0;
+  const insufficient = diff.subjects_with_two_observations === 0;
+  const windowPredatesArchive =
+    coverage.earliest != null && sinceMs < coverage.earliest;
+
+  return {
+    source: "d1_archive",
+    since_hours: sinceHours,
+    ...(args.until_hours != null ? { until_hours: args.until_hours } : {}),
+    window: {
+      from: new Date(sinceMs).toISOString(),
+      to: new Date(untilMs).toISOString(),
+    },
+    archive_coverage: {
+      earliest:
+        coverage.earliest != null
+          ? new Date(coverage.earliest).toISOString()
+          : null,
+      latest:
+        coverage.latest != null
+          ? new Date(coverage.latest).toISOString()
+          : null,
+      window_start_before_archive: windowPredatesArchive,
+    },
+    insufficient_history: insufficient,
+    ...(insufficient
+      ? {
+          note: anyRows
+            ? "The window holds archived observations but no subject has TWO distinct ones, so no delta is computable — deltas need two samples >60s apart. Widen the window (larger since_hours) or wait for more ticks."
+            : "No archived observations inside the requested window — the archive fills one tick at a time while the server polls; a window predating the archive (see archive_coverage) or a cold start is expected to be empty, not an error.",
+        }
+      : windowPredatesArchive
+        ? {
+            note: "The window start predates the archive's earliest sample (see archive_coverage) — the diff covers only the archived part of the window.",
+          }
+        : {}),
+    ...diff,
+    ...(namesJoined ? {} : { planet_names_joined: false }),
+    notes: {
+      diff: WAR_DIFF_NOTE,
+      sampling: ARCHIVE_SAMPLING_NOTE,
+    },
+    queried_at: new Date(nowMs).toISOString(),
+  };
+}
+
+/* ------------------------------------------------------------------------
+ * Item 8: get_health — the server's self-report. Deterministic counts and
+ * spacing facts over the server's OWN record (the D1 archive + quarantine
+ * table): row counts per table, the recent gap list, cadence adherence, and
+ * quarantine tallies. It reports what was (and was not) recorded; attributing
+ * WHY a tick is missing (outage vs a degraded-provenance tick that correctly
+ * recorded nothing) is the consumer's — the archive cannot distinguish them
+ * by design (degraded data is never recorded).
+ * ---------------------------------------------------------------------- */
+
+/** The cron cadence the health report measures against (wrangler.toml). */
+export const HEALTH_EXPECTED_INTERVAL_MS = 10 * 60_000;
+/** A spacing above this is reported as a gap (the spec's >15 min rule). */
+export const HEALTH_GAP_THRESHOLD_MS = 15 * 60_000;
+const HEALTH_DEFAULT_SINCE_HOURS = 7 * 24;
+/** 7 days at the 10-minute cadence is ~1008 samples; leave headroom. */
+const HEALTH_TIMESTAMP_LIMIT = 2_000;
+const HEALTH_RECENT_QUARANTINE_LIMIT = 20;
+
+export async function getHealth(
+  env: Env,
+  args: { since_hours?: number } = {},
+): Promise<unknown> {
+  const nowMs = Date.now();
+  const sinceHours =
+    args.since_hours != null &&
+    Number.isFinite(args.since_hours) &&
+    args.since_hours > 0
+      ? args.since_hours
+      : HEALTH_DEFAULT_SINCE_HOURS;
+  const sinceMs = nowMs - sinceHours * 3_600_000;
+
+  const [counts, coverage, timestamps, quarantine] = await Promise.all([
+    readArchiveCounts(env),
+    readArchiveCoverage(env),
+    readGlobalSampleTimestamps(env, sinceMs, HEALTH_TIMESTAMP_LIMIT),
+    readQuarantineSummary(env, HEALTH_RECENT_QUARANTINE_LIMIT),
+  ]);
+
+  const gaps = buildGapList(timestamps, HEALTH_GAP_THRESHOLD_MS);
+  const cadence = cadenceStats(
+    timestamps,
+    HEALTH_EXPECTED_INTERVAL_MS,
+    HEALTH_GAP_THRESHOLD_MS,
+  );
+  // The timestamp read keeps the NEWEST rows when the window holds more than
+  // the cap (~14 days at the 10-minute cadence) — say so, and state the
+  // window the gap/cadence arithmetic ACTUALLY covered, instead of silently
+  // analyzing a shorter span than the echoed since_hours (codex-review fix).
+  const analysisCapped = timestamps.length >= HEALTH_TIMESTAMP_LIMIT;
+  const analysisFrom = timestamps[0] ?? null;
+
+  return {
+    source: "d1_archive",
+    since_hours: sinceHours,
+    archive_row_counts: counts,
+    archive_coverage: {
+      earliest:
+        coverage.earliest != null
+          ? new Date(coverage.earliest).toISOString()
+          : null,
+      latest:
+        coverage.latest != null
+          ? new Date(coverage.latest).toISOString()
+          : null,
+    },
+    cadence: {
+      expected_interval_minutes: HEALTH_EXPECTED_INTERVAL_MS / 60_000,
+      gap_threshold_minutes: HEALTH_GAP_THRESHOLD_MS / 60_000,
+      ...cadence,
+      // The span the gap/adherence arithmetic actually covered. When capped,
+      // it is SHORTER than the requested since_hours window (newest rows kept).
+      analysis_covers_from:
+        analysisFrom != null ? new Date(analysisFrom).toISOString() : null,
+      analysis_window_capped: analysisCapped,
+      ...(analysisCapped
+        ? {
+            analysis_cap_note: `The window holds more archived samples than the ${HEALTH_TIMESTAMP_LIMIT}-row analysis cap, so gaps/adherence cover only the NEWEST samples back to analysis_covers_from — older gaps are not visible here. Narrow since_hours (or query in slices) for full coverage.`,
+          }
+        : {}),
+    },
+    gap_count: gaps.length,
+    gaps,
+    quarantine: {
+      counts_by_reason: quarantine.counts_by_reason,
+      recent: quarantine.recent?.map((q) => ({
+        table_name: q.table_name,
+        subject_key: q.subject_key,
+        sampled_at: q.sampled_at,
+        observed_at: new Date(q.sampled_at).toISOString(),
+        reason: q.reason,
+        detail: safeJsonParse(q.detail),
+        row: safeJsonParse(q.row_json),
+      })),
+      ...(quarantine.counts_by_reason == null
+        ? {
+            note: "The quarantine table is not readable — migration 0003_quarantine.sql has likely not been applied. Run `wrangler d1 migrations apply hd2-strategist-history --remote`.",
+          }
+        : {}),
+    },
+    notes: {
+      cadence:
+        "Deterministic spacing facts over the archived global sample timestamps in the ANALYZED window (analysis_covers_from onward; analysis_window_capped states when the requested window held more samples than the analysis cap and older spacings are therefore not covered). A gap or an expected-vs-archived shortfall means NOTHING WAS RECORDED there — which, by the persistence gate's design, covers both a genuine outage and a degraded-provenance tick that correctly recorded nothing; the archive cannot (and does not) attribute the cause.",
+      quarantine:
+        "Rows the item-7 plausibility screen diverted from the live archive (the known sentinel signature, or a delta outside the recent mean ± 6σ delta band). Each entry carries the reason, both sides of the comparison (detail), and the excluded row verbatim — flagged, never corrected, never silently dropped. Quarantined observations were still SERVED live at the time; they are only absent from the durable record.",
+      row_counts:
+        "Plain COUNT(*) per archive table; null means that table could not be read (commonly: its migration is not applied yet).",
+    },
+    queried_at: new Date(nowMs).toISOString(),
+  };
+}
+
+function safeJsonParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }

@@ -26,7 +26,15 @@ network, no real SQLite. The KV stub still proves the KV write budget is
 UNCHANGED by Stage 12 (the D1 write is a separate store).
 
 A fifth sanctioned exception (stage14.test.ts): a small in-memory D1 stub
-(`ExportFakeD1`) for the bulk CSV export — same spirit again. It answers the
+(`ExportFakeD1`) for the bulk CSV export — same spirit again. The
+next-features-wave files reuse the same two stub families: stage15/stage16
+carry read-oriented D1 stubs (keyset/COUNT, archive reads with the item-2
+`until` clause, the item-6 edge queries), stage17/stage18 carry write-capable
+ones that execute the batched INSERTs into per-table arrays (stage18's
+emulates real D1's bind()-returns-a-new-statement semantics and the
+mo_outcomes natural-PK INSERT OR IGNORE); stage15/stage18 drive the full MCP
+layer through `handleMcpRequest` with constructed `Request` objects (no
+network — the D1/KV stubs serve everything). It answers the
 export's keyset SELECT (cursor on `(sampled_at, id)`) and COUNT over rows held
 in arrays, and records the SELECT SQL so the parameterized-SQL pin holds (`?`
 placeholders, no interpolated values). The streamed `Response` is read with
@@ -445,6 +453,74 @@ the project's definition of done:
     **predicate-audit** reads `src/tools.ts` + `src/enrichment.ts` and pins ZERO
     `.source === 'live'` or campaign-map `.has()` lookups (the per-site checks
     were deleted, not duplicated).
+
+- Stage 15 (`stage15.test.ts`) — Tier 1 of the next-features wave:
+  - Item 1 (export resource_link): `initialize` advertises the resources
+    capability; `export_archive` returns a `resource_link` content item whose
+    uri equals the metadata `url`; `resources/read` on it yields the FULL CSV
+    (header + every row, 1500 > the JSON tools' 1000 cap) matching COUNT(*);
+    the max_id watermark keeps a late-committing row out of the resource read
+    (same frozen snapshot); a non-export URI errors -32002;
+    `parseExportResourceUri` round-trips a minted URL and rejects garbage;
+    `streamResourceReadResponse` emits a valid JSON-RPC result across
+    multiple streamed pages (the codex-review fix: never one buffered
+    string).
+  - Item 2 (until_hours): `untilCutoffMs` edge cases (0 valid, negative/NaN →
+    null); the three readers honor an until edge with parameterized SQL; an
+    until-less call emits BYTE-IDENTICAL SQL to the pre-item-2 query; handler
+    slices land in the requested band and adjacent slices reconstruct the
+    whole table; an inverted window is a loud ToolError, never [].
+
+- Stage 16 (`stage16.test.ts`) — Tier 2:
+  - `buildMoPace`: required_rate = remaining ÷ time_left on a cumulative
+    objective; observed latest/mean match the sampled deltas; hold_planet
+    nulls BOTH rates with `state_objective_progress_not_cumulative` (facts
+    still ride); expired → `order_expired`, no division; no samples →
+    `insufficient_history`; key-name pin (no on_track/behind/forecast).
+  - Item 4: `soleHumanLinkDependents` — the Karlia→Sangis case (Karlia is
+    Sangis's sole Human link); a second Human neighbor clears it; non-Human →
+    []; outage → null (never []). `buildIsolationRisk` joins name/kind;
+    supply-graph nodes carry `sole_link_dependents` (null per node under
+    outage). Handler acceptance: `get_planet(Karlia)` lists Sangis.
+  - `get_gambits` (KV stub): defense board with the origin's joined
+    liberation state + MO membership; ZERO `samples:planets` puts (read-only);
+    campaign outage → `defenses: null` + `stale`, never an empty board;
+    key-name pin (no viability).
+  - `buildWarDiff`: the Karlia flip with before/after tracked factions +
+    campaign turnover + per-faction delta_health rollup; MO/global deltas
+    null-propagating (null is never 0); one-edge membership is not a change.
+    Handler over the edge-query D1 stub: seeded flip diffs correctly with
+    names joined from the cached planets list; empty archive →
+    `insufficient_history` (names degrade, never an error); inverted window →
+    ToolError.
+
+- Stage 17 (`stage17.test.ts`) — Tier 3:
+  - `screenGlobalRow`: the sentinel PAIR is caught (either value alone is
+    not); a 6σ population dip (the June-28 pop=3552 shape) is caught with
+    both numbers in the detail; a plausible row passes; the rule ABSTAINS
+    below the minimum delta history and on zero spread (no divide, no
+    infinite-sigma trip).
+  - Write path (KV + D1 stubs): a sentinel tick and an Nσ-outlier tick are
+    each DIVERTED to quarantined_samples (reason + detail + verbatim row)
+    with NO live global_samples row, while the KV put is unchanged and the
+    tick stays ONE batch; a plausible tick archives normally; thin history
+    archives (never a cold-start guess).
+  - `buildGapList`/`cadenceStats`: exact gap bounds at the 15-min threshold;
+    adherence and expected-vs-archived arithmetic; empty/singleton → null
+    adherence. `get_health` handler: non-null counts, the seeded restore gap
+    flagged, quarantine tallies by reason + recent rows, zero KV writes.
+
+- Stage 18 (`stage18.test.ts`) — Tier 4:
+  - Item 9: `export_archive(table:'planet', planet_index:185)` resource read
+    returns ONLY that planet's rows (header + 30, filter in the URI).
+  - Item 10 write path: an MO id absent from live observations records each
+    objective's FINAL state (target_reached 1 AND 0 in one order); the new
+    live MO is never an outcome; re-detection is a no-op (natural-PK
+    INSERT OR IGNORE); a poll WITHOUT assignments data abstains (absence of
+    observations ≠ ended order); a still-active MO is never recorded.
+  - Item 10 read path: `get_major_order_archive` serves `outcomes` with
+    boolean `target_reached` + ISO recorded_at, narrows by major_order_id,
+    and carries no forecast/trend key.
 
 ## Conventions
 

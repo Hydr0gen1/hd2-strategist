@@ -5,16 +5,24 @@
  */
 import { ArchiveError } from "./archive";
 import { UpstreamError } from "./client";
-import { ExportParamError, exportArchive } from "./export";
+import {
+  ExportParamError,
+  exportArchive,
+  parseExportResourceUri,
+  streamResourceReadResponse,
+} from "./export";
 import {
   ToolError,
   getCampaigns,
   getDispatches,
+  getGambits,
   getGlobalArchive,
   getGlobalHistory,
+  getHealth,
   getMajorOrder,
   getMajorOrderArchive,
   getMajorOrderHistory,
+  getMoPace,
   getObservedSignatures,
   getPatchNotes,
   getPlanet,
@@ -23,6 +31,7 @@ import {
   getSourceCrossCheck,
   getSupplyGraph,
   getWarBrief,
+  getWarDiff,
   getWarStatus,
   getWikiPage,
   resolvePlanetTool,
@@ -84,6 +93,39 @@ const TOOL_DEFINITIONS = [
     description:
       "Current Major Order: objectives with per-objective progress, rewards, and time remaining (seconds + human-readable).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_mo_pace",
+    description:
+      "Major Order pace: per objective, the OBSERVED progress rate (latest and mean per-interval deltas over this server's retained progress samples) and the REQUIRED rate (remaining ÷ time_left_hours — the pace that would exactly reach the target at expiry) side by side, plus remaining, time_left_hours, progress/target. Two numbers, NO on-track/behind verdict — the reader compares them. State-at-expiry objective kinds (hold_planet) null both rates with a reason (progress is a state, not a cumulative counter). Read-only; observed rates need two samples >60s apart (insufficient_history on a cold start is expected).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_gambits",
+    description:
+      "The gambit board: every active defense campaign with its attack-origin planet(s) — resolved by inverting the observed source→target attack pairs — each origin joined with its live liberation state (raw_hp, max_hp, liberation_pct_display_only, signed hp_per_hour) and is_major_order_target (a pure membership join). Facts only: NO gambit-viability score or clear-the-origin-in-time verdict, by design. Read-only (records nothing). Under a campaign outage the defense set is UNKNOWN — defenses is null, never an asserted-empty board.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_war_diff",
+    description:
+      "What changed since N hours ago, as deterministic D1-archive arithmetic: each planet's / MO objective's / global counter's FIRST vs LAST archived observation inside the window, with raw before/after values and subtractions — tracked-faction changes, campaigns opened/closed (campaign_id turnover), per-planet delta_health, net health delta grouped by last-observed faction, MO progress deltas, and global counter deltas. Pure archive facts: no significance ranking, no cause attribution, no went-well/badly verdict. insufficient_history when the window predates the archive. Optional until_hours closes the window's upper edge (diff an older band).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since_hours: {
+          type: "number",
+          description:
+            "Window START in hours-back-from-now (default 24). The diff compares first vs last archived observation inside the window.",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours.",
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: "get_planet",
@@ -267,7 +309,12 @@ const TOOL_DEFINITIONS = [
         since_hours: {
           type: "number",
           description:
-            "Look-back window in hours (default 168 = 7 days). Only samples newer than this are returned.",
+            "Look-back window START in hours-back-from-now (default 168 = 7 days). Only samples newer than this are returned.",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours. Lets you page backward through older history in slices (e.g. since_hours: 400, until_hours: 200).",
         },
         limit: {
           type: "number",
@@ -286,7 +333,12 @@ const TOOL_DEFINITIONS = [
       properties: {
         since_hours: {
           type: "number",
-          description: "Look-back window in hours (default 168 = 7 days).",
+          description: "Look-back window START in hours-back-from-now (default 168 = 7 days).",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours. Pages backward through older history in slices.",
         },
         limit: {
           type: "number",
@@ -313,7 +365,12 @@ const TOOL_DEFINITIONS = [
         },
         since_hours: {
           type: "number",
-          description: "Look-back window in hours (default 168 = 7 days).",
+          description: "Look-back window START in hours-back-from-now (default 168 = 7 days).",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours. Pages backward through older history in slices.",
         },
         limit: {
           type: "number",
@@ -324,9 +381,25 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "get_health",
+    description:
+      "The server's self-report over its OWN record: archive row counts per table, archive coverage, the recent gap list (spacings > 15 min between archived global samples), cadence adherence against the 10-minute cron, and quarantine tallies (rows the plausibility screen diverted from the live archive, each with its reason, both sides of the comparison, and the excluded row verbatim). Deterministic counts and spacing facts only — a gap means nothing was recorded there (an outage OR a degraded-provenance tick that correctly recorded nothing; the archive cannot attribute which). Answers 'is the tool okay?' without judgment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since_hours: {
+          type: "number",
+          description:
+            "Window for the gap/cadence analysis in hours-back-from-now (default 168 = 7 days). Row counts and quarantine tallies are whole-archive regardless.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "export_archive",
     description:
-      "Bulk CSV export of the UNBOUNDED D1 archive, bypassing the 1000-row cap on the get_*_archive tools so the WHOLE history (or an arbitrary window) can be pulled off-context for trend analysis. Returns metadata ONLY — { url, table, bucket, row_count, byte_size_estimate, range, columns, format, generated_at } — NOT the rows: web_fetch the returned `url` to a file to get the streamed CSV. Pick table (global | planet | mo). Optional since/until (ISO-8601) or since_hours/until_hours bound an arbitrary window (both edges, which the JSON tools lack); planet_index filters the planet table to one planet; bucket (raw | hourly | daily) server-side rolls up long ranges (mean of rates/multiplier, last value of counts) into one row per bucket. A faithful verbatim dump of stored rows — no derived/trend columns; trend synthesis stays in the conversation layer. For live rate/ETA/projection use the live tools; this is history.",
+      "Bulk CSV export of the UNBOUNDED D1 archive, bypassing the 1000-row cap on the get_*_archive tools so the WHOLE history (or an arbitrary window) can be pulled off-context for trend analysis. Returns metadata — { url, table, bucket, row_count, byte_size_estimate, range, columns, format, generated_at } — plus a resource_link content item for the same snapshot: read the link (resources/read) to receive the full CSV through the MCP connector, or fetch `url` over plain HTTP; the rows are NEVER inlined in this result. Pick table (global | planet | mo). Optional since/until (ISO-8601) or since_hours/until_hours bound an arbitrary window (both edges, which the JSON tools lack); planet_index filters the planet table to one planet; bucket (raw | hourly | daily) server-side rolls up long ranges (mean of rates/multiplier, last value of counts) into one row per bucket. A faithful verbatim dump of stored rows — no derived/trend columns; trend synthesis stays in the conversation layer. For live rate/ETA/projection use the live tools; this is history.",
     inputSchema: {
       type: "object",
       properties: {
@@ -431,6 +504,26 @@ async function dispatchTool(
       );
     case "get_major_order":
       return toolText(await getMajorOrder(env));
+    case "get_mo_pace":
+      return toolText(await getMoPace(env));
+    case "get_gambits":
+      return toolText(await getGambits(env));
+    case "get_health":
+      return toolText(
+        await getHealth(env, {
+          since_hours:
+            typeof args.since_hours === "number" ? args.since_hours : undefined,
+        }),
+      );
+    case "get_war_diff":
+      return toolText(
+        await getWarDiff(env, {
+          since_hours:
+            typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
+        }),
+      );
     case "get_planet":
       return toolText(
         await getPlanet(env, {
@@ -492,6 +585,8 @@ async function dispatchTool(
           name: typeof args.name === "string" ? args.name : undefined,
           since_hours:
             typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
@@ -500,6 +595,8 @@ async function dispatchTool(
         await getGlobalArchive(env, {
           since_hours:
             typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
@@ -516,6 +613,8 @@ async function dispatchTool(
               : undefined,
           since_hours:
             typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
@@ -527,17 +626,32 @@ async function dispatchTool(
       // single-planet export to every planet.
       const numOrStr = (v: unknown): number | string | undefined =>
         typeof v === "number" || typeof v === "string" ? v : undefined;
-      return toolText(
-        await exportArchive(env, origin, {
-          table: typeof args.table === "string" ? args.table : undefined,
-          planet_index: numOrStr(args.planet_index),
-          since: typeof args.since === "string" ? args.since : undefined,
-          until: typeof args.until === "string" ? args.until : undefined,
-          since_hours: numOrStr(args.since_hours),
-          until_hours: numOrStr(args.until_hours),
-          bucket: typeof args.bucket === "string" ? args.bucket : undefined,
-        }),
-      );
+      const meta = await exportArchive(env, origin, {
+        table: typeof args.table === "string" ? args.table : undefined,
+        planet_index: numOrStr(args.planet_index),
+        since: typeof args.since === "string" ? args.since : undefined,
+        until: typeof args.until === "string" ? args.until : undefined,
+        since_hours: numOrStr(args.since_hours),
+        until_hours: numOrStr(args.until_hours),
+        bucket: typeof args.bucket === "string" ? args.bucket : undefined,
+      });
+      // Item 1: the metadata pointer AND an MCP resource_link for the same
+      // frozen snapshot. An in-connector agent (blocked from fetching a
+      // workers.dev URL directly) reads the link via resources/read and the
+      // bytes route through the connector; the plain `url` stays for
+      // browser/CLI use. The rows are still never inlined in this result.
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(meta, null, 2) },
+          {
+            type: "resource_link",
+            uri: meta.url,
+            name: `${meta.table}-archive-${meta.bucket}.csv`,
+            description: `Streamed CSV of the ${meta.table} archive window (${meta.row_count} raw rows${meta.bucket !== "raw" ? `, ${meta.bucket} rollup` : ""}). Read this resource to receive the full file through the MCP connector — not capped at the JSON tools' 1000 rows.`,
+            mimeType: "text/csv",
+          },
+        ],
+      };
     }
     case "get_major_order_history":
       return toolText(
@@ -586,7 +700,7 @@ export async function handleMcpRequest(
           : PROTOCOL_VERSION;
       return rpcResult(id, {
         protocolVersion,
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, resources: {} },
         serverInfo: {
           name: "hd2-strategist",
           version: "0.1.0",
@@ -598,6 +712,47 @@ export async function handleMcpRequest(
       return rpcResult(id, {});
     case "tools/list":
       return rpcResult(id, { tools: TOOL_DEFINITIONS });
+    // Item 1: export resources. The server mints resource URIs dynamically —
+    // one per export_archive call (the tool result's resource_link) — so the
+    // static list is empty; resources/read serves any minted export URI.
+    case "resources/list":
+      return rpcResult(id, { resources: [] });
+    case "resources/templates/list":
+      return rpcResult(id, { resourceTemplates: [] });
+    case "resources/read": {
+      const uri = typeof params.uri === "string" ? params.uri : "";
+      let exportParams;
+      try {
+        exportParams = parseExportResourceUri(uri, Date.now());
+      } catch (err) {
+        if (err instanceof ExportParamError) {
+          return rpcError(id, -32602, err.message);
+        }
+        throw err;
+      }
+      if (exportParams === null) {
+        return rpcError(
+          id,
+          -32002,
+          `Resource not found: "${uri}". This server only serves archive-export resources minted by the export_archive tool (path /export/archive).`,
+        );
+      }
+      // Fail fast (a proper JSON-RPC error) while nothing is on the wire yet;
+      // a D1 failure mid-stream can only surface as a broken stream.
+      if (!env.HISTORY_DB) {
+        return rpcError(
+          id,
+          -32603,
+          "The history archive (D1 binding HISTORY_DB) is not configured, so there is no export resource to read.",
+        );
+      }
+      // The SAME keyset-paginated read path as the HTTP route, STREAMED as
+      // the JSON-RPC response (envelope + JSON-escaped CSV pages) so memory
+      // stays bounded by one page regardless of export size. The URI carries
+      // the frozen window + max_id watermark, so the bytes match the metadata
+      // the tool returned.
+      return streamResourceReadResponse(env, exportParams, uri, id);
+    }
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
       const args =

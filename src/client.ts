@@ -10,9 +10,12 @@ import {
   type ArchiveTick,
   type GlobalArchiveWriteRow,
   type MoArchiveWriteRow,
+  type MoOutcomeRow,
   type PlanetArchiveWriteRow,
+  type QuarantineRow,
   type SignatureArchiveRow,
 } from "./archive";
+import { screenGlobalRow } from "./integrity";
 import {
   advanceGlobalSeries,
   advanceMoSeries,
@@ -354,13 +357,17 @@ export interface PreparedSampleTick {
   results: Map<number, SampleOutput>;
   nextStore: SampleStore;
   /** Inputs the D1 archive step needs at commit time (old store + folded
-   * sections + the per-tick planet rows). */
+   * sections + the per-tick planet rows). `moObservations` is null when the
+   * poll carried NO assignments data (e.g. a single-planet probe) — item 10's
+   * end-of-order detection must then abstain: absence of observations is not
+   * evidence an order ended. */
   archive: {
     planetRows: PlanetArchiveWriteRow[];
     oldStore: SampleStore;
     global: GlobalSample[];
     mo: MoObjectiveSeries[];
     signatures: SignatureObservation[];
+    moObservations: MoProgressObservation[] | null;
     nowMs: number;
   };
 }
@@ -492,6 +499,9 @@ export async function prepareSampleTick(
       global,
       mo,
       signatures: opts.signatures ?? [],
+      // null (not []) when the poll had no assignments fetch — item 10's
+      // detection distinguishes "no MOs active (observed)" from "not observed".
+      moObservations: opts.moProgress ?? null,
       nowMs,
     },
   };
@@ -553,6 +563,7 @@ export async function commitSampleTick(
           prepared.archive.global,
           prepared.archive.mo,
           prepared.archive.signatures,
+          prepared.archive.moObservations,
           prepared.archive.nowMs,
         ),
       );
@@ -596,12 +607,13 @@ function buildArchiveTick(
   global: GlobalSample[],
   mo: MoObjectiveSeries[],
   signatures: SignatureObservation[],
+  moObservations: MoProgressObservation[] | null,
   nowMs: number,
 ): ArchiveTick {
   // Global sample committed iff the series gained a point at this tick.
   const globalTail = global[global.length - 1];
   const globalCommitted = globalTail != null && globalTail.t === nowMs;
-  const globalRow: GlobalArchiveWriteRow | null =
+  let globalRow: GlobalArchiveWriteRow | null =
     globalCommitted && globalTail
       ? {
           sampled_at: nowMs,
@@ -620,6 +632,35 @@ function buildArchiveTick(
           ),
         }
       : null;
+
+  // Item 7: plausibility screen on the archive-bound global row — the known
+  // sentinel signature + the Nσ delta-outlier rule over the RECENT (pre-
+  // advance) series. A failing row is DIVERTED to quarantined_samples with
+  // its reason and both sides of the comparison — never silently dropped,
+  // never written to the live table. The KV ring buffer above is untouched
+  // (frozen path): the observation is still served live, only the durable
+  // archive is screened. The allFresh gate is unchanged — this branch runs
+  // strictly after it, at row-assembly time.
+  const quarantined: QuarantineRow[] = [];
+  if (globalRow) {
+    // The recent series EXCLUDING this tick's point: the old store's tail.
+    const recent = store.global ?? [];
+    const findings = screenGlobalRow(globalRow, recent);
+    if (findings.length > 0) {
+      // ONE quarantine row per diverted subject (the dedup index is keyed on
+      // table/subject/anchor); every finding rides the detail JSON.
+      quarantined.push({
+        table_name: "global_samples",
+        subject_key: "global",
+        sampled_at: nowMs,
+        reason: findings[0]!.reason,
+        detail: JSON.stringify(findings.map((f) => f.detail)),
+        row_json: JSON.stringify(globalRow),
+        tick_anchor: globalRow.tick_anchor,
+      });
+      globalRow = null;
+    }
+  }
 
   // MO rows: one per series that gained a sample at this tick (a series carried
   // forward unchanged keeps an older tail and is skipped). Each anchors on its
@@ -671,11 +712,54 @@ function buildArchiveTick(
     }
   }
 
+  // Item 10: end-of-order detection. An MO id that WAS being tracked (a
+  // retained series in the old store) but is absent from THIS poll's live
+  // assignments observations has observably ended — record each objective's
+  // FINAL retained state. Only when observations were actually supplied
+  // (moObservations null = no assignments fetch this poll — absence of
+  // evidence, abstain) and only on a fresh tick (the same freshness the
+  // signature upsert requires, so a within-60s cache replay adds no D1
+  // write). Re-detections while the retired series is retained are no-ops
+  // via the natural-PK INSERT OR IGNORE — first writer wins.
+  const moOutcomes: MoOutcomeRow[] = [];
+  if (moObservations != null && tickIsFresh) {
+    const activeIds = new Set(moObservations.map((o) => o.majorOrderId));
+    for (const series of store.mo ?? []) {
+      if (activeIds.has(series.major_order_id)) continue;
+      const first = series.samples[0];
+      const tail = series.samples[series.samples.length - 1];
+      if (!tail) continue;
+      const reached =
+        tail.progress != null && tail.target != null
+          ? tail.progress >= tail.target
+            ? 1
+            : 0
+          : null;
+      moOutcomes.push({
+        major_order_id: series.major_order_id,
+        objective_index: series.objective_index,
+        task_type: series.task_type,
+        final_progress: tail.progress,
+        target: tail.target,
+        final_progress_pct:
+          tail.progress != null && tail.target != null && tail.target > 0
+            ? (tail.progress / tail.target) * 100
+            : null,
+        target_reached: reached as 0 | 1 | null,
+        first_observed_at: first?.t ?? null,
+        last_observed_at: tail.t,
+        recorded_at: nowMs,
+      });
+    }
+  }
+
   return {
     planets: planetRows,
     global: globalRow,
     mo: moRows,
     signatures: signatureRows,
+    quarantined,
+    moOutcomes,
   };
 }
 

@@ -103,16 +103,56 @@ export interface MoArchiveWriteRow extends MoArchiveRow {
   tick_anchor: number;
 }
 
+/** Item 7: one quarantined row — a screened-out observation diverted from its
+ * live archive table, with the machine-readable reason and both sides of the
+ * comparison. Flag-never-correct: `row_json` holds the excluded row verbatim. */
+export interface QuarantineRow {
+  table_name: string;
+  subject_key: string;
+  sampled_at: number;
+  reason: string;
+  detail: string; // JSON
+  row_json: string; // JSON, the excluded row verbatim
+  tick_anchor: number;
+}
+
+/** Item 10: one Major Order objective's final observed state, recorded when
+ * the order leaves the live assignments set. `target_reached` is the plain
+ * comparison final_progress >= target (null when either side is unknown) —
+ * a deterministic record of the observed end state, not an analysis. The
+ * natural PK makes the INSERT OR IGNORE idempotent across re-detections. */
+export interface MoOutcomeRow {
+  major_order_id: number;
+  objective_index: number;
+  task_type: number | null;
+  final_progress: number | null;
+  target: number | null;
+  final_progress_pct: number | null;
+  target_reached: 0 | 1 | null;
+  first_observed_at: number | null;
+  last_observed_at: number | null;
+  recorded_at: number;
+}
+
 /** One sample tick's archive payload — exactly the observations that were just
  * committed to KV as NEW this cycle. The caller (client.ts) gates each section
  * by the SAME 60s interval that governs the KV write, so a within-60s replay
  * produces an empty tick and inserts nothing; the tick_anchor unique index is
- * the second, atomic line of defense against concurrent overlapping polls. */
+ * the second, atomic line of defense against concurrent overlapping polls.
+ * `quarantined` (item 7) carries rows the plausibility screen diverted from a
+ * live table — recorded to quarantined_samples, never silently dropped.
+ * `moOutcomes` (item 10) carries the final observed state of orders that just
+ * left the live assignments set — idempotent on the natural PK. Both optional
+ * sections write in a SECOND, separately-isolated batch (see
+ * archiveSampleTick) so an unapplied 0003/0004 migration can never reject the
+ * core append. */
 export interface ArchiveTick {
   planets: PlanetArchiveWriteRow[];
   global: GlobalArchiveWriteRow | null;
   mo: MoArchiveWriteRow[];
   signatures: SignatureArchiveRow[];
+  quarantined?: QuarantineRow[];
+  moOutcomes?: MoOutcomeRow[];
 }
 
 /** Stable signature key for the observed_signatures primary key — deterministic
@@ -140,11 +180,15 @@ export async function archiveSampleTick(
 ): Promise<void> {
   const db = env.HISTORY_DB;
   if (!db) return;
+  const quarantined = tick.quarantined ?? [];
+  const moOutcomes = tick.moOutcomes ?? [];
   if (
     tick.planets.length === 0 &&
     tick.global == null &&
     tick.mo.length === 0 &&
-    tick.signatures.length === 0
+    tick.signatures.length === 0 &&
+    quarantined.length === 0 &&
+    moOutcomes.length === 0
   ) {
     return;
   }
@@ -255,6 +299,81 @@ export async function archiveSampleTick(
       }`,
     );
   }
+
+  // Items 7 + 10: the OPTIONAL-TABLE rows (quarantined_samples — migration
+  // 0003 — and mo_outcomes — 0004) go in a SECOND, separately-isolated batch.
+  // A D1 batch is atomic, so co-batching them with the core sections would let
+  // a missing optional table (a partial migration rollout) reject the WHOLE
+  // batch and silently lose that tick's planet/global/MO rows. The write path
+  // now degrades like the read path: a missing optional table costs only its
+  // own rows (logged), never the core archive append. Still bounded: at most
+  // two batches per tick, and the second exists only on the rare ticks that
+  // produce a quarantine or outcome row.
+  if (quarantined.length === 0 && moOutcomes.length === 0) return;
+  try {
+    const optionalBatch: D1PreparedStatement[] = [];
+
+    if (quarantined.length > 0) {
+      // Item 7: screened-out rows, flagged with a reason — never silently
+      // dropped, never mixed into the live tables. Same race-proof
+      // INSERT OR IGNORE discipline as every append-only table.
+      const stmt = db.prepare(
+        `INSERT OR IGNORE INTO quarantined_samples
+           (table_name, subject_key, sampled_at, reason, detail, row_json, tick_anchor)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const q of quarantined) {
+        optionalBatch.push(
+          stmt.bind(
+            q.table_name,
+            q.subject_key,
+            q.sampled_at,
+            q.reason,
+            q.detail,
+            q.row_json,
+            q.tick_anchor,
+          ),
+        );
+      }
+    }
+
+    if (moOutcomes.length > 0) {
+      // Item 10: the observed end state of orders that just left the live
+      // assignments set. Natural-PK INSERT OR IGNORE — re-detections while
+      // the retired series is still retained are no-ops.
+      const stmt = db.prepare(
+        `INSERT OR IGNORE INTO mo_outcomes
+           (major_order_id, objective_index, task_type, final_progress, target,
+            final_progress_pct, target_reached, first_observed_at, last_observed_at, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const o of moOutcomes) {
+        optionalBatch.push(
+          stmt.bind(
+            o.major_order_id,
+            o.objective_index,
+            o.task_type,
+            o.final_progress,
+            o.target,
+            o.final_progress_pct,
+            o.target_reached,
+            o.first_observed_at,
+            o.last_observed_at,
+            o.recorded_at,
+          ),
+        );
+      }
+    }
+
+    if (optionalBatch.length > 0) await db.batch(optionalBatch);
+  } catch (err) {
+    console.warn(
+      `D1 optional-table archive write failed (core archive + KV unaffected; ` +
+        `if this mentions a missing table, apply migrations 0003/0004): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+    );
+  }
 }
 
 /* ------------------------------------------------------------------------
@@ -290,26 +409,41 @@ async function runArchiveQuery<T>(
   }
 }
 
+/** Optional inclusive upper window edge (item 2): `AND sampled_at <= ?` when a
+ * cutoff is supplied, byte-identical SQL when it is not — so an until-less call
+ * matches the pre-item-2 query exactly. */
+function untilClause(untilMs: number | null | undefined): {
+  sql: string;
+  binds: number[];
+} {
+  return untilMs != null
+    ? { sql: " AND sampled_at <= ?", binds: [untilMs] }
+    : { sql: "", binds: [] };
+}
+
 /** Long-range planet samples within the window — the NEWEST `limit` rows when
  * capped (selected DESC, then re-sorted ascending for presentation), so a
- * busy window never silently drops its most recent points. */
+ * busy window never silently drops its most recent points. `untilMs` (item 2)
+ * closes the window's upper edge so older bands can be paged. */
 export async function readPlanetArchive(
   env: Env,
   planetIndex: number,
   sinceMs: number,
   limit: number,
+  untilMs: number | null = null,
 ): Promise<PlanetArchiveRow[]> {
   const db = requireDb(env);
+  const until = untilClause(untilMs);
   const rows = await runArchiveQuery<PlanetArchiveRow>(
     db
       .prepare(
         `SELECT planet_index, sampled_at, health, max_health, hp_per_hour, campaign_id, campaign_kind, faction
            FROM planet_samples
-          WHERE planet_index = ? AND sampled_at >= ?
+          WHERE planet_index = ? AND sampled_at >= ?${until.sql}
           ORDER BY sampled_at DESC
           LIMIT ?`,
       )
-      .bind(planetIndex, sinceMs, limit),
+      .bind(planetIndex, sinceMs, ...until.binds, limit),
     "planet archive",
   );
   return rows.sort((a, b) => a.sampled_at - b.sampled_at);
@@ -321,19 +455,21 @@ export async function readGlobalArchive(
   env: Env,
   sinceMs: number,
   limit: number,
+  untilMs: number | null = null,
 ): Promise<GlobalArchiveRow[]> {
   const db = requireDb(env);
+  const until = untilClause(untilMs);
   const rows = await runArchiveQuery<GlobalArchiveRow>(
     db
       .prepare(
         `SELECT sampled_at, player_count, impact_multiplier, active_campaign_count,
                 missions_won, missions_lost, deaths, terminid_kills, automaton_kills, illuminate_kills
            FROM global_samples
-          WHERE sampled_at >= ?
+          WHERE sampled_at >= ?${until.sql}
           ORDER BY sampled_at DESC
           LIMIT ?`,
       )
-      .bind(sinceMs, limit),
+      .bind(sinceMs, ...until.binds, limit),
     "global archive",
   );
   return rows.sort((a, b) => a.sampled_at - b.sampled_at);
@@ -350,11 +486,19 @@ export async function readMoArchive(
   env: Env,
   sinceMs: number,
   limit: number,
-  filters: { majorOrderId?: number; objectiveIndex?: number } = {},
+  filters: {
+    majorOrderId?: number;
+    objectiveIndex?: number;
+    untilMs?: number | null;
+  } = {},
 ): Promise<MoArchiveRow[]> {
   const db = requireDb(env);
   const where: string[] = ["sampled_at >= ?"];
   const binds: unknown[] = [sinceMs];
+  if (filters.untilMs != null) {
+    where.push("sampled_at <= ?");
+    binds.push(filters.untilMs);
+  }
   if (filters.majorOrderId != null) {
     where.push("major_order_id = ?");
     binds.push(filters.majorOrderId);
@@ -379,6 +523,236 @@ export async function readMoArchive(
   return rows.sort((a, b) => a.sampled_at - b.sampled_at);
 }
 
+/* ------------------------------------------------------------------------
+ * Item 6 (get_war_diff): window-edge readers. Each returns ONE row per
+ * subject — its FIRST or LAST observation inside [sinceMs, untilMs] — using
+ * SQLite's documented bare-column guarantee: with a single MIN()/MAX()
+ * aggregate, the non-aggregated columns come from the row where that
+ * minimum/maximum occurs (D1 is SQLite). This keeps the diff O(subjects)
+ * rows regardless of how many samples the window holds.
+ * ---------------------------------------------------------------------- */
+
+/** First/last archived planet observation per planet inside the window. */
+export async function readPlanetEdgeRows(
+  env: Env,
+  sinceMs: number,
+  untilMs: number,
+  edge: "first" | "last",
+): Promise<PlanetArchiveRow[]> {
+  const db = requireDb(env);
+  const fn = edge === "first" ? "MIN" : "MAX";
+  return runArchiveQuery<PlanetArchiveRow>(
+    db
+      .prepare(
+        `SELECT planet_index, health, max_health, hp_per_hour, campaign_id, campaign_kind, faction,
+                ${fn}(sampled_at) AS sampled_at
+           FROM planet_samples
+          WHERE sampled_at >= ? AND sampled_at <= ?
+          GROUP BY planet_index`,
+      )
+      .bind(sinceMs, untilMs),
+    "planet archive window edges",
+  );
+}
+
+/** First/last archived MO objective observation per objective in the window. */
+export async function readMoEdgeRows(
+  env: Env,
+  sinceMs: number,
+  untilMs: number,
+  edge: "first" | "last",
+): Promise<MoArchiveRow[]> {
+  const db = requireDb(env);
+  const fn = edge === "first" ? "MIN" : "MAX";
+  return runArchiveQuery<MoArchiveRow>(
+    db
+      .prepare(
+        `SELECT major_order_id, objective_index, progress, target,
+                ${fn}(sampled_at) AS sampled_at
+           FROM mo_progress_samples
+          WHERE sampled_at >= ? AND sampled_at <= ?
+          GROUP BY major_order_id, objective_index`,
+      )
+      .bind(sinceMs, untilMs),
+    "major order archive window edges",
+  );
+}
+
+/** First or last archived global sample inside the window (null when none). */
+export async function readGlobalEdgeRow(
+  env: Env,
+  sinceMs: number,
+  untilMs: number,
+  edge: "first" | "last",
+): Promise<GlobalArchiveRow | null> {
+  const db = requireDb(env);
+  const dir = edge === "first" ? "ASC" : "DESC";
+  const rows = await runArchiveQuery<GlobalArchiveRow>(
+    db
+      .prepare(
+        `SELECT sampled_at, player_count, impact_multiplier, active_campaign_count,
+                missions_won, missions_lost, deaths, terminid_kills, automaton_kills, illuminate_kills
+           FROM global_samples
+          WHERE sampled_at >= ? AND sampled_at <= ?
+          ORDER BY sampled_at ${dir}
+          LIMIT 1`,
+      )
+      .bind(sinceMs, untilMs),
+    "global archive window edge",
+  );
+  return rows[0] ?? null;
+}
+
+/** Overall archive coverage — the oldest/newest global sample ever archived.
+ * Lets a windowed read say honestly when the window predates the archive. */
+export async function readArchiveCoverage(
+  env: Env,
+): Promise<{ earliest: number | null; latest: number | null }> {
+  const db = requireDb(env);
+  const rows = await runArchiveQuery<{ earliest: number | null; latest: number | null }>(
+    db.prepare(
+      `SELECT MIN(sampled_at) AS earliest, MAX(sampled_at) AS latest FROM global_samples`,
+    ),
+    "archive coverage",
+  );
+  return rows[0] ?? { earliest: null, latest: null };
+}
+
+/** Item 10: past Major Order outcomes, newest recorded first, optionally
+ * narrowed to one MO id and/or one objective index (the SAME narrowing the
+ * series read honors, so a narrowed response never mixes in other objectives'
+ * final states). Degrades to null when the mo_outcomes table is not readable
+ * yet (migration 0004 not applied) — the caller notes it rather than failing
+ * the whole archive read. */
+export async function readMoOutcomes(
+  env: Env,
+  filters: { majorOrderId?: number; objectiveIndex?: number } = {},
+  limit = 100,
+): Promise<MoOutcomeRow[] | null> {
+  const db = requireDb(env);
+  try {
+    const where: string[] = [];
+    const binds: unknown[] = [];
+    if (filters.majorOrderId != null) {
+      where.push("major_order_id = ?");
+      binds.push(filters.majorOrderId);
+    }
+    if (filters.objectiveIndex != null) {
+      where.push("objective_index = ?");
+      binds.push(filters.objectiveIndex);
+    }
+    binds.push(limit);
+    const res = await db
+      .prepare(
+        `SELECT major_order_id, objective_index, task_type, final_progress, target,
+                final_progress_pct, target_reached, first_observed_at, last_observed_at, recorded_at
+           FROM mo_outcomes${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY recorded_at DESC, major_order_id DESC, objective_index ASC
+          LIMIT ?`,
+      )
+      .bind(...binds)
+      .all<MoOutcomeRow>();
+    return res.results ?? [];
+  } catch {
+    return null;
+  }
+}
+
+/* ------------------------------------------------------------------------
+ * Item 8 (get_health): self-report reads. All plain SELECTs; a missing
+ * quarantine table (migration 0003 not applied) degrades that section rather
+ * than failing the whole health report.
+ * ---------------------------------------------------------------------- */
+
+const HEALTH_TABLES = [
+  "planet_samples",
+  "global_samples",
+  "mo_progress_samples",
+  "observed_signatures",
+  "quarantined_samples",
+  "mo_outcomes",
+] as const;
+export type HealthTable = (typeof HEALTH_TABLES)[number];
+
+/** Row counts per archive table. A table that cannot be counted (e.g. its
+ * migration is not applied yet) reports null, never a thrown health check. */
+export async function readArchiveCounts(
+  env: Env,
+): Promise<Record<HealthTable, number | null>> {
+  const db = requireDb(env);
+  const counts = {} as Record<HealthTable, number | null>;
+  for (const table of HEALTH_TABLES) {
+    try {
+      // Table names come from the fixed HEALTH_TABLES list above, never from
+      // caller input — the values in play are all bound (there are none).
+      const res = await db
+        .prepare(`SELECT COUNT(*) AS n FROM ${table}`)
+        .first<{ n: number }>();
+      counts[table] = res?.n ?? 0;
+    } catch {
+      counts[table] = null;
+    }
+  }
+  return counts;
+}
+
+/** The archived global sample timestamps in a window (ascending) — the
+ * cadence record get_health's gap/adherence arithmetic runs over. Capped at
+ * the NEWEST `limit` rows like every archive read. */
+export async function readGlobalSampleTimestamps(
+  env: Env,
+  sinceMs: number,
+  limit: number,
+): Promise<number[]> {
+  const db = requireDb(env);
+  const rows = await runArchiveQuery<{ sampled_at: number }>(
+    db
+      .prepare(
+        `SELECT sampled_at FROM global_samples
+          WHERE sampled_at >= ?
+          ORDER BY sampled_at DESC
+          LIMIT ?`,
+      )
+      .bind(sinceMs, limit),
+    "global sample timestamps",
+  );
+  return rows.map((r) => r.sampled_at).sort((a, b) => a - b);
+}
+
+/** Quarantine tallies per reason + the most recent quarantined rows (both
+ * numbers and the verbatim excluded row ride each entry). Degrades to nulls
+ * when the quarantine table does not exist yet. */
+export async function readQuarantineSummary(
+  env: Env,
+  recentLimit: number,
+): Promise<{
+  counts_by_reason: Record<string, number> | null;
+  recent: QuarantineRow[] | null;
+}> {
+  const db = requireDb(env);
+  try {
+    const byReason = await db
+      .prepare(
+        `SELECT reason, COUNT(*) AS n FROM quarantined_samples GROUP BY reason ORDER BY reason`,
+      )
+      .all<{ reason: string; n: number }>();
+    const counts: Record<string, number> = {};
+    for (const r of byReason.results ?? []) counts[r.reason] = r.n;
+    const recent = await db
+      .prepare(
+        `SELECT table_name, subject_key, sampled_at, reason, detail, row_json, tick_anchor
+           FROM quarantined_samples
+          ORDER BY sampled_at DESC
+          LIMIT ?`,
+      )
+      .bind(recentLimit)
+      .all<QuarantineRow>();
+    return { counts_by_reason: counts, recent: recent.results ?? [] };
+  } catch {
+    return { counts_by_reason: null, recent: null };
+  }
+}
+
 /** Clamp a caller-supplied row limit into [1, ARCHIVE_MAX_LIMIT]. */
 export function clampLimit(limit: number | undefined): number {
   if (limit == null || !Number.isFinite(limit)) return ARCHIVE_DEFAULT_LIMIT;
@@ -395,4 +769,17 @@ export function sinceCutoffMs(
       ? sinceHours
       : ARCHIVE_DEFAULT_SINCE_HOURS;
   return nowMs - hours * 3_600_000;
+}
+
+/** Item 2: resolve an optional end-of-window (hours back from now) to an
+ * absolute epoch-ms cutoff. Absent/invalid → null (open upper edge, the
+ * pre-item-2 behavior). 0 is valid ("up to now"). */
+export function untilCutoffMs(
+  untilHours: number | undefined,
+  nowMs: number,
+): number | null {
+  if (untilHours == null || !Number.isFinite(untilHours) || untilHours < 0) {
+    return null;
+  }
+  return nowMs - untilHours * 3_600_000;
 }

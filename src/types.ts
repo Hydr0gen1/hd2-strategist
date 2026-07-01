@@ -903,6 +903,13 @@ export interface SupplyGraphNode {
   campaign_kind: "liberation" | "defense" | null;
   campaign_state_known: boolean;
   borders_super_earth: boolean;
+  /** Item 4: active-campaign planet indices whose ONLY adjacent Human-owned
+   * planet (over the full-galaxy observed adjacency) is this node — the set
+   * that loses its last observed Super Earth warp link if this node flips
+   * owner. [] when none / not Human-owned; null when campaign state is
+   * UNKNOWN (the active set cannot be enumerated). An adjacency fact, not a
+   * defend-this judgment. */
+  sole_link_dependents: number[] | null;
 }
 
 /** Feature 1: one directed supply edge. `observed: true` always — only edges

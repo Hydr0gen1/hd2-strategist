@@ -604,6 +604,74 @@ async function* csvChunks(
   }
 }
 
+/** JSON-escape a text fragment for embedding inside an already-open JSON
+ * string literal: JSON.stringify's escaping with the enclosing quotes
+ * stripped. JSON string escaping is per-character (no cross-chunk state), so
+ * escaping chunk-by-chunk concatenates into one valid escaped string. */
+function jsonStringFragment(text: string): string {
+  return JSON.stringify(text).slice(1, -1);
+}
+
+/**
+ * The MCP `resources/read` transport (item 1: the resource_link handoff),
+ * STREAMED. An in-connector agent cannot fetch a workers.dev URL over HTTP
+ * (egress-blocked), so the SAME keyset-paginated, parameter-bound query path
+ * is exposed as an MCP resource. The JSON-RPC result is one JSON object, but
+ * nothing says it must be BUILT in memory: this emits the response envelope
+ * (`{"jsonrpc":…,"result":{"contents":[{…,"text":"`), then each CSV page as a
+ * JSON-escaped string fragment, then the closing braces — over the same
+ * pull-driven ReadableStream discipline as streamArchiveCsv, so memory stays
+ * bounded by ONE page regardless of export size (never the whole archive
+ * concatenated, which a multi-million-row export would make hundreds of MB).
+ * The decoder runs in streaming mode so a multi-byte character split across
+ * page boundaries can never corrupt the escape. READ-ONLY, same as the rest
+ * of the module.
+ */
+export function streamResourceReadResponse(
+  env: Env,
+  params: ExportParams,
+  uri: string,
+  id: number | string | null,
+  pageSize: number = PAGE_SIZE,
+): Response {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  async function* jsonChunks(): AsyncGenerator<Uint8Array> {
+    yield encoder.encode(
+      `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":{"contents":[{` +
+        `"uri":${JSON.stringify(uri)},"mimeType":"text/csv","text":"`,
+    );
+    for await (const chunk of csvChunks(env, params, pageSize)) {
+      yield encoder.encode(
+        jsonStringFragment(decoder.decode(chunk, { stream: true })),
+      );
+    }
+    const tail = decoder.decode();
+    if (tail) yield encoder.encode(jsonStringFragment(tail));
+    yield encoder.encode(`"}]}}`);
+  }
+  const iterator = jsonChunks()[Symbol.asyncIterator]();
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await iterator.next();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (err) {
+        // Mid-stream D1 failure: the envelope may already be on the wire, so
+        // the JSON-RPC status can't change — surface it to the reader.
+        controller.error(err);
+      }
+    },
+    async cancel() {
+      await iterator.return?.(undefined);
+    },
+  });
+  return new Response(stream, {
+    headers: { "content-type": "application/json" },
+  });
+}
+
 /** Build a streamed CSV Response driven by a backpressure-aware `pull()`: each
  * `pull` advances the chunk generator by one chunk, so the runtime only asks for
  * (and only then fetches/builds) the next chunk when the consumer has demand. A
@@ -704,17 +772,50 @@ export interface ExportArchiveArgs {
   bucket?: string;
 }
 
+/** The typed subset of the export_archive metadata the MCP layer needs to
+ * compose the resource_link content item; the rest rides as extra keys. */
+export interface ExportArchiveMeta {
+  url: string;
+  table: ExportTable;
+  bucket: Bucket;
+  row_count: number;
+  [key: string]: unknown;
+}
+
+/**
+ * Item 1 (resource_link transport): recover the ExportParams from a previously
+ * issued export URL so `resources/read` can serve the SAME frozen snapshot the
+ * metadata described (the URL carries the resolved ISO window + the max_id
+ * watermark). Returns null when the URI is not an export-archive URI at all;
+ * a malformed query on a matching path throws ExportParamError.
+ */
+export function parseExportResourceUri(
+  uri: string,
+  nowMs: number,
+): ExportParams | null {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return null;
+  }
+  if (url.pathname !== "/export/archive") return null;
+  return parseExportParams((k) => url.searchParams.get(k), nowMs);
+}
+
 /**
  * The `export_archive` tool body: build the URL + shape metadata. Returns NO
- * rows — just the pointer the agent fetches over HTTP. `row_count` is the raw
- * COUNT(*) over the same predicate (so the agent knows the size before
- * fetching), even under a bucket (where the file itself is smaller).
+ * rows — just the pointer. The MCP layer attaches a `resource_link` content
+ * item for the same URL, so an in-connector agent reads the bytes via
+ * `resources/read` while a browser/CLI fetches the URL over HTTP. `row_count`
+ * is the raw COUNT(*) over the same predicate (so the agent knows the size
+ * before fetching), even under a bucket (where the file itself is smaller).
  */
 export async function exportArchive(
   env: Env,
   origin: string,
   args: ExportArchiveArgs,
-): Promise<unknown> {
+): Promise<ExportArchiveMeta> {
   const nowMs = Date.now();
   // Reuse the exact same parsing as the HTTP route by adapting the args object
   // to the string-getter shape, so the tool and the route can never diverge.
@@ -770,7 +871,7 @@ export async function exportArchive(
     generated_at: new Date(nowMs).toISOString(),
     notes: {
       transport:
-        "Fetch `url` over HTTP to a file — the rows are delivered as a streamed CSV, never inlined here (that would re-hit the context wall). This object is the pointer + shape only.",
+        "Two ways to get the bytes, both serving the SAME frozen snapshot: (1) the resource_link content item beside this JSON — read it via resources/read to receive the CSV through the MCP connector (works when direct HTTP egress to the worker is blocked); (2) fetch `url` over plain HTTP to a file. The rows are never inlined here (that would re-hit the context wall). This object is the pointer + shape only.",
       row_count:
         "Raw stored-row count over the same window predicate (before any bucket rollup). Under bucket != 'raw' the CSV has fewer rows than this — one per (key, time bucket).",
       ...(params.bucket !== "raw"
