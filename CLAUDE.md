@@ -23,36 +23,61 @@ Local dev secrets go in `.dev.vars` (gitignored): `SUPER_CLIENT`, `SUPER_CONTACT
 src/         Worker source — see src/CLAUDE.md for the domain invariants (read
              it before touching anything in src/)
 test/        Unit tests — see test/CLAUDE.md for required coverage
-migrations/  D1 schema (0001_init.sql + 0002 planet_samples sampled_at index) — applied via `wrangler d1 migrations apply`
+migrations/  D1 schema (0001_init + 0002 planet_samples sampled_at index + 0003 quarantined_samples + 0004 mo_outcomes) — applied via `wrangler d1 migrations apply`
 wrangler.toml  KV binding WAR_CACHE + D1 binding HISTORY_DB. NEVER put secrets here.
 ```
 
 ## Hard rules (project-wide)
 
-- **Exactly nineteen tools**: `get_war_brief`, `get_war_status`,
+- **Exactly twenty-three tools**: `get_war_brief`, `get_war_status`,
   `get_campaigns`, `get_major_order`, `get_planet`, `get_supply_graph`,
   `get_dispatches`, `get_patch_notes`, `get_planet_history`,
   `get_wiki_page`, `get_observed_signatures`, `get_global_history`,
   `get_major_order_history`, `resolve_planet`, `get_source_crosscheck`,
   the Stage 12 D1 archive trio `get_planet_archive`,
-  `get_global_archive`, `get_major_order_archive`, and the bulk CSV export
-  `export_archive`. Do not add tools or rename them. (`get_supply_graph` was
-  the eighteenth, added by the Fabel supply-graph/gambit pass; the count was
-  seventeen before it. `export_archive` is the nineteenth, added by the
-  bulk-archive-CSV-export pass.)
+  `get_global_archive`, `get_major_order_archive`, the bulk CSV export
+  `export_archive`, and the next-features-wave quartet `get_mo_pace`,
+  `get_gambits`, `get_war_diff`, `get_health`. Do not add tools or rename
+  them. (`get_supply_graph` was the eighteenth, added by the Fabel
+  supply-graph/gambit pass; `export_archive` the nineteenth, added by the
+  bulk-archive-CSV-export pass; the quartet took the count from nineteen to
+  twenty-three in the next-features wave.)
 - **`export_archive` is transport, not a new data source** (`src/export.ts` +
   the `GET /export/archive` route): a FAITHFUL bulk CSV dump of the existing D1
   archive, READ-ONLY (only SELECTs; no binding, no write, never touches KV or
   the live rate path). It exists to bypass the 1000-row context cap on the
-  `*_archive` tools, so the MCP tool returns ONLY a metadata pointer (`url`,
-  `row_count`, `columns`, `range`, …) and the bytes come over a streamed,
-  keyset-paginated HTTP response (never inlined — that would re-hit the context
-  wall). Same prime directive as the rest of the archive: no derived/trend
+  `*_archive` tools, so the MCP tool returns a metadata pointer (`url`,
+  `row_count`, `columns`, `range`, …) PLUS a `resource_link` content item for
+  the same frozen snapshot (the server answers `resources/read` by running the
+  SAME keyset-paginated read — the handoff an egress-blocked in-connector agent
+  needs), and the bytes come over the streamed HTTP response or the resource
+  read (never inlined in the tool result — that would re-hit the context wall). Same prime directive as the rest of the archive: no derived/trend
   columns, no re-normalization, no verdict — the `hourly`/`daily` buckets are
   deterministic arithmetic (mean of rates/multiplier, last value of counts), not
   a forecast. CSV columns mirror the D1 schema EXACTLY (no invented columns);
   parameterized SQL only; the table schema, the row-capped JSON tools, and the
   KV/live path are untouched.
+- **Next-features wave rules** (the tools/fields added after `export_archive`):
+  every one of them follows the same enrich-never-conclude discipline.
+  `get_mo_pace` surfaces observed vs required rates SIDE BY SIDE (never an
+  on-track verdict; state-at-expiry kinds like hold_planet null the pace with a
+  reason). `isolation_risk` / `sole_link_dependents` are ONE-HOP adjacency
+  facts over observed edges (never routing, never "should defend"), read
+  through the tri-state accessor (null under a campaign outage, never []).
+  `get_gambits` is READ-ONLY facts (no viability score; `defenses: null`,
+  never asserted-empty, under an outage). `get_war_diff` is first-vs-last
+  archive arithmetic (raw before/after pairs + subtractions, no significance
+  ranking). The item-7 quarantine screen (`src/integrity.ts`, pure) runs at
+  the D1 archive write ONLY: a sentinel/Nσ-outlier global row is DIVERTED to
+  `quarantined_samples` with a reason and both sides of the comparison —
+  served-but-flagged, never silently dropped, never "corrected", and the KV
+  ring buffer / response path / `allFresh` gate are untouched. `get_health`
+  reports counts and spacing facts about the server's own record (a gap means
+  "nothing recorded" — cause attribution is the consumer's). The item-10
+  `mo_outcomes` log records each ended MO objective's FINAL OBSERVED state
+  (`target_reached` = the plain comparison at the last observation), detected
+  when a tracked id leaves the live assignments set; detection abstains when a
+  poll carried no assignments data and is idempotent on the natural PK.
 - **Fabel additive-fact rule** (supply graph, gambit, per-player rates,
   regions, warm cache): every new field is a raw upstream value or a
   deterministic transform of values already in the payload — never a verdict.

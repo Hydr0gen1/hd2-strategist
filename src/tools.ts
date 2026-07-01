@@ -1,5 +1,5 @@
 /**
- * The eighteen MCP tools. Orchestration layer: fetch raw data via client.ts,
+ * The twenty-two MCP tools (the twenty-third, export_archive, lives in export.ts). Orchestration layer: fetch raw data via client.ts,
  * assemble NormalizeContext (rates, ages, MO planet set), and run the pure
  * invariant normalization from invariants.ts (plus the pure Stage 1/2
  * enrichment shapers from enrichment.ts). The one non-war-state tool,
