@@ -140,10 +140,12 @@ export interface MoOutcomeRow {
  * produces an empty tick and inserts nothing; the tick_anchor unique index is
  * the second, atomic line of defense against concurrent overlapping polls.
  * `quarantined` (item 7) carries rows the plausibility screen diverted from a
- * live table — recorded to quarantined_samples in the SAME batch, never
- * silently dropped. `moOutcomes` (item 10) carries the final observed state of
- * orders that just left the live assignments set — idempotent on the natural
- * PK. */
+ * live table — recorded to quarantined_samples, never silently dropped.
+ * `moOutcomes` (item 10) carries the final observed state of orders that just
+ * left the live assignments set — idempotent on the natural PK. Both optional
+ * sections write in a SECOND, separately-isolated batch (see
+ * archiveSampleTick) so an unapplied 0003/0004 migration can never reject the
+ * core append. */
 export interface ArchiveTick {
   planets: PlanetArchiveWriteRow[];
   global: GlobalArchiveWriteRow | null;
@@ -289,17 +291,39 @@ export async function archiveSampleTick(
       }
     }
 
+    if (batch.length > 0) await db.batch(batch);
+  } catch (err) {
+    console.warn(
+      `D1 archive write failed (KV unaffected): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  // Items 7 + 10: the OPTIONAL-TABLE rows (quarantined_samples — migration
+  // 0003 — and mo_outcomes — 0004) go in a SECOND, separately-isolated batch.
+  // A D1 batch is atomic, so co-batching them with the core sections would let
+  // a missing optional table (a partial migration rollout) reject the WHOLE
+  // batch and silently lose that tick's planet/global/MO rows. The write path
+  // now degrades like the read path: a missing optional table costs only its
+  // own rows (logged), never the core archive append. Still bounded: at most
+  // two batches per tick, and the second exists only on the rare ticks that
+  // produce a quarantine or outcome row.
+  if (quarantined.length === 0 && moOutcomes.length === 0) return;
+  try {
+    const optionalBatch: D1PreparedStatement[] = [];
+
     if (quarantined.length > 0) {
-      // Item 7: screened-out rows land in quarantined_samples in the SAME
-      // batch — flagged with a reason, never silently dropped, never mixed
-      // into the live tables. Same race-proof INSERT OR IGNORE discipline.
+      // Item 7: screened-out rows, flagged with a reason — never silently
+      // dropped, never mixed into the live tables. Same race-proof
+      // INSERT OR IGNORE discipline as every append-only table.
       const stmt = db.prepare(
         `INSERT OR IGNORE INTO quarantined_samples
            (table_name, subject_key, sampled_at, reason, detail, row_json, tick_anchor)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const q of quarantined) {
-        batch.push(
+        optionalBatch.push(
           stmt.bind(
             q.table_name,
             q.subject_key,
@@ -324,7 +348,7 @@ export async function archiveSampleTick(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const o of moOutcomes) {
-        batch.push(
+        optionalBatch.push(
           stmt.bind(
             o.major_order_id,
             o.objective_index,
@@ -341,12 +365,13 @@ export async function archiveSampleTick(
       }
     }
 
-    if (batch.length > 0) await db.batch(batch);
+    if (optionalBatch.length > 0) await db.batch(optionalBatch);
   } catch (err) {
     console.warn(
-      `D1 archive write failed (KV unaffected): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `D1 optional-table archive write failed (core archive + KV unaffected; ` +
+        `if this mentions a missing table, apply migrations 0003/0004): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
     );
   }
 }

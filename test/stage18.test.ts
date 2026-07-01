@@ -177,8 +177,18 @@ class FakeD1 {
     return rows;
   }
 
+  /** Tables that "do not exist" (their migration is unapplied): a batch
+   * naming one is rejected WHOLE — D1 batches are atomic. */
+  failTables = new Set<string>();
+
   async batch(stmts: { sql: string; vals: unknown[] }[]) {
     this.batches += 1;
+    for (const s of stmts) {
+      const m = s.sql.match(/INTO (\w+)/);
+      if (m && this.failTables.has(m[1]!)) {
+        throw new Error(`no such table: ${m[1]}`);
+      }
+    }
     for (const s of stmts) {
       const m = s.sql.match(/INTO (\w+)\s*\(([^)]+)\)/);
       if (!m) continue;
@@ -366,6 +376,33 @@ describe("MO outcome log write path (item 10)", () => {
       moProgress: [],
     });
     expect(db.tables.mo_outcomes).toHaveLength(2);
+  });
+
+  it("a missing mo_outcomes table (migration 0004 unapplied) never costs the core archive rows", async () => {
+    const kv = fakeKv();
+    const db = new FakeD1();
+    db.failTables.add("mo_outcomes"); // partial migration rollout
+    seedStore(kv, retiredMoSeries());
+
+    // An outcome-producing tick: the outcome batch is rejected, but the core
+    // planet/MO rows for the tick must still land (separate batch), and the
+    // failure is swallowed — never a thrown error out of the sampler.
+    await samplePlanetRates(envWith(kv, db), planetInput, NOW, {
+      moProgress: [
+        {
+          majorOrderId: 222,
+          objectiveIndex: 0,
+          taskType: 9,
+          progress: 5,
+          target: 100,
+        },
+      ],
+    });
+
+    expect(db.tables.planet_samples).toHaveLength(1);
+    expect(db.tables.mo_progress_samples).toHaveLength(1);
+    expect(db.tables.mo_outcomes).toHaveLength(0); // lost with a logged warn only
+    expect(db.batches).toBe(2); // core batch + the rejected optional batch
   });
 
   it("a poll WITHOUT assignments data abstains — absence of observations is not an ended order", async () => {

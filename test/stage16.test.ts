@@ -586,6 +586,37 @@ describe("buildWarDiff (item 6, pure)", () => {
     expect(diff.global.deltas!.delta_illuminate_kills).toBeNull();
   });
 
+  it("a single-observation window computes no deltas and reports zero two-observation subjects", () => {
+    // One sample in the window: both edge reads return the SAME row.
+    const diff = buildWarDiff({
+      planetFirst: [karliaFirst],
+      planetLast: [karliaFirst],
+      moFirst: [
+        { major_order_id: 7, objective_index: 0, sampled_at: T0, progress: 10, target: 100 },
+      ],
+      moLast: [
+        { major_order_id: 7, objective_index: 0, sampled_at: T0, progress: 10, target: 100 },
+      ],
+      globalFirst: null,
+      globalLast: null,
+    });
+    expect(diff.subjects_with_two_observations).toBe(0);
+    expect(diff.planets_changed).toHaveLength(0);
+    expect(diff.major_order_deltas).toHaveLength(0);
+  });
+
+  it("the Karlia flip counts as a two-observation subject", () => {
+    const diff = buildWarDiff({
+      planetFirst: [karliaFirst],
+      planetLast: [karliaLast],
+      moFirst: [],
+      moLast: [],
+      globalFirst: null,
+      globalLast: null,
+    });
+    expect(diff.subjects_with_two_observations).toBe(1);
+  });
+
   it("a planet observed only at one edge is membership, not a change", () => {
     const diff = buildWarDiff({
       planetFirst: [],
@@ -772,6 +803,48 @@ describe("getWarDiff handler (item 6)", () => {
     // Read-only on KV.
     expect(kv.puts).toHaveLength(0);
     for (const k of collectKeys(out)) expect(k).not.toMatch(FORBIDDEN_KEYS);
+  });
+
+  it("a window holding a SINGLE tick is insufficient_history, never an apparently-valid empty diff", async () => {
+    const db = new EdgeFakeD1();
+    const base = Date.now();
+    // Exactly one archived tick inside the window.
+    db.rows.planet_samples = [
+      {
+        id: 1,
+        sampled_at: base - 2 * HOUR,
+        planet_index: 185,
+        health: 100_000,
+        max_health: 1_000_000,
+        hp_per_hour: null,
+        campaign_id: 52,
+        campaign_kind: "defense",
+        faction: "Humans",
+      },
+    ];
+    db.rows.global_samples = [
+      {
+        id: 1,
+        sampled_at: base - 2 * HOUR,
+        player_count: 40_000,
+        impact_multiplier: 1,
+        active_campaign_count: 3,
+        missions_won: 10,
+        missions_lost: 1,
+        deaths: 5,
+        terminid_kills: 1,
+        automaton_kills: 1,
+        illuminate_kills: 1,
+      },
+    ];
+    forbidNetwork();
+    const out = (await getWarDiff(
+      { HISTORY_DB: db as unknown as Env["HISTORY_DB"] },
+      { since_hours: 24 },
+    )) as Record<string, any>;
+    expect(out.subjects_with_two_observations).toBe(0);
+    expect(out.insufficient_history).toBe(true);
+    expect(out.note).toMatch(/no subject has TWO distinct/i);
   });
 
   it("empty archive → insufficient_history with a non-error note", async () => {

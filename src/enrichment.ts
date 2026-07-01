@@ -2257,6 +2257,12 @@ export function buildWarDiff(args: {
     deltas: Record<string, number | null> | null;
   };
   planets_observed: number;
+  /** Subjects (planets, MO objectives, the global series) with TWO distinct
+   * observations inside the window — the diff's version of the >= 2 samples
+   * rule every history surface applies. 0 means every subject was seen only
+   * once (or not at all): no delta is computable and the caller reports
+   * insufficient_history, never an apparently-valid empty diff. */
+  subjects_with_two_observations: number;
 } {
   const names = args.planetNames ?? new Map<number, string>();
   const nameOf = (idx: number): string | null => names.get(idx) ?? null;
@@ -2270,6 +2276,7 @@ export function buildWarDiff(args: {
   const campaigns_closed: ReturnType<typeof buildWarDiff>["campaigns_closed"] = [];
   const byFaction: Record<string, { delta_health_sum: number; planets_counted: number }> = {};
 
+  let subjectsWithTwoObservations = 0;
   const allIndices = [
     ...new Set([...firstByPlanet.keys(), ...lastByPlanet.keys()]),
   ].sort((a, b) => a - b);
@@ -2277,6 +2284,7 @@ export function buildWarDiff(args: {
     const first = firstByPlanet.get(idx);
     const last = lastByPlanet.get(idx);
     if (first && last && first.sampled_at !== last.sampled_at) {
+      subjectsWithTwoObservations += 1;
       const factionChanged = first.faction !== last.faction;
       const kindChanged = first.campaign_kind !== last.campaign_kind;
       const idChanged = first.campaign_id !== last.campaign_id;
@@ -2366,6 +2374,7 @@ export function buildWarDiff(args: {
       `${last.major_order_id}:${last.objective_index}`,
     );
     if (!first || first.sampled_at === last.sampled_at) continue;
+    subjectsWithTwoObservations += 1;
     major_order_deltas.push({
       major_order_id: last.major_order_id,
       objective_index: last.objective_index,
@@ -2392,6 +2401,7 @@ export function buildWarDiff(args: {
     args.globalLast &&
     args.globalFirst.sampled_at !== args.globalLast.sampled_at
   ) {
+    subjectsWithTwoObservations += 1;
     const fields: (keyof GlobalArchiveRow)[] = [
       "player_count",
       "impact_multiplier",
@@ -2431,6 +2441,7 @@ export function buildWarDiff(args: {
       deltas: globalDeltas,
     },
     planets_observed: allIndices.length,
+    subjects_with_two_observations: subjectsWithTwoObservations,
   };
 }
 

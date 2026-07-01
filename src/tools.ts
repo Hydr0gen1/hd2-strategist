@@ -2417,8 +2417,13 @@ export async function getWarDiff(
     planetNames,
   });
 
-  const insufficient =
-    planetFirst.length === 0 && globalFirst == null && moFirst.length === 0;
+  // Insufficient unless at least ONE subject has two distinct observations in
+  // the window (the same >= 2 samples rule every history surface applies): a
+  // cold archive OR a window holding a single tick both yield no computable
+  // delta, and neither may read as an apparently-valid empty diff.
+  const anyRows =
+    planetFirst.length > 0 || globalFirst != null || moFirst.length > 0;
+  const insufficient = diff.subjects_with_two_observations === 0;
   const windowPredatesArchive =
     coverage.earliest != null && sinceMs < coverage.earliest;
 
@@ -2444,7 +2449,9 @@ export async function getWarDiff(
     insufficient_history: insufficient,
     ...(insufficient
       ? {
-          note: "No archived observations inside the requested window — the archive fills one tick at a time while the server polls; a window predating the archive (see archive_coverage) or a cold start is expected to be empty, not an error.",
+          note: anyRows
+            ? "The window holds archived observations but no subject has TWO distinct ones, so no delta is computable — deltas need two samples >60s apart. Widen the window (larger since_hours) or wait for more ticks."
+            : "No archived observations inside the requested window — the archive fills one tick at a time while the server polls; a window predating the archive (see archive_coverage) or a cold start is expected to be empty, not an error.",
         }
       : windowPredatesArchive
         ? {

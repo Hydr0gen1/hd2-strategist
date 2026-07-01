@@ -178,6 +178,9 @@ class WriteFakeD1 {
     quarantined_samples: [],
   };
   batches = 0;
+  /** Tables that "do not exist" (migration unapplied): a batch naming one is
+   * rejected WHOLE — D1 batches are atomic. */
+  failTables = new Set<string>();
 
   prepare(sql: string) {
     const db = this;
@@ -229,6 +232,12 @@ class WriteFakeD1 {
 
   async batch(stmts: { sql: string; vals: unknown[] }[]) {
     this.batches += 1;
+    for (const s of stmts) {
+      const m = s.sql.match(/INTO (\w+)/);
+      if (m && this.failTables.has(m[1]!)) {
+        throw new Error(`no such table: ${m[1]}`);
+      }
+    }
     for (const s of stmts) {
       const m = s.sql.match(/INTO (\w+)\s*\(([^)]+)\)/);
       if (!m) continue;
@@ -317,6 +326,32 @@ describe("quarantine at the write path (item 7)", () => {
     expect(detail[0].field).toBe("player_count");
     expect(detail[0].observed_value).toBe(3_552);
     expect(typeof detail[0].recent_delta_stddev).toBe("number");
+  });
+
+  it("a missing quarantine table (migration 0003 unapplied) never costs the core archive rows", async () => {
+    const kv = fakeKv();
+    const db = new WriteFakeD1();
+    db.failTables.add("quarantined_samples"); // partial migration rollout
+    seedStore(kv, steadySeries(12, NOW - 10 * MINUTE));
+
+    // A quarantine-producing tick WITH a core planet observation: the
+    // quarantine batch is rejected, the planet row still lands (separate
+    // batch), and the failure is swallowed — never a thrown error.
+    await samplePlanetRates(
+      envWith(kv, db),
+      [{ planetIndex: 185, health: 900_000, campaignId: 52 }],
+      NOW,
+      {
+        globalStatistics: statsOf(3_552), // Nσ outlier → diverted
+        globalImpactMultiplier: 1.2,
+        globalActiveCampaignCount: 5,
+      },
+    );
+
+    expect(db.tables.planet_samples).toHaveLength(1); // core append survived
+    expect(db.tables.global_samples).toHaveLength(0); // diverted, as always
+    expect(db.tables.quarantined_samples).toHaveLength(0); // lost with a warn only
+    expect(db.batches).toBe(2); // core batch + the rejected optional batch
   });
 
   it("a plausible tick archives normally — no quarantine row", async () => {
