@@ -404,6 +404,101 @@ export async function readMoArchive(
   return rows.sort((a, b) => a.sampled_at - b.sampled_at);
 }
 
+/* ------------------------------------------------------------------------
+ * Item 6 (get_war_diff): window-edge readers. Each returns ONE row per
+ * subject — its FIRST or LAST observation inside [sinceMs, untilMs] — using
+ * SQLite's documented bare-column guarantee: with a single MIN()/MAX()
+ * aggregate, the non-aggregated columns come from the row where that
+ * minimum/maximum occurs (D1 is SQLite). This keeps the diff O(subjects)
+ * rows regardless of how many samples the window holds.
+ * ---------------------------------------------------------------------- */
+
+/** First/last archived planet observation per planet inside the window. */
+export async function readPlanetEdgeRows(
+  env: Env,
+  sinceMs: number,
+  untilMs: number,
+  edge: "first" | "last",
+): Promise<PlanetArchiveRow[]> {
+  const db = requireDb(env);
+  const fn = edge === "first" ? "MIN" : "MAX";
+  return runArchiveQuery<PlanetArchiveRow>(
+    db
+      .prepare(
+        `SELECT planet_index, health, max_health, hp_per_hour, campaign_id, campaign_kind, faction,
+                ${fn}(sampled_at) AS sampled_at
+           FROM planet_samples
+          WHERE sampled_at >= ? AND sampled_at <= ?
+          GROUP BY planet_index`,
+      )
+      .bind(sinceMs, untilMs),
+    "planet archive window edges",
+  );
+}
+
+/** First/last archived MO objective observation per objective in the window. */
+export async function readMoEdgeRows(
+  env: Env,
+  sinceMs: number,
+  untilMs: number,
+  edge: "first" | "last",
+): Promise<MoArchiveRow[]> {
+  const db = requireDb(env);
+  const fn = edge === "first" ? "MIN" : "MAX";
+  return runArchiveQuery<MoArchiveRow>(
+    db
+      .prepare(
+        `SELECT major_order_id, objective_index, progress, target,
+                ${fn}(sampled_at) AS sampled_at
+           FROM mo_progress_samples
+          WHERE sampled_at >= ? AND sampled_at <= ?
+          GROUP BY major_order_id, objective_index`,
+      )
+      .bind(sinceMs, untilMs),
+    "major order archive window edges",
+  );
+}
+
+/** First or last archived global sample inside the window (null when none). */
+export async function readGlobalEdgeRow(
+  env: Env,
+  sinceMs: number,
+  untilMs: number,
+  edge: "first" | "last",
+): Promise<GlobalArchiveRow | null> {
+  const db = requireDb(env);
+  const dir = edge === "first" ? "ASC" : "DESC";
+  const rows = await runArchiveQuery<GlobalArchiveRow>(
+    db
+      .prepare(
+        `SELECT sampled_at, player_count, impact_multiplier, active_campaign_count,
+                missions_won, missions_lost, deaths, terminid_kills, automaton_kills, illuminate_kills
+           FROM global_samples
+          WHERE sampled_at >= ? AND sampled_at <= ?
+          ORDER BY sampled_at ${dir}
+          LIMIT 1`,
+      )
+      .bind(sinceMs, untilMs),
+    "global archive window edge",
+  );
+  return rows[0] ?? null;
+}
+
+/** Overall archive coverage — the oldest/newest global sample ever archived.
+ * Lets a windowed read say honestly when the window predates the archive. */
+export async function readArchiveCoverage(
+  env: Env,
+): Promise<{ earliest: number | null; latest: number | null }> {
+  const db = requireDb(env);
+  const rows = await runArchiveQuery<{ earliest: number | null; latest: number | null }>(
+    db.prepare(
+      `SELECT MIN(sampled_at) AS earliest, MAX(sampled_at) AS latest FROM global_samples`,
+    ),
+    "archive coverage",
+  );
+  return rows[0] ?? { earliest: null, latest: null };
+}
+
 /** Clamp a caller-supplied row limit into [1, ARCHIVE_MAX_LIMIT]. */
 export function clampLimit(limit: number | undefined): number {
   if (limit == null || !Number.isFinite(limit)) return ARCHIVE_DEFAULT_LIMIT;

@@ -683,6 +683,14 @@ export function buildSupplyGraph(
       campaign_kind: campaigns.kind(idx),
       campaign_state_known: campaignStateKnown,
       borders_super_earth: bordersSuperEarth(idx, planetByIndex, reverseAdjacency),
+      // Item 4: computed over the FULL-galaxy adjacency (like
+      // borders_super_earth), via the tri-state accessor — null when unknown.
+      sole_link_dependents: soleHumanLinkDependents(
+        idx,
+        planetByIndex,
+        reverseAdjacency,
+        campaigns,
+      ),
     };
   });
 
@@ -1947,3 +1955,484 @@ export const ETA_NOTE =
 /** Stage 9: the defense competing-clocks framing, stated inline. */
 export const DEFENSE_ETA_NOTE =
   "Defense campaigns carry COMPETING clocks, never a prediction: depletion_eta_instantaneous_hours / depletion_eta_historical_hours (time to deplete the event health to the win state, computed under each rate assumption — defenses regime-change hard when reinforcements arrive or leave, so both matter) versus defense_hours_remaining (the fixed deadline, echoed for co-location). resolution_within_defense_window_instantaneous / _historical evaluate the Stage 7 comparison (depletion ETA ≤ deadline) against each rate, labeled which one was used. The race between the depletion ETAs and the deadline IS the information; no success/failure field exists by design — calling the winner is the consumer's judgment.";
+
+/* ----------------------- Next-features wave, Tier 2 -------------------- */
+
+/**
+ * Item 3 (MO pace): task types whose per-objective `progress` is a STATE at
+ * expiry rather than a cumulative counter. A hold_planet objective's progress
+ * can fall as planets are lost, so "required rate = remaining ÷ time" is not a
+ * meaningful cumulative requirement — the pace fields are nulled with a reason
+ * instead of presenting arithmetic that misreads as a pace. Confirmed-values
+ * discipline as everywhere: only live-verified task types are listed.
+ */
+export const MO_STATE_OBJECTIVE_TASK_TYPES: ReadonlySet<number> = new Set([
+  13, // hold_planet (TASK_TYPE_NAMES)
+]);
+
+/** Item 3: one objective's pace facts — observed vs required, side by side. */
+export interface MoObjectivePace {
+  index: number;
+  task_type: number | null;
+  objective_kind: string | null;
+  progress: number | null;
+  target: number | null;
+  progress_pct: number | null;
+  /** target − progress, clamped at 0; null when either side is unknown. */
+  remaining: number | null;
+  /** Hours until the order expires (clamped at 0 once past). */
+  time_left_hours: number | null;
+  /** remaining ÷ time_left_hours — the pace that would exactly reach the
+   * target at expiry. A number to compare against the observed rates, NEVER
+   * an on-track/behind verdict. */
+  required_rate_per_hour: number | null;
+  required_rate_reason: string | null;
+  /** The latest observed per-interval progress delta per hour (the Stage 9
+   * instantaneous convention) over the retained MO series. */
+  observed_rate_per_hour_latest: number | null;
+  /** Unweighted mean of the per-interval observed rates (the Stage 9
+   * historical convention). */
+  observed_rate_per_hour_mean: number | null;
+  observed_rate_reason: string | null;
+  sample_count: number;
+  samples_span_hours: number | null;
+}
+
+/**
+ * Item 3: the observed-vs-required pace block for one shaped Major Order (the
+ * shapeMajorOrders output) joined with its retained progress series. Two
+ * numbers per objective — the rate that was OBSERVED and the rate that would
+ * exactly reach the target at expiry — presented side by side with their
+ * inputs. "On track" never appears: the reader compares the numbers. Every
+ * null carries a machine-readable reason; a state-at-expiry objective kind
+ * (hold_planet) nulls the pace fields rather than presenting arithmetic that
+ * misreads as a cumulative requirement.
+ */
+export function buildMoPace(
+  order: ReturnType<typeof shapeMajorOrders>[number],
+  series: ReadonlyArray<MoObjectiveSeries>,
+): MoObjectivePace[] {
+  return order.objectives.map((objective): MoObjectivePace => {
+    const stateKind =
+      objective.task_type != null &&
+      MO_STATE_OBJECTIVE_TASK_TYPES.has(objective.task_type);
+    const remaining =
+      objective.progress != null && objective.target != null
+        ? Math.max(0, objective.target - objective.progress)
+        : null;
+    const timeLeftHours = objective && order.expires_in_seconds != null
+      ? order.expires_in_seconds / SECONDS_PER_HOUR
+      : null;
+
+    let requiredRate: number | null = null;
+    let requiredReason: string | null = null;
+    if (stateKind) requiredReason = "state_objective_progress_not_cumulative";
+    else if (remaining == null) requiredReason = "unknown_remaining";
+    else if (timeLeftHours == null) requiredReason = "unknown_time_left";
+    else if (timeLeftHours <= 0) requiredReason = "order_expired";
+    else requiredRate = remaining / timeLeftHours;
+
+    const s = series.find(
+      (x) =>
+        x.major_order_id === order.id &&
+        x.objective_index === objective.index,
+    );
+    const samples = s?.samples ?? [];
+    const rates = moIntervalRates(samples);
+    let latest: number | null = null;
+    let mean: number | null = null;
+    let observedReason: string | null = null;
+    if (stateKind) observedReason = "state_objective_progress_not_cumulative";
+    else if (rates.length === 0) observedReason = "insufficient_history";
+    else {
+      latest = rates[rates.length - 1]!;
+      mean = rates.reduce((sum, r) => sum + r, 0) / rates.length;
+    }
+
+    return {
+      index: objective.index,
+      task_type: objective.task_type ?? null,
+      objective_kind: objective.objective_kind,
+      progress: objective.progress,
+      target: objective.target,
+      progress_pct: objective.progress_pct,
+      remaining,
+      time_left_hours: timeLeftHours,
+      required_rate_per_hour: requiredRate,
+      required_rate_reason: requiredReason,
+      observed_rate_per_hour_latest: latest,
+      observed_rate_per_hour_mean: mean,
+      observed_rate_reason: observedReason,
+      sample_count: samples.length,
+      samples_span_hours: seriesSpanHours(samples),
+    };
+  });
+}
+
+export const MO_PACE_NOTE =
+  "Two rates per objective, side by side, in the objective's own progress units per hour: required_rate_per_hour = remaining ÷ time_left_hours (the pace that would exactly reach the target at expiry — plain arithmetic over two fields in this payload) and observed_rate_per_hour_latest / _mean (the Stage 9 instantaneous/historical conventions over the retained progress series — raw observed deltas, no smoothing). There is deliberately NO on-track/behind/forecast field: whether the observed pace suffices is the reader's comparison of the two numbers. A state-at-expiry objective kind (hold_planet — progress can fall as planets are lost) nulls both rates with reason state_objective_progress_not_cumulative rather than presenting a pace that misreads. Every null carries a machine-readable reason.";
+
+/**
+ * Item 4 (reachability): combined observed adjacency for one planet — its own
+ * waypoints (outbound) ∪ the planets whose waypoints name it (inbound, via the
+ * precomputed reverse adjacency). Deduped indices; dangling targets excluded.
+ */
+function combinedAdjacency(
+  index: number,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  reverseAdjacency: ReadonlyMap<number, number[]>,
+): number[] {
+  const planet = planetByIndex.get(index);
+  const outbound =
+    planet && Array.isArray(planet.waypoints) ? planet.waypoints : [];
+  const inbound = reverseAdjacency.get(index) ?? [];
+  const set = new Set<number>();
+  for (const n of [...outbound, ...inbound]) {
+    if (planetByIndex.has(n)) set.add(n);
+  }
+  return [...set].sort((a, b) => a - b);
+}
+
+/** Item 4: build the reverse (inbound) adjacency once over a snapshot —
+ * index → planets whose own waypoints name it. The same inversion
+ * buildInboundNeighbors performs, precomputed for whole-graph passes. */
+export function buildReverseAdjacency(
+  planets: ReadonlyArray<RawPlanet>,
+): Map<number, number[]> {
+  const reverse = new Map<number, number[]>();
+  for (const p of planets) {
+    const waypoints = Array.isArray(p.waypoints) ? p.waypoints : [];
+    for (const w of waypoints) {
+      const list = reverse.get(w);
+      if (list) list.push(p.index);
+      else reverse.set(w, [p.index]);
+    }
+  }
+  return reverse;
+}
+
+/**
+ * Item 4: the active-campaign planets whose ONLY adjacent Human-owned planet
+ * (over observed inbound ∪ outbound waypoint edges) is THIS planet — the set
+ * that loses its last observed warp link into Super Earth territory if this
+ * planet changes owner. A deterministic one-hop graph fact over observed
+ * edges: no routing, no reachability search beyond adjacency, no defend/
+ * priority judgment. Returns null when campaign state is UNKNOWN (the active
+ * set cannot be enumerated), [] when this planet is not Human-owned (its flip
+ * removes no Super Earth link).
+ */
+export function soleHumanLinkDependents(
+  index: number,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  reverseAdjacency: ReadonlyMap<number, number[]>,
+  campaigns: CampaignView,
+): number[] | null {
+  if (!campaigns.known) return null;
+  if (planetByIndex.get(index)?.currentOwner !== "Humans") return [];
+  const dependents: number[] = [];
+  for (const n of combinedAdjacency(index, planetByIndex, reverseAdjacency)) {
+    if (campaigns.status(n) !== "active") continue;
+    const humanNeighbors = combinedAdjacency(
+      n,
+      planetByIndex,
+      reverseAdjacency,
+    ).filter((m) => planetByIndex.get(m)?.currentOwner === "Humans");
+    if (humanNeighbors.length === 1 && humanNeighbors[0] === index) {
+      dependents.push(n);
+    }
+  }
+  return dependents;
+}
+
+/** Item 4: the isolation block get_planet carries. */
+export interface IsolationRisk {
+  planet_is_human_owned: boolean;
+  campaign_state_known: boolean;
+  /** Null when campaign state is UNKNOWN — never an asserted-empty list. */
+  dependent_active_campaigns:
+    | { index: number; name: string | null; campaign_kind: "liberation" | "defense" | null }[]
+    | null;
+}
+
+/** Item 4: the joined isolation block for one planet — indices from
+ * soleHumanLinkDependents joined with name/kind over the same snapshot. */
+export function buildIsolationRisk(
+  planet: RawPlanet,
+  planetByIndex: ReadonlyMap<number, RawPlanet>,
+  reverseAdjacency: ReadonlyMap<number, number[]>,
+  campaigns: CampaignView,
+): IsolationRisk {
+  const dependents = soleHumanLinkDependents(
+    planet.index,
+    planetByIndex,
+    reverseAdjacency,
+    campaigns,
+  );
+  return {
+    planet_is_human_owned: planet.currentOwner === "Humans",
+    campaign_state_known: campaigns.known,
+    dependent_active_campaigns:
+      dependents === null
+        ? null
+        : dependents.map((idx) => ({
+            index: idx,
+            name: planetByIndex.get(idx)?.name ?? null,
+            campaign_kind: campaigns.kind(idx),
+          })),
+  };
+}
+
+export const ISOLATION_RISK_NOTE =
+  "dependent_active_campaigns lists the active-campaign planets whose ONLY adjacent Human-owned planet — over observed inbound ∪ outbound waypoint edges, the same edge set the supply graph serves — is THIS planet: the set that loses its last observed warp link into Super Earth territory if this planet changes owner. A deterministic one-hop adjacency fact (no routing or multi-hop reachability search), computed only from the observed snapshot. Empty when this planet is not Human-owned or nothing depends on it solely; null when campaign state is unknown. It is NOT a defend-this recommendation — what to do about the dependency is the consumer's judgment.";
+
+/* ------------------------- Item 6: war diff ---------------------------- */
+
+/** Item 6: one edge observation of a planet inside the diff window. */
+export interface PlanetEdgeObservation {
+  sampled_at: number;
+  observed_at: string;
+  health: number | null;
+  max_health: number | null;
+  campaign_id: number | null;
+  campaign_kind: string | null;
+  faction: string | null;
+}
+
+function planetEdgeObservation(row: PlanetArchiveRow): PlanetEdgeObservation {
+  return {
+    sampled_at: row.sampled_at,
+    observed_at: new Date(row.sampled_at).toISOString(),
+    health: row.health,
+    max_health: row.max_health,
+    campaign_id: row.campaign_id,
+    campaign_kind: row.campaign_kind,
+    faction: row.faction,
+  };
+}
+
+/**
+ * Item 6: deterministic archive arithmetic between the FIRST and LAST
+ * observation of each subject inside a window — "what changed since N hours
+ * ago" as raw before/after pairs and their differences. Every field is either
+ * an archived observation or a subtraction of two of them; no significance
+ * ranking, no cause attribution, no verdict. `faction` is the campaign-tracked
+ * faction the archive stores (the attacker on a defense, the planet owner
+ * otherwise — the same derivation the campaign payloads use), so a change in
+ * it is presented as exactly that: the tracked faction changed.
+ */
+export function buildWarDiff(args: {
+  planetFirst: PlanetArchiveRow[];
+  planetLast: PlanetArchiveRow[];
+  moFirst: MoArchiveRow[];
+  moLast: MoArchiveRow[];
+  globalFirst: GlobalArchiveRow | null;
+  globalLast: GlobalArchiveRow | null;
+  planetNames?: ReadonlyMap<number, string>;
+}): {
+  planets_changed: {
+    planet_index: number;
+    planet_name: string | null;
+    first: PlanetEdgeObservation;
+    last: PlanetEdgeObservation;
+    faction_changed: boolean;
+    campaign_kind_changed: boolean;
+    campaign_id_changed: boolean;
+    delta_health: number | null;
+  }[];
+  planets_first_observed: { planet_index: number; planet_name: string | null; last: PlanetEdgeObservation }[];
+  planets_no_longer_observed: { planet_index: number; planet_name: string | null; first: PlanetEdgeObservation }[];
+  campaigns_opened: { planet_index: number; planet_name: string | null; campaign_id: number; campaign_kind: string | null }[];
+  campaigns_closed: { planet_index: number; planet_name: string | null; campaign_id: number; campaign_kind: string | null }[];
+  net_health_delta_by_faction: Record<string, { delta_health_sum: number; planets_counted: number }>;
+  major_order_deltas: {
+    major_order_id: number;
+    objective_index: number;
+    first: { sampled_at: number; progress: number | null; target: number | null };
+    last: { sampled_at: number; progress: number | null; target: number | null };
+    delta_progress: number | null;
+  }[];
+  global: {
+    first: GlobalArchiveRow | null;
+    last: GlobalArchiveRow | null;
+    deltas: Record<string, number | null> | null;
+  };
+  planets_observed: number;
+} {
+  const names = args.planetNames ?? new Map<number, string>();
+  const nameOf = (idx: number): string | null => names.get(idx) ?? null;
+  const firstByPlanet = new Map(args.planetFirst.map((r) => [r.planet_index, r]));
+  const lastByPlanet = new Map(args.planetLast.map((r) => [r.planet_index, r]));
+
+  const planets_changed: ReturnType<typeof buildWarDiff>["planets_changed"] = [];
+  const planets_first_observed: ReturnType<typeof buildWarDiff>["planets_first_observed"] = [];
+  const planets_no_longer_observed: ReturnType<typeof buildWarDiff>["planets_no_longer_observed"] = [];
+  const campaigns_opened: ReturnType<typeof buildWarDiff>["campaigns_opened"] = [];
+  const campaigns_closed: ReturnType<typeof buildWarDiff>["campaigns_closed"] = [];
+  const byFaction: Record<string, { delta_health_sum: number; planets_counted: number }> = {};
+
+  const allIndices = [
+    ...new Set([...firstByPlanet.keys(), ...lastByPlanet.keys()]),
+  ].sort((a, b) => a - b);
+  for (const idx of allIndices) {
+    const first = firstByPlanet.get(idx);
+    const last = lastByPlanet.get(idx);
+    if (first && last && first.sampled_at !== last.sampled_at) {
+      const factionChanged = first.faction !== last.faction;
+      const kindChanged = first.campaign_kind !== last.campaign_kind;
+      const idChanged = first.campaign_id !== last.campaign_id;
+      const deltaHealth =
+        first.health != null && last.health != null
+          ? last.health - first.health
+          : null;
+      if (factionChanged || kindChanged || idChanged) {
+        planets_changed.push({
+          planet_index: idx,
+          planet_name: nameOf(idx),
+          first: planetEdgeObservation(first),
+          last: planetEdgeObservation(last),
+          faction_changed: factionChanged,
+          campaign_kind_changed: kindChanged,
+          campaign_id_changed: idChanged,
+          delta_health: deltaHealth,
+        });
+      }
+      if (idChanged) {
+        if (first.campaign_id != null) {
+          campaigns_closed.push({
+            planet_index: idx,
+            planet_name: nameOf(idx),
+            campaign_id: first.campaign_id,
+            campaign_kind: first.campaign_kind,
+          });
+        }
+        if (last.campaign_id != null) {
+          campaigns_opened.push({
+            planet_index: idx,
+            planet_name: nameOf(idx),
+            campaign_id: last.campaign_id,
+            campaign_kind: last.campaign_kind,
+          });
+        }
+      }
+      if (deltaHealth != null && last.faction != null) {
+        const agg = (byFaction[last.faction] ??= {
+          delta_health_sum: 0,
+          planets_counted: 0,
+        });
+        agg.delta_health_sum += deltaHealth;
+        agg.planets_counted += 1;
+      }
+    } else if (last && !first) {
+      planets_first_observed.push({
+        planet_index: idx,
+        planet_name: nameOf(idx),
+        last: planetEdgeObservation(last),
+      });
+      if (last.campaign_id != null) {
+        campaigns_opened.push({
+          planet_index: idx,
+          planet_name: nameOf(idx),
+          campaign_id: last.campaign_id,
+          campaign_kind: last.campaign_kind,
+        });
+      }
+    } else if (first && !last) {
+      planets_no_longer_observed.push({
+        planet_index: idx,
+        planet_name: nameOf(idx),
+        first: planetEdgeObservation(first),
+      });
+      if (first.campaign_id != null) {
+        campaigns_closed.push({
+          planet_index: idx,
+          planet_name: nameOf(idx),
+          campaign_id: first.campaign_id,
+          campaign_kind: first.campaign_kind,
+        });
+      }
+    }
+  }
+
+  const firstMoByKey = new Map(
+    args.moFirst.map((r) => [`${r.major_order_id}:${r.objective_index}`, r]),
+  );
+  const major_order_deltas: ReturnType<typeof buildWarDiff>["major_order_deltas"] = [];
+  for (const last of [...args.moLast].sort(
+    (a, b) =>
+      a.major_order_id - b.major_order_id ||
+      a.objective_index - b.objective_index,
+  )) {
+    const first = firstMoByKey.get(
+      `${last.major_order_id}:${last.objective_index}`,
+    );
+    if (!first || first.sampled_at === last.sampled_at) continue;
+    major_order_deltas.push({
+      major_order_id: last.major_order_id,
+      objective_index: last.objective_index,
+      first: {
+        sampled_at: first.sampled_at,
+        progress: first.progress,
+        target: first.target,
+      },
+      last: {
+        sampled_at: last.sampled_at,
+        progress: last.progress,
+        target: last.target,
+      },
+      delta_progress:
+        first.progress != null && last.progress != null
+          ? last.progress - first.progress
+          : null,
+    });
+  }
+
+  let globalDeltas: Record<string, number | null> | null = null;
+  if (
+    args.globalFirst &&
+    args.globalLast &&
+    args.globalFirst.sampled_at !== args.globalLast.sampled_at
+  ) {
+    const fields: (keyof GlobalArchiveRow)[] = [
+      "player_count",
+      "impact_multiplier",
+      "active_campaign_count",
+      "missions_won",
+      "missions_lost",
+      "deaths",
+      "terminid_kills",
+      "automaton_kills",
+      "illuminate_kills",
+    ];
+    globalDeltas = {};
+    for (const f of fields) {
+      const a = args.globalFirst[f];
+      const b = args.globalLast[f];
+      globalDeltas[`delta_${f}`] =
+        typeof a === "number" && typeof b === "number" ? b - a : null;
+    }
+  }
+
+  const sortedByFaction: typeof byFaction = {};
+  for (const key of Object.keys(byFaction).sort()) {
+    sortedByFaction[key] = byFaction[key]!;
+  }
+
+  return {
+    planets_changed,
+    planets_first_observed,
+    planets_no_longer_observed,
+    campaigns_opened,
+    campaigns_closed,
+    net_health_delta_by_faction: sortedByFaction,
+    major_order_deltas,
+    global: {
+      first: args.globalFirst,
+      last: args.globalLast,
+      deltas: globalDeltas,
+    },
+    planets_observed: allIndices.length,
+  };
+}
+
+export const WAR_DIFF_NOTE =
+  "Deterministic archive arithmetic between each subject's FIRST and LAST archived observation inside the window — raw before/after pairs and their subtractions, nothing more. faction is the campaign-tracked faction the archive stores (the event attacker on a defense, the planet owner otherwise — the same derivation the live campaign payloads use), so faction_changed means exactly that tracked value changed; an owner flip typically also shows as campaign_kind_changed (defense → liberation) with the campaign_id turning over. delta_health follows the raw stored orientation (last − first; negative = health fell). net_health_delta_by_faction groups planets by their LAST-observed faction and sums known delta_health values (planets_counted states coverage). planets_first_observed / _no_longer_observed report archive-set membership — a planet enters the archive when sampling observes it (campaign start or a direct probe) and stops accruing when it leaves the campaign set, which is evidence, not proof, of a campaign opening/closing. No significance ranking, cause attribution, or went-well/badly verdict exists here by design.";

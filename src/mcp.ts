@@ -15,11 +15,13 @@ import {
   ToolError,
   getCampaigns,
   getDispatches,
+  getGambits,
   getGlobalArchive,
   getGlobalHistory,
   getMajorOrder,
   getMajorOrderArchive,
   getMajorOrderHistory,
+  getMoPace,
   getObservedSignatures,
   getPatchNotes,
   getPlanet,
@@ -28,6 +30,7 @@ import {
   getSourceCrossCheck,
   getSupplyGraph,
   getWarBrief,
+  getWarDiff,
   getWarStatus,
   getWikiPage,
   resolvePlanetTool,
@@ -89,6 +92,39 @@ const TOOL_DEFINITIONS = [
     description:
       "Current Major Order: objectives with per-objective progress, rewards, and time remaining (seconds + human-readable).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_mo_pace",
+    description:
+      "Major Order pace: per objective, the OBSERVED progress rate (latest and mean per-interval deltas over this server's retained progress samples) and the REQUIRED rate (remaining ÷ time_left_hours — the pace that would exactly reach the target at expiry) side by side, plus remaining, time_left_hours, progress/target. Two numbers, NO on-track/behind verdict — the reader compares them. State-at-expiry objective kinds (hold_planet) null both rates with a reason (progress is a state, not a cumulative counter). Read-only; observed rates need two samples >60s apart (insufficient_history on a cold start is expected).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_gambits",
+    description:
+      "The gambit board: every active defense campaign with its attack-origin planet(s) — resolved by inverting the observed source→target attack pairs — each origin joined with its live liberation state (raw_hp, max_hp, liberation_pct_display_only, signed hp_per_hour) and is_major_order_target (a pure membership join). Facts only: NO gambit-viability score or clear-the-origin-in-time verdict, by design. Read-only (records nothing). Under a campaign outage the defense set is UNKNOWN — defenses is null, never an asserted-empty board.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_war_diff",
+    description:
+      "What changed since N hours ago, as deterministic D1-archive arithmetic: each planet's / MO objective's / global counter's FIRST vs LAST archived observation inside the window, with raw before/after values and subtractions — tracked-faction changes, campaigns opened/closed (campaign_id turnover), per-planet delta_health, net health delta grouped by last-observed faction, MO progress deltas, and global counter deltas. Pure archive facts: no significance ranking, no cause attribution, no went-well/badly verdict. insufficient_history when the window predates the archive. Optional until_hours closes the window's upper edge (diff an older band).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since_hours: {
+          type: "number",
+          description:
+            "Window START in hours-back-from-now (default 24). The diff compares first vs last archived observation inside the window.",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours.",
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: "get_planet",
@@ -451,6 +487,19 @@ async function dispatchTool(
       );
     case "get_major_order":
       return toolText(await getMajorOrder(env));
+    case "get_mo_pace":
+      return toolText(await getMoPace(env));
+    case "get_gambits":
+      return toolText(await getGambits(env));
+    case "get_war_diff":
+      return toolText(
+        await getWarDiff(env, {
+          since_hours:
+            typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
+        }),
+      );
     case "get_planet":
       return toolText(
         await getPlanet(env, {
