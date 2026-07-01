@@ -5,7 +5,12 @@
  */
 import { ArchiveError } from "./archive";
 import { UpstreamError } from "./client";
-import { ExportParamError, exportArchive } from "./export";
+import {
+  ExportParamError,
+  collectArchiveCsv,
+  exportArchive,
+  parseExportResourceUri,
+} from "./export";
 import {
   ToolError,
   getCampaigns,
@@ -267,7 +272,12 @@ const TOOL_DEFINITIONS = [
         since_hours: {
           type: "number",
           description:
-            "Look-back window in hours (default 168 = 7 days). Only samples newer than this are returned.",
+            "Look-back window START in hours-back-from-now (default 168 = 7 days). Only samples newer than this are returned.",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours. Lets you page backward through older history in slices (e.g. since_hours: 400, until_hours: 200).",
         },
         limit: {
           type: "number",
@@ -286,7 +296,12 @@ const TOOL_DEFINITIONS = [
       properties: {
         since_hours: {
           type: "number",
-          description: "Look-back window in hours (default 168 = 7 days).",
+          description: "Look-back window START in hours-back-from-now (default 168 = 7 days).",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours. Pages backward through older history in slices.",
         },
         limit: {
           type: "number",
@@ -313,7 +328,12 @@ const TOOL_DEFINITIONS = [
         },
         since_hours: {
           type: "number",
-          description: "Look-back window in hours (default 168 = 7 days).",
+          description: "Look-back window START in hours-back-from-now (default 168 = 7 days).",
+        },
+        until_hours: {
+          type: "number",
+          description:
+            "Optional window END in hours-back-from-now (omit for 'up to now'). Must be SMALLER than since_hours. Pages backward through older history in slices.",
         },
         limit: {
           type: "number",
@@ -326,7 +346,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "export_archive",
     description:
-      "Bulk CSV export of the UNBOUNDED D1 archive, bypassing the 1000-row cap on the get_*_archive tools so the WHOLE history (or an arbitrary window) can be pulled off-context for trend analysis. Returns metadata ONLY — { url, table, bucket, row_count, byte_size_estimate, range, columns, format, generated_at } — NOT the rows: web_fetch the returned `url` to a file to get the streamed CSV. Pick table (global | planet | mo). Optional since/until (ISO-8601) or since_hours/until_hours bound an arbitrary window (both edges, which the JSON tools lack); planet_index filters the planet table to one planet; bucket (raw | hourly | daily) server-side rolls up long ranges (mean of rates/multiplier, last value of counts) into one row per bucket. A faithful verbatim dump of stored rows — no derived/trend columns; trend synthesis stays in the conversation layer. For live rate/ETA/projection use the live tools; this is history.",
+      "Bulk CSV export of the UNBOUNDED D1 archive, bypassing the 1000-row cap on the get_*_archive tools so the WHOLE history (or an arbitrary window) can be pulled off-context for trend analysis. Returns metadata — { url, table, bucket, row_count, byte_size_estimate, range, columns, format, generated_at } — plus a resource_link content item for the same snapshot: read the link (resources/read) to receive the full CSV through the MCP connector, or fetch `url` over plain HTTP; the rows are NEVER inlined in this result. Pick table (global | planet | mo). Optional since/until (ISO-8601) or since_hours/until_hours bound an arbitrary window (both edges, which the JSON tools lack); planet_index filters the planet table to one planet; bucket (raw | hourly | daily) server-side rolls up long ranges (mean of rates/multiplier, last value of counts) into one row per bucket. A faithful verbatim dump of stored rows — no derived/trend columns; trend synthesis stays in the conversation layer. For live rate/ETA/projection use the live tools; this is history.",
     inputSchema: {
       type: "object",
       properties: {
@@ -492,6 +512,8 @@ async function dispatchTool(
           name: typeof args.name === "string" ? args.name : undefined,
           since_hours:
             typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
@@ -500,6 +522,8 @@ async function dispatchTool(
         await getGlobalArchive(env, {
           since_hours:
             typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
@@ -516,6 +540,8 @@ async function dispatchTool(
               : undefined,
           since_hours:
             typeof args.since_hours === "number" ? args.since_hours : undefined,
+          until_hours:
+            typeof args.until_hours === "number" ? args.until_hours : undefined,
           limit: typeof args.limit === "number" ? args.limit : undefined,
         }),
       );
@@ -527,17 +553,32 @@ async function dispatchTool(
       // single-planet export to every planet.
       const numOrStr = (v: unknown): number | string | undefined =>
         typeof v === "number" || typeof v === "string" ? v : undefined;
-      return toolText(
-        await exportArchive(env, origin, {
-          table: typeof args.table === "string" ? args.table : undefined,
-          planet_index: numOrStr(args.planet_index),
-          since: typeof args.since === "string" ? args.since : undefined,
-          until: typeof args.until === "string" ? args.until : undefined,
-          since_hours: numOrStr(args.since_hours),
-          until_hours: numOrStr(args.until_hours),
-          bucket: typeof args.bucket === "string" ? args.bucket : undefined,
-        }),
-      );
+      const meta = await exportArchive(env, origin, {
+        table: typeof args.table === "string" ? args.table : undefined,
+        planet_index: numOrStr(args.planet_index),
+        since: typeof args.since === "string" ? args.since : undefined,
+        until: typeof args.until === "string" ? args.until : undefined,
+        since_hours: numOrStr(args.since_hours),
+        until_hours: numOrStr(args.until_hours),
+        bucket: typeof args.bucket === "string" ? args.bucket : undefined,
+      });
+      // Item 1: the metadata pointer AND an MCP resource_link for the same
+      // frozen snapshot. An in-connector agent (blocked from fetching a
+      // workers.dev URL directly) reads the link via resources/read and the
+      // bytes route through the connector; the plain `url` stays for
+      // browser/CLI use. The rows are still never inlined in this result.
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(meta, null, 2) },
+          {
+            type: "resource_link",
+            uri: meta.url,
+            name: `${meta.table}-archive-${meta.bucket}.csv`,
+            description: `Streamed CSV of the ${meta.table} archive window (${meta.row_count} raw rows${meta.bucket !== "raw" ? `, ${meta.bucket} rollup` : ""}). Read this resource to receive the full file through the MCP connector — not capped at the JSON tools' 1000 rows.`,
+            mimeType: "text/csv",
+          },
+        ],
+      };
     }
     case "get_major_order_history":
       return toolText(
@@ -586,7 +627,7 @@ export async function handleMcpRequest(
           : PROTOCOL_VERSION;
       return rpcResult(id, {
         protocolVersion,
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, resources: {} },
         serverInfo: {
           name: "hd2-strategist",
           version: "0.1.0",
@@ -598,6 +639,51 @@ export async function handleMcpRequest(
       return rpcResult(id, {});
     case "tools/list":
       return rpcResult(id, { tools: TOOL_DEFINITIONS });
+    // Item 1: export resources. The server mints resource URIs dynamically —
+    // one per export_archive call (the tool result's resource_link) — so the
+    // static list is empty; resources/read serves any minted export URI.
+    case "resources/list":
+      return rpcResult(id, { resources: [] });
+    case "resources/templates/list":
+      return rpcResult(id, { resourceTemplates: [] });
+    case "resources/read": {
+      const uri = typeof params.uri === "string" ? params.uri : "";
+      let exportParams;
+      try {
+        exportParams = parseExportResourceUri(uri, Date.now());
+      } catch (err) {
+        if (err instanceof ExportParamError) {
+          return rpcError(id, -32602, err.message);
+        }
+        throw err;
+      }
+      if (exportParams === null) {
+        return rpcError(
+          id,
+          -32002,
+          `Resource not found: "${uri}". This server only serves archive-export resources minted by the export_archive tool (path /export/archive).`,
+        );
+      }
+      try {
+        // The SAME keyset-paginated read path as the HTTP route, buffered into
+        // one contents item (resources/read is a single JSON-RPC response).
+        // The URI carries the frozen window + max_id watermark, so the bytes
+        // match the metadata the tool returned.
+        const text = await collectArchiveCsv(env, exportParams);
+        return rpcResult(id, {
+          contents: [{ uri, mimeType: "text/csv", text }],
+        });
+      } catch (err) {
+        if (err instanceof ArchiveError || err instanceof ExportParamError) {
+          return rpcError(id, -32603, err.message);
+        }
+        return rpcError(
+          id,
+          -32603,
+          "Internal error while reading the export resource.",
+        );
+      }
+    }
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
       const args =

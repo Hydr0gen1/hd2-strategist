@@ -604,6 +604,30 @@ async function* csvChunks(
   }
 }
 
+/**
+ * Collect the whole CSV as ONE string — the MCP `resources/read` transport
+ * (item 1: the resource_link handoff). An in-connector agent cannot fetch a
+ * workers.dev URL over HTTP (egress-blocked), so the SAME keyset-paginated,
+ * parameter-bound query path is exposed as an MCP resource: the bytes route
+ * through the connector instead of the open internet. This buffers the file in
+ * Worker memory (resources/read is a single JSON-RPC response, not a stream) —
+ * fine for the small archive row shapes well past millions of rows; the HTTP
+ * route remains the zero-buffer path for browser/CLI use. READ-ONLY, same as
+ * the rest of the module.
+ */
+export async function collectArchiveCsv(
+  env: Env,
+  params: ExportParams,
+  pageSize: number = PAGE_SIZE,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let out = "";
+  for await (const chunk of csvChunks(env, params, pageSize)) {
+    out += decoder.decode(chunk);
+  }
+  return out;
+}
+
 /** Build a streamed CSV Response driven by a backpressure-aware `pull()`: each
  * `pull` advances the chunk generator by one chunk, so the runtime only asks for
  * (and only then fetches/builds) the next chunk when the consumer has demand. A
@@ -704,17 +728,50 @@ export interface ExportArchiveArgs {
   bucket?: string;
 }
 
+/** The typed subset of the export_archive metadata the MCP layer needs to
+ * compose the resource_link content item; the rest rides as extra keys. */
+export interface ExportArchiveMeta {
+  url: string;
+  table: ExportTable;
+  bucket: Bucket;
+  row_count: number;
+  [key: string]: unknown;
+}
+
+/**
+ * Item 1 (resource_link transport): recover the ExportParams from a previously
+ * issued export URL so `resources/read` can serve the SAME frozen snapshot the
+ * metadata described (the URL carries the resolved ISO window + the max_id
+ * watermark). Returns null when the URI is not an export-archive URI at all;
+ * a malformed query on a matching path throws ExportParamError.
+ */
+export function parseExportResourceUri(
+  uri: string,
+  nowMs: number,
+): ExportParams | null {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return null;
+  }
+  if (url.pathname !== "/export/archive") return null;
+  return parseExportParams((k) => url.searchParams.get(k), nowMs);
+}
+
 /**
  * The `export_archive` tool body: build the URL + shape metadata. Returns NO
- * rows — just the pointer the agent fetches over HTTP. `row_count` is the raw
- * COUNT(*) over the same predicate (so the agent knows the size before
- * fetching), even under a bucket (where the file itself is smaller).
+ * rows — just the pointer. The MCP layer attaches a `resource_link` content
+ * item for the same URL, so an in-connector agent reads the bytes via
+ * `resources/read` while a browser/CLI fetches the URL over HTTP. `row_count`
+ * is the raw COUNT(*) over the same predicate (so the agent knows the size
+ * before fetching), even under a bucket (where the file itself is smaller).
  */
 export async function exportArchive(
   env: Env,
   origin: string,
   args: ExportArchiveArgs,
-): Promise<unknown> {
+): Promise<ExportArchiveMeta> {
   const nowMs = Date.now();
   // Reuse the exact same parsing as the HTTP route by adapting the args object
   // to the string-getter shape, so the tool and the route can never diverge.
@@ -770,7 +827,7 @@ export async function exportArchive(
     generated_at: new Date(nowMs).toISOString(),
     notes: {
       transport:
-        "Fetch `url` over HTTP to a file — the rows are delivered as a streamed CSV, never inlined here (that would re-hit the context wall). This object is the pointer + shape only.",
+        "Two ways to get the bytes, both serving the SAME frozen snapshot: (1) the resource_link content item beside this JSON — read it via resources/read to receive the CSV through the MCP connector (works when direct HTTP egress to the worker is blocked); (2) fetch `url` over plain HTTP to a file. The rows are never inlined here (that would re-hit the context wall). This object is the pointer + shape only.",
       row_count:
         "Raw stored-row count over the same window predicate (before any bucket rollup). Under bucket != 'raw' the CSV has fewer rows than this — one per (key, time bucket).",
       ...(params.bucket !== "raw"

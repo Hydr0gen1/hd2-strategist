@@ -290,26 +290,41 @@ async function runArchiveQuery<T>(
   }
 }
 
+/** Optional inclusive upper window edge (item 2): `AND sampled_at <= ?` when a
+ * cutoff is supplied, byte-identical SQL when it is not — so an until-less call
+ * matches the pre-item-2 query exactly. */
+function untilClause(untilMs: number | null | undefined): {
+  sql: string;
+  binds: number[];
+} {
+  return untilMs != null
+    ? { sql: " AND sampled_at <= ?", binds: [untilMs] }
+    : { sql: "", binds: [] };
+}
+
 /** Long-range planet samples within the window — the NEWEST `limit` rows when
  * capped (selected DESC, then re-sorted ascending for presentation), so a
- * busy window never silently drops its most recent points. */
+ * busy window never silently drops its most recent points. `untilMs` (item 2)
+ * closes the window's upper edge so older bands can be paged. */
 export async function readPlanetArchive(
   env: Env,
   planetIndex: number,
   sinceMs: number,
   limit: number,
+  untilMs: number | null = null,
 ): Promise<PlanetArchiveRow[]> {
   const db = requireDb(env);
+  const until = untilClause(untilMs);
   const rows = await runArchiveQuery<PlanetArchiveRow>(
     db
       .prepare(
         `SELECT planet_index, sampled_at, health, max_health, hp_per_hour, campaign_id, campaign_kind, faction
            FROM planet_samples
-          WHERE planet_index = ? AND sampled_at >= ?
+          WHERE planet_index = ? AND sampled_at >= ?${until.sql}
           ORDER BY sampled_at DESC
           LIMIT ?`,
       )
-      .bind(planetIndex, sinceMs, limit),
+      .bind(planetIndex, sinceMs, ...until.binds, limit),
     "planet archive",
   );
   return rows.sort((a, b) => a.sampled_at - b.sampled_at);
@@ -321,19 +336,21 @@ export async function readGlobalArchive(
   env: Env,
   sinceMs: number,
   limit: number,
+  untilMs: number | null = null,
 ): Promise<GlobalArchiveRow[]> {
   const db = requireDb(env);
+  const until = untilClause(untilMs);
   const rows = await runArchiveQuery<GlobalArchiveRow>(
     db
       .prepare(
         `SELECT sampled_at, player_count, impact_multiplier, active_campaign_count,
                 missions_won, missions_lost, deaths, terminid_kills, automaton_kills, illuminate_kills
            FROM global_samples
-          WHERE sampled_at >= ?
+          WHERE sampled_at >= ?${until.sql}
           ORDER BY sampled_at DESC
           LIMIT ?`,
       )
-      .bind(sinceMs, limit),
+      .bind(sinceMs, ...until.binds, limit),
     "global archive",
   );
   return rows.sort((a, b) => a.sampled_at - b.sampled_at);
@@ -350,11 +367,19 @@ export async function readMoArchive(
   env: Env,
   sinceMs: number,
   limit: number,
-  filters: { majorOrderId?: number; objectiveIndex?: number } = {},
+  filters: {
+    majorOrderId?: number;
+    objectiveIndex?: number;
+    untilMs?: number | null;
+  } = {},
 ): Promise<MoArchiveRow[]> {
   const db = requireDb(env);
   const where: string[] = ["sampled_at >= ?"];
   const binds: unknown[] = [sinceMs];
+  if (filters.untilMs != null) {
+    where.push("sampled_at <= ?");
+    binds.push(filters.untilMs);
+  }
   if (filters.majorOrderId != null) {
     where.push("major_order_id = ?");
     binds.push(filters.majorOrderId);
@@ -395,4 +420,17 @@ export function sinceCutoffMs(
       ? sinceHours
       : ARCHIVE_DEFAULT_SINCE_HOURS;
   return nowMs - hours * 3_600_000;
+}
+
+/** Item 2: resolve an optional end-of-window (hours back from now) to an
+ * absolute epoch-ms cutoff. Absent/invalid → null (open upper edge, the
+ * pre-item-2 behavior). 0 is valid ("up to now"). */
+export function untilCutoffMs(
+  untilHours: number | undefined,
+  nowMs: number,
+): number | null {
+  if (untilHours == null || !Number.isFinite(untilHours) || untilHours < 0) {
+    return null;
+  }
+  return nowMs - untilHours * 3_600_000;
 }

@@ -14,6 +14,7 @@ import {
   readMoArchive,
   readPlanetArchive,
   sinceCutoffMs,
+  untilCutoffMs,
 } from "./archive";
 import {
   cacheBulkPlanets,
@@ -1919,6 +1920,28 @@ const ARCHIVE_RETENTION_NOTE =
 const ARCHIVE_SAMPLING_NOTE =
   "Observed data points and deterministic consecutive deltas only — no smoothing, no forecast, no trend verdict. Sample timestamps use the Worker clock (upstream war time is game-epoch and not comparable). These are the SAME observations the KV history tools serve, persisted durably; the two views can differ only by time range, never by interpretation.";
 
+const ARCHIVE_WINDOW_NOTE =
+  "The window has BOTH edges: since_hours (start, hours back from now — default 168) and optional until_hours (end, hours back from now; omit for 'up to now'). since_hours must be LARGER than until_hours (further back). With more rows in the window than `limit`, the NEWEST rows are returned — page backward through older history by walking until_hours outward (e.g. since_hours: 400, until_hours: 200, then 600/400, …); adjacent slices reconstruct the full table.";
+
+/**
+ * Item 2: resolve the two-edged archive window from the tool args. The upper
+ * edge is optional (absent = up to now); an inverted pair (until further back
+ * than since) is an empty window and rejected loudly rather than returning [].
+ */
+function archiveWindow(
+  args: { since_hours?: number; until_hours?: number },
+  nowMs: number,
+): { sinceMs: number; untilMs: number | null } {
+  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
+  const untilMs = untilCutoffMs(args.until_hours, nowMs);
+  if (untilMs != null && sinceMs > untilMs) {
+    throw new ToolError(
+      `Empty window: since_hours (${args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS}) must be LARGER than until_hours (${args.until_hours}) — both count hours back from now, so the window start must lie further back than its end.`,
+    );
+  }
+  return { sinceMs, untilMs };
+}
+
 /**
  * Stage 12: a planet's UNBOUNDED observed health series from the D1 archive —
  * the long-range counterpart to get_planet_history's recent KV window. Resolves
@@ -1928,7 +1951,13 @@ const ARCHIVE_SAMPLING_NOTE =
  */
 export async function getPlanetArchive(
   env: Env,
-  args: { index?: number; name?: string; since_hours?: number; limit?: number },
+  args: {
+    index?: number;
+    name?: string;
+    since_hours?: number;
+    until_hours?: number;
+    limit?: number;
+  },
 ): Promise<unknown> {
   assertPlanetArgs(args);
 
@@ -1948,8 +1977,14 @@ export async function getPlanetArchive(
 
   const nowMs = Date.now();
   const limit = clampLimit(args.limit);
-  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
-  const rows = await readPlanetArchive(env, planet.index, sinceMs, limit);
+  const { sinceMs, untilMs } = archiveWindow(args, nowMs);
+  const rows = await readPlanetArchive(
+    env,
+    planet.index,
+    sinceMs,
+    limit,
+    untilMs,
+  );
   const points = buildPlanetArchivePoints(rows);
   const first = rows[0];
   const last = rows[rows.length - 1];
@@ -1959,6 +1994,7 @@ export async function getPlanetArchive(
     planet_name: planet.name,
     source: "d1_archive",
     since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    ...(args.until_hours != null ? { until_hours: args.until_hours } : {}),
     limit,
     max_limit: ARCHIVE_MAX_LIMIT,
     truncated: rows.length === limit,
@@ -1981,6 +2017,7 @@ export async function getPlanetArchive(
       delta_health:
         "Raw observed change per point: current − previous health (negative = health depleting). hp_per_hour stored on each point uses the opposite orientation, (previous − current) / hours, positive = progressing toward resolution. Both conventions apply to defense campaigns identically (the tracked health is the EVENT health, which depletes toward zero while the defense is won).",
       hp_per_hour: RATE_SIGN_NOTE,
+      window: ARCHIVE_WINDOW_NOTE,
       sampling: ARCHIVE_SAMPLING_NOTE,
       retention: ARCHIVE_RETENTION_NOTE,
       freshness: FRESHNESS_NOTE,
@@ -1999,12 +2036,12 @@ export async function getPlanetArchive(
  */
 export async function getGlobalArchive(
   env: Env,
-  args: { since_hours?: number; limit?: number },
+  args: { since_hours?: number; until_hours?: number; limit?: number },
 ): Promise<unknown> {
   const nowMs = Date.now();
   const limit = clampLimit(args.limit);
-  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
-  const rows = await readGlobalArchive(env, sinceMs, limit);
+  const { sinceMs, untilMs } = archiveWindow(args, nowMs);
+  const rows = await readGlobalArchive(env, sinceMs, limit, untilMs);
   const points = buildGlobalArchivePoints(rows);
   const first = rows[0];
   const last = rows[rows.length - 1];
@@ -2012,6 +2049,7 @@ export async function getGlobalArchive(
   return {
     source: "d1_archive",
     since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    ...(args.until_hours != null ? { until_hours: args.until_hours } : {}),
     limit,
     max_limit: ARCHIVE_MAX_LIMIT,
     truncated: rows.length === limit,
@@ -2032,6 +2070,7 @@ export async function getGlobalArchive(
       : {}),
     notes: {
       sampling: ARCHIVE_SAMPLING_NOTE,
+      window: ARCHIVE_WINDOW_NOTE,
       impact_multiplier:
         "The raw upstream war.impactMultiplier observed at sample time, with active_campaign_count co-sampled beside it. Over a multi-day window the daily population cycle and the multiplier relationship become legible — but any correlation, model, or prediction relating them is for the consumer to read off the curves; the server computes none.",
       retention: ARCHIVE_RETENTION_NOTE,
@@ -2053,15 +2092,17 @@ export async function getMajorOrderArchive(
     major_order_id?: number;
     objective_index?: number;
     since_hours?: number;
+    until_hours?: number;
     limit?: number;
   },
 ): Promise<unknown> {
   const nowMs = Date.now();
   const limit = clampLimit(args.limit);
-  const sinceMs = sinceCutoffMs(args.since_hours, nowMs);
+  const { sinceMs, untilMs } = archiveWindow(args, nowMs);
   const rows = await readMoArchive(env, sinceMs, limit, {
     majorOrderId: args.major_order_id,
     objectiveIndex: args.objective_index,
+    untilMs,
   });
   const series = buildMoArchiveSeries(rows);
   const retainedIds = [...new Set(rows.map((r) => r.major_order_id))];
@@ -2069,6 +2110,7 @@ export async function getMajorOrderArchive(
   return {
     source: "d1_archive",
     since_hours: args.since_hours ?? ARCHIVE_DEFAULT_SINCE_HOURS,
+    ...(args.until_hours != null ? { until_hours: args.until_hours } : {}),
     limit,
     max_limit: ARCHIVE_MAX_LIMIT,
     truncated: rows.length === limit,
@@ -2094,6 +2136,7 @@ export async function getMajorOrderArchive(
       : {}),
     notes: {
       sampling: ARCHIVE_SAMPLING_NOTE,
+      window: ARCHIVE_WINDOW_NOTE,
       deltas:
         "delta_progress / delta_hours are raw differences between consecutive OBSERVATIONS — never a projection. No forecast, completion estimate, required pace, or on-track/behind verdict exists anywhere in this payload by design; pace judgment belongs to the consumer, grounded on these observed points.",
       progress_pct:
