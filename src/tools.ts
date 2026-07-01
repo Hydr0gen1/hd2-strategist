@@ -17,6 +17,7 @@ import {
   readGlobalSampleTimestamps,
   readMoArchive,
   readMoEdgeRows,
+  readMoOutcomes,
   readPlanetArchive,
   readPlanetEdgeRows,
   readQuarantineSummary,
@@ -2128,11 +2129,16 @@ export async function getMajorOrderArchive(
   const nowMs = Date.now();
   const limit = clampLimit(args.limit);
   const { sinceMs, untilMs } = archiveWindow(args, nowMs);
-  const rows = await readMoArchive(env, sinceMs, limit, {
-    majorOrderId: args.major_order_id,
-    objectiveIndex: args.objective_index,
-    untilMs,
-  });
+  const [rows, outcomes] = await Promise.all([
+    readMoArchive(env, sinceMs, limit, {
+      majorOrderId: args.major_order_id,
+      objectiveIndex: args.objective_index,
+      untilMs,
+    }),
+    // Item 10: past-order outcomes ride the same archive read. Null when the
+    // mo_outcomes migration is not applied yet (noted, never an error).
+    readMoOutcomes(env, { majorOrderId: args.major_order_id }),
+  ]);
   const series = buildMoArchiveSeries(rows);
   const retainedIds = [...new Set(rows.map((r) => r.major_order_id))];
 
@@ -2158,6 +2164,19 @@ export async function getMajorOrderArchive(
     archived_major_order_ids: retainedIds,
     series_count: series.length,
     series,
+    // Item 10: the outcome log — each completed order's final observed state
+    // per objective (recorded when the order left the live assignments set).
+    outcomes: outcomes?.map((o) => ({
+      ...o,
+      recorded_at_iso: new Date(o.recorded_at).toISOString(),
+      target_reached: o.target_reached == null ? null : o.target_reached === 1,
+    })),
+    ...(outcomes == null
+      ? {
+          outcomes_note:
+            "The mo_outcomes table is not readable — migration 0004_mo_outcomes.sql has likely not been applied. Run `wrangler d1 migrations apply hd2-strategist-history --remote`.",
+        }
+      : {}),
     ...(series.length === 0
       ? {
           note: "No archived Major Order progress in the requested window. Samples accrue whenever the server polls campaigns (request polls + the 10-minute cron); a cold start, a too-narrow since_hours, or a major_order_id never sampled is expected to be empty, not an error.",
@@ -2172,6 +2191,8 @@ export async function getMajorOrderArchive(
         "latest_progress / target × 100, from the newest archived sample — deterministic; null when the target is 0 or unknown or progress is unknown.",
       objective_kind:
         "Always null in the archive: the D1 schema does not store the raw task_type, so the objective-kind label is not decoded here. get_major_order_history (the recent KV view) carries it. progress/target are identical between the two.",
+      outcomes:
+        "One row per objective of each COMPLETED Major Order, recorded when the order was observed to leave the live assignments set: the final retained progress/target sample, final_progress_pct, and target_reached — the plain comparison final_progress >= target at the last observation (null when either side is unknown). A deterministic record of observed final state; no success-trend analysis or cause attribution is derived from it. Detection is observational: an order that ended inside a sampling gap is recorded on the next poll with its last-seen state.",
       retention: ARCHIVE_RETENTION_NOTE,
     },
     queried_at: new Date(nowMs).toISOString(),

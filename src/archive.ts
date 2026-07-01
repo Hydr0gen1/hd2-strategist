@@ -116,6 +116,24 @@ export interface QuarantineRow {
   tick_anchor: number;
 }
 
+/** Item 10: one Major Order objective's final observed state, recorded when
+ * the order leaves the live assignments set. `target_reached` is the plain
+ * comparison final_progress >= target (null when either side is unknown) —
+ * a deterministic record of the observed end state, not an analysis. The
+ * natural PK makes the INSERT OR IGNORE idempotent across re-detections. */
+export interface MoOutcomeRow {
+  major_order_id: number;
+  objective_index: number;
+  task_type: number | null;
+  final_progress: number | null;
+  target: number | null;
+  final_progress_pct: number | null;
+  target_reached: 0 | 1 | null;
+  first_observed_at: number | null;
+  last_observed_at: number | null;
+  recorded_at: number;
+}
+
 /** One sample tick's archive payload — exactly the observations that were just
  * committed to KV as NEW this cycle. The caller (client.ts) gates each section
  * by the SAME 60s interval that governs the KV write, so a within-60s replay
@@ -123,13 +141,16 @@ export interface QuarantineRow {
  * the second, atomic line of defense against concurrent overlapping polls.
  * `quarantined` (item 7) carries rows the plausibility screen diverted from a
  * live table — recorded to quarantined_samples in the SAME batch, never
- * silently dropped. */
+ * silently dropped. `moOutcomes` (item 10) carries the final observed state of
+ * orders that just left the live assignments set — idempotent on the natural
+ * PK. */
 export interface ArchiveTick {
   planets: PlanetArchiveWriteRow[];
   global: GlobalArchiveWriteRow | null;
   mo: MoArchiveWriteRow[];
   signatures: SignatureArchiveRow[];
   quarantined?: QuarantineRow[];
+  moOutcomes?: MoOutcomeRow[];
 }
 
 /** Stable signature key for the observed_signatures primary key — deterministic
@@ -158,12 +179,14 @@ export async function archiveSampleTick(
   const db = env.HISTORY_DB;
   if (!db) return;
   const quarantined = tick.quarantined ?? [];
+  const moOutcomes = tick.moOutcomes ?? [];
   if (
     tick.planets.length === 0 &&
     tick.global == null &&
     tick.mo.length === 0 &&
     tick.signatures.length === 0 &&
-    quarantined.length === 0
+    quarantined.length === 0 &&
+    moOutcomes.length === 0
   ) {
     return;
   }
@@ -285,6 +308,34 @@ export async function archiveSampleTick(
             q.detail,
             q.row_json,
             q.tick_anchor,
+          ),
+        );
+      }
+    }
+
+    if (moOutcomes.length > 0) {
+      // Item 10: the observed end state of orders that just left the live
+      // assignments set. Natural-PK INSERT OR IGNORE — re-detections while
+      // the retired series is still retained are no-ops.
+      const stmt = db.prepare(
+        `INSERT OR IGNORE INTO mo_outcomes
+           (major_order_id, objective_index, task_type, final_progress, target,
+            final_progress_pct, target_reached, first_observed_at, last_observed_at, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const o of moOutcomes) {
+        batch.push(
+          stmt.bind(
+            o.major_order_id,
+            o.objective_index,
+            o.task_type,
+            o.final_progress,
+            o.target,
+            o.final_progress_pct,
+            o.target_reached,
+            o.first_observed_at,
+            o.last_observed_at,
+            o.recorded_at,
           ),
         );
       }
@@ -542,6 +593,37 @@ export async function readArchiveCoverage(
   return rows[0] ?? { earliest: null, latest: null };
 }
 
+/** Item 10: past Major Order outcomes, newest recorded first, optionally
+ * narrowed to one MO id. Degrades to null when the mo_outcomes table is not
+ * readable yet (migration 0004 not applied) — the caller notes it rather than
+ * failing the whole archive read. */
+export async function readMoOutcomes(
+  env: Env,
+  filters: { majorOrderId?: number } = {},
+  limit = 100,
+): Promise<MoOutcomeRow[] | null> {
+  const db = requireDb(env);
+  try {
+    const where =
+      filters.majorOrderId != null ? " WHERE major_order_id = ?" : "";
+    const binds: unknown[] =
+      filters.majorOrderId != null ? [filters.majorOrderId, limit] : [limit];
+    const res = await db
+      .prepare(
+        `SELECT major_order_id, objective_index, task_type, final_progress, target,
+                final_progress_pct, target_reached, first_observed_at, last_observed_at, recorded_at
+           FROM mo_outcomes${where}
+          ORDER BY recorded_at DESC, major_order_id DESC, objective_index ASC
+          LIMIT ?`,
+      )
+      .bind(...binds)
+      .all<MoOutcomeRow>();
+    return res.results ?? [];
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------------
  * Item 8 (get_health): self-report reads. All plain SELECTs; a missing
  * quarantine table (migration 0003 not applied) degrades that section rather
@@ -554,6 +636,7 @@ const HEALTH_TABLES = [
   "mo_progress_samples",
   "observed_signatures",
   "quarantined_samples",
+  "mo_outcomes",
 ] as const;
 export type HealthTable = (typeof HEALTH_TABLES)[number];
 
