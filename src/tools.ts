@@ -10,16 +10,20 @@ import {
   ARCHIVE_DEFAULT_SINCE_HOURS,
   ARCHIVE_MAX_LIMIT,
   clampLimit,
+  readArchiveCounts,
   readArchiveCoverage,
   readGlobalArchive,
   readGlobalEdgeRow,
+  readGlobalSampleTimestamps,
   readMoArchive,
   readMoEdgeRows,
   readPlanetArchive,
   readPlanetEdgeRows,
+  readQuarantineSummary,
   sinceCutoffMs,
   untilCutoffMs,
 } from "./archive";
+import { buildGapList, cadenceStats } from "./integrity";
 import {
   cacheBulkPlanets,
   commitSampleTick,
@@ -2429,4 +2433,108 @@ export async function getWarDiff(
     },
     queried_at: new Date(nowMs).toISOString(),
   };
+}
+
+/* ------------------------------------------------------------------------
+ * Item 8: get_health — the server's self-report. Deterministic counts and
+ * spacing facts over the server's OWN record (the D1 archive + quarantine
+ * table): row counts per table, the recent gap list, cadence adherence, and
+ * quarantine tallies. It reports what was (and was not) recorded; attributing
+ * WHY a tick is missing (outage vs a degraded-provenance tick that correctly
+ * recorded nothing) is the consumer's — the archive cannot distinguish them
+ * by design (degraded data is never recorded).
+ * ---------------------------------------------------------------------- */
+
+/** The cron cadence the health report measures against (wrangler.toml). */
+export const HEALTH_EXPECTED_INTERVAL_MS = 10 * 60_000;
+/** A spacing above this is reported as a gap (the spec's >15 min rule). */
+export const HEALTH_GAP_THRESHOLD_MS = 15 * 60_000;
+const HEALTH_DEFAULT_SINCE_HOURS = 7 * 24;
+/** 7 days at the 10-minute cadence is ~1008 samples; leave headroom. */
+const HEALTH_TIMESTAMP_LIMIT = 2_000;
+const HEALTH_RECENT_QUARANTINE_LIMIT = 20;
+
+export async function getHealth(
+  env: Env,
+  args: { since_hours?: number } = {},
+): Promise<unknown> {
+  const nowMs = Date.now();
+  const sinceHours =
+    args.since_hours != null &&
+    Number.isFinite(args.since_hours) &&
+    args.since_hours > 0
+      ? args.since_hours
+      : HEALTH_DEFAULT_SINCE_HOURS;
+  const sinceMs = nowMs - sinceHours * 3_600_000;
+
+  const [counts, coverage, timestamps, quarantine] = await Promise.all([
+    readArchiveCounts(env),
+    readArchiveCoverage(env),
+    readGlobalSampleTimestamps(env, sinceMs, HEALTH_TIMESTAMP_LIMIT),
+    readQuarantineSummary(env, HEALTH_RECENT_QUARANTINE_LIMIT),
+  ]);
+
+  const gaps = buildGapList(timestamps, HEALTH_GAP_THRESHOLD_MS);
+  const cadence = cadenceStats(
+    timestamps,
+    HEALTH_EXPECTED_INTERVAL_MS,
+    HEALTH_GAP_THRESHOLD_MS,
+  );
+
+  return {
+    source: "d1_archive",
+    since_hours: sinceHours,
+    archive_row_counts: counts,
+    archive_coverage: {
+      earliest:
+        coverage.earliest != null
+          ? new Date(coverage.earliest).toISOString()
+          : null,
+      latest:
+        coverage.latest != null
+          ? new Date(coverage.latest).toISOString()
+          : null,
+    },
+    cadence: {
+      expected_interval_minutes: HEALTH_EXPECTED_INTERVAL_MS / 60_000,
+      gap_threshold_minutes: HEALTH_GAP_THRESHOLD_MS / 60_000,
+      ...cadence,
+    },
+    gap_count: gaps.length,
+    gaps,
+    quarantine: {
+      counts_by_reason: quarantine.counts_by_reason,
+      recent: quarantine.recent?.map((q) => ({
+        table_name: q.table_name,
+        subject_key: q.subject_key,
+        sampled_at: q.sampled_at,
+        observed_at: new Date(q.sampled_at).toISOString(),
+        reason: q.reason,
+        detail: safeJsonParse(q.detail),
+        row: safeJsonParse(q.row_json),
+      })),
+      ...(quarantine.counts_by_reason == null
+        ? {
+            note: "The quarantine table is not readable — migration 0003_quarantine.sql has likely not been applied. Run `wrangler d1 migrations apply hd2-strategist-history --remote`.",
+          }
+        : {}),
+    },
+    notes: {
+      cadence:
+        "Deterministic spacing facts over the archived global sample timestamps in the window (the cron-driven record). A gap or an expected-vs-archived shortfall means NOTHING WAS RECORDED there — which, by the persistence gate's design, covers both a genuine outage and a degraded-provenance tick that correctly recorded nothing; the archive cannot (and does not) attribute the cause.",
+      quarantine:
+        "Rows the item-7 plausibility screen diverted from the live archive (the known sentinel signature, or a delta outside the recent mean ± 6σ delta band). Each entry carries the reason, both sides of the comparison (detail), and the excluded row verbatim — flagged, never corrected, never silently dropped. Quarantined observations were still SERVED live at the time; they are only absent from the durable record.",
+      row_counts:
+        "Plain COUNT(*) per archive table; null means that table could not be read (commonly: its migration is not applied yet).",
+    },
+    queried_at: new Date(nowMs).toISOString(),
+  };
+}
+
+function safeJsonParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }

@@ -11,8 +11,10 @@ import {
   type GlobalArchiveWriteRow,
   type MoArchiveWriteRow,
   type PlanetArchiveWriteRow,
+  type QuarantineRow,
   type SignatureArchiveRow,
 } from "./archive";
+import { screenGlobalRow } from "./integrity";
 import {
   advanceGlobalSeries,
   advanceMoSeries,
@@ -601,7 +603,7 @@ function buildArchiveTick(
   // Global sample committed iff the series gained a point at this tick.
   const globalTail = global[global.length - 1];
   const globalCommitted = globalTail != null && globalTail.t === nowMs;
-  const globalRow: GlobalArchiveWriteRow | null =
+  let globalRow: GlobalArchiveWriteRow | null =
     globalCommitted && globalTail
       ? {
           sampled_at: nowMs,
@@ -620,6 +622,35 @@ function buildArchiveTick(
           ),
         }
       : null;
+
+  // Item 7: plausibility screen on the archive-bound global row — the known
+  // sentinel signature + the Nσ delta-outlier rule over the RECENT (pre-
+  // advance) series. A failing row is DIVERTED to quarantined_samples with
+  // its reason and both sides of the comparison — never silently dropped,
+  // never written to the live table. The KV ring buffer above is untouched
+  // (frozen path): the observation is still served live, only the durable
+  // archive is screened. The allFresh gate is unchanged — this branch runs
+  // strictly after it, at row-assembly time.
+  const quarantined: QuarantineRow[] = [];
+  if (globalRow) {
+    // The recent series EXCLUDING this tick's point: the old store's tail.
+    const recent = store.global ?? [];
+    const findings = screenGlobalRow(globalRow, recent);
+    if (findings.length > 0) {
+      // ONE quarantine row per diverted subject (the dedup index is keyed on
+      // table/subject/anchor); every finding rides the detail JSON.
+      quarantined.push({
+        table_name: "global_samples",
+        subject_key: "global",
+        sampled_at: nowMs,
+        reason: findings[0]!.reason,
+        detail: JSON.stringify(findings.map((f) => f.detail)),
+        row_json: JSON.stringify(globalRow),
+        tick_anchor: globalRow.tick_anchor,
+      });
+      globalRow = null;
+    }
+  }
 
   // MO rows: one per series that gained a sample at this tick (a series carried
   // forward unchanged keeps an older tail and is skipped). Each anchors on its
@@ -676,6 +707,7 @@ function buildArchiveTick(
     global: globalRow,
     mo: moRows,
     signatures: signatureRows,
+    quarantined,
   };
 }
 

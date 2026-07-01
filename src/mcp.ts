@@ -18,6 +18,7 @@ import {
   getGambits,
   getGlobalArchive,
   getGlobalHistory,
+  getHealth,
   getMajorOrder,
   getMajorOrderArchive,
   getMajorOrderHistory,
@@ -380,6 +381,22 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "get_health",
+    description:
+      "The server's self-report over its OWN record: archive row counts per table, archive coverage, the recent gap list (spacings > 15 min between archived global samples), cadence adherence against the 10-minute cron, and quarantine tallies (rows the plausibility screen diverted from the live archive, each with its reason, both sides of the comparison, and the excluded row verbatim). Deterministic counts and spacing facts only — a gap means nothing was recorded there (an outage OR a degraded-provenance tick that correctly recorded nothing; the archive cannot attribute which). Answers 'is the tool okay?' without judgment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since_hours: {
+          type: "number",
+          description:
+            "Window for the gap/cadence analysis in hours-back-from-now (default 168 = 7 days). Row counts and quarantine tallies are whole-archive regardless.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "export_archive",
     description:
       "Bulk CSV export of the UNBOUNDED D1 archive, bypassing the 1000-row cap on the get_*_archive tools so the WHOLE history (or an arbitrary window) can be pulled off-context for trend analysis. Returns metadata — { url, table, bucket, row_count, byte_size_estimate, range, columns, format, generated_at } — plus a resource_link content item for the same snapshot: read the link (resources/read) to receive the full CSV through the MCP connector, or fetch `url` over plain HTTP; the rows are NEVER inlined in this result. Pick table (global | planet | mo). Optional since/until (ISO-8601) or since_hours/until_hours bound an arbitrary window (both edges, which the JSON tools lack); planet_index filters the planet table to one planet; bucket (raw | hourly | daily) server-side rolls up long ranges (mean of rates/multiplier, last value of counts) into one row per bucket. A faithful verbatim dump of stored rows — no derived/trend columns; trend synthesis stays in the conversation layer. For live rate/ETA/projection use the live tools; this is history.",
@@ -491,6 +508,13 @@ async function dispatchTool(
       return toolText(await getMoPace(env));
     case "get_gambits":
       return toolText(await getGambits(env));
+    case "get_health":
+      return toolText(
+        await getHealth(env, {
+          since_hours:
+            typeof args.since_hours === "number" ? args.since_hours : undefined,
+        }),
+      );
     case "get_war_diff":
       return toolText(
         await getWarDiff(env, {

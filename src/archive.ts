@@ -103,16 +103,33 @@ export interface MoArchiveWriteRow extends MoArchiveRow {
   tick_anchor: number;
 }
 
+/** Item 7: one quarantined row — a screened-out observation diverted from its
+ * live archive table, with the machine-readable reason and both sides of the
+ * comparison. Flag-never-correct: `row_json` holds the excluded row verbatim. */
+export interface QuarantineRow {
+  table_name: string;
+  subject_key: string;
+  sampled_at: number;
+  reason: string;
+  detail: string; // JSON
+  row_json: string; // JSON, the excluded row verbatim
+  tick_anchor: number;
+}
+
 /** One sample tick's archive payload — exactly the observations that were just
  * committed to KV as NEW this cycle. The caller (client.ts) gates each section
  * by the SAME 60s interval that governs the KV write, so a within-60s replay
  * produces an empty tick and inserts nothing; the tick_anchor unique index is
- * the second, atomic line of defense against concurrent overlapping polls. */
+ * the second, atomic line of defense against concurrent overlapping polls.
+ * `quarantined` (item 7) carries rows the plausibility screen diverted from a
+ * live table — recorded to quarantined_samples in the SAME batch, never
+ * silently dropped. */
 export interface ArchiveTick {
   planets: PlanetArchiveWriteRow[];
   global: GlobalArchiveWriteRow | null;
   mo: MoArchiveWriteRow[];
   signatures: SignatureArchiveRow[];
+  quarantined?: QuarantineRow[];
 }
 
 /** Stable signature key for the observed_signatures primary key — deterministic
@@ -140,11 +157,13 @@ export async function archiveSampleTick(
 ): Promise<void> {
   const db = env.HISTORY_DB;
   if (!db) return;
+  const quarantined = tick.quarantined ?? [];
   if (
     tick.planets.length === 0 &&
     tick.global == null &&
     tick.mo.length === 0 &&
-    tick.signatures.length === 0
+    tick.signatures.length === 0 &&
+    quarantined.length === 0
   ) {
     return;
   }
@@ -242,6 +261,30 @@ export async function archiveSampleTick(
             r.faction,
             r.seen_at, // first_seen (ignored on conflict — preserved)
             r.seen_at, // last_seen
+          ),
+        );
+      }
+    }
+
+    if (quarantined.length > 0) {
+      // Item 7: screened-out rows land in quarantined_samples in the SAME
+      // batch — flagged with a reason, never silently dropped, never mixed
+      // into the live tables. Same race-proof INSERT OR IGNORE discipline.
+      const stmt = db.prepare(
+        `INSERT OR IGNORE INTO quarantined_samples
+           (table_name, subject_key, sampled_at, reason, detail, row_json, tick_anchor)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const q of quarantined) {
+        batch.push(
+          stmt.bind(
+            q.table_name,
+            q.subject_key,
+            q.sampled_at,
+            q.reason,
+            q.detail,
+            q.row_json,
+            q.tick_anchor,
           ),
         );
       }
@@ -497,6 +540,100 @@ export async function readArchiveCoverage(
     "archive coverage",
   );
   return rows[0] ?? { earliest: null, latest: null };
+}
+
+/* ------------------------------------------------------------------------
+ * Item 8 (get_health): self-report reads. All plain SELECTs; a missing
+ * quarantine table (migration 0003 not applied) degrades that section rather
+ * than failing the whole health report.
+ * ---------------------------------------------------------------------- */
+
+const HEALTH_TABLES = [
+  "planet_samples",
+  "global_samples",
+  "mo_progress_samples",
+  "observed_signatures",
+  "quarantined_samples",
+] as const;
+export type HealthTable = (typeof HEALTH_TABLES)[number];
+
+/** Row counts per archive table. A table that cannot be counted (e.g. its
+ * migration is not applied yet) reports null, never a thrown health check. */
+export async function readArchiveCounts(
+  env: Env,
+): Promise<Record<HealthTable, number | null>> {
+  const db = requireDb(env);
+  const counts = {} as Record<HealthTable, number | null>;
+  for (const table of HEALTH_TABLES) {
+    try {
+      // Table names come from the fixed HEALTH_TABLES list above, never from
+      // caller input — the values in play are all bound (there are none).
+      const res = await db
+        .prepare(`SELECT COUNT(*) AS n FROM ${table}`)
+        .first<{ n: number }>();
+      counts[table] = res?.n ?? 0;
+    } catch {
+      counts[table] = null;
+    }
+  }
+  return counts;
+}
+
+/** The archived global sample timestamps in a window (ascending) — the
+ * cadence record get_health's gap/adherence arithmetic runs over. Capped at
+ * the NEWEST `limit` rows like every archive read. */
+export async function readGlobalSampleTimestamps(
+  env: Env,
+  sinceMs: number,
+  limit: number,
+): Promise<number[]> {
+  const db = requireDb(env);
+  const rows = await runArchiveQuery<{ sampled_at: number }>(
+    db
+      .prepare(
+        `SELECT sampled_at FROM global_samples
+          WHERE sampled_at >= ?
+          ORDER BY sampled_at DESC
+          LIMIT ?`,
+      )
+      .bind(sinceMs, limit),
+    "global sample timestamps",
+  );
+  return rows.map((r) => r.sampled_at).sort((a, b) => a - b);
+}
+
+/** Quarantine tallies per reason + the most recent quarantined rows (both
+ * numbers and the verbatim excluded row ride each entry). Degrades to nulls
+ * when the quarantine table does not exist yet. */
+export async function readQuarantineSummary(
+  env: Env,
+  recentLimit: number,
+): Promise<{
+  counts_by_reason: Record<string, number> | null;
+  recent: QuarantineRow[] | null;
+}> {
+  const db = requireDb(env);
+  try {
+    const byReason = await db
+      .prepare(
+        `SELECT reason, COUNT(*) AS n FROM quarantined_samples GROUP BY reason ORDER BY reason`,
+      )
+      .all<{ reason: string; n: number }>();
+    const counts: Record<string, number> = {};
+    for (const r of byReason.results ?? []) counts[r.reason] = r.n;
+    const recent = await db
+      .prepare(
+        `SELECT table_name, subject_key, sampled_at, reason, detail, row_json, tick_anchor
+           FROM quarantined_samples
+          ORDER BY sampled_at DESC
+          LIMIT ?`,
+      )
+      .bind(recentLimit)
+      .all<QuarantineRow>();
+    return { counts_by_reason: counts, recent: recent.results ?? [] };
+  } catch {
+    return { counts_by_reason: null, recent: null };
+  }
 }
 
 /** Clamp a caller-supplied row limit into [1, ARCHIVE_MAX_LIMIT]. */
