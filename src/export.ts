@@ -47,9 +47,17 @@ export class ExportParamError extends Error {
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
-/** Keyset page size — large enough to amortize round-trips, small enough to
- * stay well under any single-query D1 ceiling. */
-const PAGE_SIZE = 5000;
+/** Keyset page size. Chosen against the Workers Free per-invocation D1 query
+ * budget: Free allows ~50 D1 queries per request (Paid: 1000), and this route
+ * issues one query per page, so the page size sets how many rows a single
+ * streamed export can cover before the platform aborts it. At 50k rows/page the
+ * ceiling is ~2.5M rows on Free / ~50M on Paid — far beyond a realistic archive
+ * — while a page stays small in memory (D1 caps a single ROW at 2MB; these rows
+ * are a handful of small columns, so a 50k-row page buffer is only a few MB,
+ * well under the 128MB Worker limit). paginatePages also fetches PAGE_SIZE+1 and
+ * keeps PAGE_SIZE, so it never wastes a trailing empty-probe query when the row
+ * count lands on an exact page multiple. */
+const PAGE_SIZE = 50_000;
 
 type Agg = "mean" | "last" | "sum";
 
@@ -352,6 +360,7 @@ interface RawRow {
 async function* paginatePages(
   env: Env,
   params: ExportParams,
+  pageSize: number,
 ): AsyncGenerator<RawRow[]> {
   const db = requireDb(env);
   const cfg = TABLE_CONFIG[params.table];
@@ -370,20 +379,26 @@ async function* paginatePages(
       `(${TS_COL} > ? OR (${TS_COL} = ? AND id > ?))`,
       ...(clause ? [clause] : []),
     ].join(" AND ");
+    // Fetch ONE more than a page: if we get it, there's another page; if not,
+    // this is the last page. This drops the trailing empty-probe query that a
+    // plain LIMIT PAGE_SIZE loop wastes when the row count is an exact multiple
+    // of the page — one fewer query against the Free-plan per-invocation budget.
     const sql =
       `SELECT ${selectCols} FROM ${cfg.sqlTable} WHERE ${where} ` +
       `ORDER BY ${TS_COL} ASC, id ASC LIMIT ?`;
     const res = await db
       .prepare(sql)
-      .bind(curTs, curTs, curId, ...windowBinds, PAGE_SIZE)
+      .bind(curTs, curTs, curId, ...windowBinds, pageSize + 1)
       .all<RawRow>();
-    const rows = res.results ?? [];
-    if (rows.length === 0) break;
+    const fetched = res.results ?? [];
+    if (fetched.length === 0) break;
+    const hasMore = fetched.length > pageSize;
+    const rows = hasMore ? fetched.slice(0, pageSize) : fetched;
     yield rows;
+    if (!hasMore) break;
     const last = rows[rows.length - 1]!;
     curTs = last.sampled_at;
     curId = last.id;
-    if (rows.length < PAGE_SIZE) break;
   }
 }
 
@@ -533,13 +548,14 @@ const CSV_HEADERS = {
 async function* csvChunks(
   env: Env,
   params: ExportParams,
+  pageSize: number,
 ): AsyncGenerator<Uint8Array> {
   const cfg = TABLE_CONFIG[params.table];
   const encoder = new TextEncoder();
   yield encoder.encode(csvLine(exportColumns(params.table, params.bucket)));
 
   if (params.bucket === "raw") {
-    for await (const rows of paginatePages(env, params)) {
+    for await (const rows of paginatePages(env, params, pageSize)) {
       let buf = "";
       for (const row of rows) {
         buf += csvLine([
@@ -567,7 +583,7 @@ async function* csvChunks(
     }
     return ready;
   };
-  for await (const rows of paginatePages(env, params)) {
+  for await (const rows of paginatePages(env, params, pageSize)) {
     for (const row of rows) {
       const bs = bucketStartMs(row.sampled_at, bucket);
       if (bs > currentBucket) {
@@ -592,8 +608,12 @@ async function* csvChunks(
  * `pull` advances the chunk generator by one chunk, so the runtime only asks for
  * (and only then fetches/builds) the next chunk when the consumer has demand. A
  * slow client therefore cannot make us queue the whole archive in memory. */
-export function streamArchiveCsv(env: Env, params: ExportParams): Response {
-  const iterator = csvChunks(env, params)[Symbol.asyncIterator]();
+export function streamArchiveCsv(
+  env: Env,
+  params: ExportParams,
+  pageSize: number = PAGE_SIZE,
+): Response {
+  const iterator = csvChunks(env, params, pageSize)[Symbol.asyncIterator]();
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {

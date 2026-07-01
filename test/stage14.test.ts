@@ -253,8 +253,15 @@ describe("exportColumns / buildExportUrl", () => {
  * Streaming CSV route — acceptance tests
  * ====================================================================== */
 
-async function csvText(env: Env, params: ExportParams): Promise<string> {
-  const res = streamArchiveCsv(env, params);
+async function csvText(
+  env: Env,
+  params: ExportParams,
+  pageSize?: number,
+): Promise<string> {
+  const res =
+    pageSize == null
+      ? streamArchiveCsv(env, params)
+      : streamArchiveCsv(env, params, pageSize);
   return await res.text();
 }
 
@@ -279,36 +286,47 @@ describe("streamArchiveCsv", () => {
     expect(Date.parse(firstTs)).toBeLessThan(Date.parse(lastTs));
   });
 
-  it("paginates a >10,000-row table to completion (no cap error)", async () => {
+  it("paginates a multi-page table to completion (no cap error)", async () => {
     const db = new ExportFakeD1();
     seed(db, 12_345);
-    const text = await csvText(envWith(db), {
-      table: "global",
-      planetIndex: null,
-      sinceMs: null,
-      untilMs: null,
-      bucket: "raw",
-    });
+    // Small page size so the keyset loop spans many pages (13) in the test.
+    const text = await csvText(
+      envWith(db),
+      { table: "global", planetIndex: null, sinceMs: null, untilMs: null, bucket: "raw" },
+      1000,
+    );
     expect(text.trimEnd().split("\n").length - 1).toBe(12_345);
+  });
+
+  it("does not waste an empty-probe query when the row count is an exact page multiple", async () => {
+    const db = new ExportFakeD1();
+    seed(db, 20); // exactly 4 pages of 5
+    await csvText(
+      envWith(db),
+      { table: "global", planetIndex: null, sinceMs: null, untilMs: null, bucket: "raw" },
+      5,
+    );
+    // 20 rows / page 5 = 4 pages. The PAGE_SIZE+1 look-ahead means the 4th page
+    // reveals there is no more, so there are exactly 4 page queries — never a
+    // 5th empty-probe query (which a plain LIMIT loop would issue).
+    expect(db.selectSqls.length).toBe(4);
   });
 
   it("honors backpressure — does not eagerly fetch every page up front", async () => {
     const db = new ExportFakeD1();
-    seed(db, 12_345); // 3 pages of 5000
-    const res = streamArchiveCsv(envWith(db), {
-      table: "global",
-      planetIndex: null,
-      sinceMs: null,
-      untilMs: null,
-      bucket: "raw",
-    });
+    seed(db, 50); // 10 pages of 5
+    const res = streamArchiveCsv(
+      envWith(db),
+      { table: "global", planetIndex: null, sinceMs: null, untilMs: null, bucket: "raw" },
+      5,
+    );
     const reader = res.body!.getReader();
     await reader.read(); // header chunk (no query)
     await reader.read(); // first data page (one query)
-    // A backpressure-aware (pull-driven) producer must NOT have run all three
-    // page queries just because we read the first chunks. The old eager
-    // start()-based producer would have issued all 3 before returning.
-    expect(db.selectSqls.length).toBeLessThan(3);
+    // A backpressure-aware (pull-driven) producer must NOT have run all ten page
+    // queries just because we read the first chunks. The old eager start()-based
+    // producer would have issued every page before returning.
+    expect(db.selectSqls.length).toBeLessThan(10);
     await reader.cancel();
   });
 
