@@ -594,25 +594,34 @@ export async function readArchiveCoverage(
 }
 
 /** Item 10: past Major Order outcomes, newest recorded first, optionally
- * narrowed to one MO id. Degrades to null when the mo_outcomes table is not
- * readable yet (migration 0004 not applied) — the caller notes it rather than
- * failing the whole archive read. */
+ * narrowed to one MO id and/or one objective index (the SAME narrowing the
+ * series read honors, so a narrowed response never mixes in other objectives'
+ * final states). Degrades to null when the mo_outcomes table is not readable
+ * yet (migration 0004 not applied) — the caller notes it rather than failing
+ * the whole archive read. */
 export async function readMoOutcomes(
   env: Env,
-  filters: { majorOrderId?: number } = {},
+  filters: { majorOrderId?: number; objectiveIndex?: number } = {},
   limit = 100,
 ): Promise<MoOutcomeRow[] | null> {
   const db = requireDb(env);
   try {
-    const where =
-      filters.majorOrderId != null ? " WHERE major_order_id = ?" : "";
-    const binds: unknown[] =
-      filters.majorOrderId != null ? [filters.majorOrderId, limit] : [limit];
+    const where: string[] = [];
+    const binds: unknown[] = [];
+    if (filters.majorOrderId != null) {
+      where.push("major_order_id = ?");
+      binds.push(filters.majorOrderId);
+    }
+    if (filters.objectiveIndex != null) {
+      where.push("objective_index = ?");
+      binds.push(filters.objectiveIndex);
+    }
+    binds.push(limit);
     const res = await db
       .prepare(
         `SELECT major_order_id, objective_index, task_type, final_progress, target,
                 final_progress_pct, target_reached, first_observed_at, last_observed_at, recorded_at
-           FROM mo_outcomes${where}
+           FROM mo_outcomes${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
           ORDER BY recorded_at DESC, major_order_id DESC, objective_index ASC
           LIMIT ?`,
       )

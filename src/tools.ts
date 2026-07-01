@@ -2135,9 +2135,14 @@ export async function getMajorOrderArchive(
       objectiveIndex: args.objective_index,
       untilMs,
     }),
-    // Item 10: past-order outcomes ride the same archive read. Null when the
-    // mo_outcomes migration is not applied yet (noted, never an error).
-    readMoOutcomes(env, { majorOrderId: args.major_order_id }),
+    // Item 10: past-order outcomes ride the same archive read, honoring the
+    // SAME narrowing as the series (a narrowed response never mixes in other
+    // objectives' final states). Null when the mo_outcomes migration is not
+    // applied yet (noted, never an error).
+    readMoOutcomes(env, {
+      majorOrderId: args.major_order_id,
+      objectiveIndex: args.objective_index,
+    }),
   ]);
   const series = buildMoArchiveSeries(rows);
   const retainedIds = [...new Set(rows.map((r) => r.major_order_id))];

@@ -21,7 +21,10 @@ import {
   readPlanetArchive,
   untilCutoffMs,
 } from "../src/archive";
-import { collectArchiveCsv, parseExportResourceUri } from "../src/export";
+import {
+  parseExportResourceUri,
+  streamResourceReadResponse,
+} from "../src/export";
 import { handleMcpRequest } from "../src/mcp";
 import { getGlobalArchive, ToolError } from "../src/tools";
 import type { Env } from "../src/types";
@@ -285,10 +288,10 @@ describe("export_archive resource_link (item 1)", () => {
     expect(parseExportResourceUri("https://w.example/elsewhere", NOW)).toBeNull();
   });
 
-  it("collectArchiveCsv paginates across pages into one string", async () => {
+  it("streamResourceReadResponse emits a valid JSON-RPC result across pages (never one buffered string)", async () => {
     const db = new FakeD1();
     seedGlobal(db, 7);
-    const csv = await collectArchiveCsv(
+    const res = streamResourceReadResponse(
       envWith(db),
       {
         table: "global",
@@ -297,9 +300,16 @@ describe("export_archive resource_link (item 1)", () => {
         untilMs: null,
         bucket: "raw",
       },
-      3, // page size 3 → 3 pages
+      "https://w.example/export/archive?table=global",
+      42,
+      3, // page size 3 → 3 pages streamed through the JSON envelope
     );
-    expect(csv.trim().split("\n")).toHaveLength(1 + 7);
+    const body = (await res.json()) as any;
+    expect(body.jsonrpc).toBe("2.0");
+    expect(body.id).toBe(42);
+    const contents = body.result.contents;
+    expect(contents[0].mimeType).toBe("text/csv");
+    expect(contents[0].text.trim().split("\n")).toHaveLength(1 + 7);
   });
 });
 

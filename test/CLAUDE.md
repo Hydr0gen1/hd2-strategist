@@ -462,7 +462,9 @@ the project's definition of done:
     the max_id watermark keeps a late-committing row out of the resource read
     (same frozen snapshot); a non-export URI errors -32002;
     `parseExportResourceUri` round-trips a minted URL and rejects garbage;
-    `collectArchiveCsv` paginates multiple pages into one string.
+    `streamResourceReadResponse` emits a valid JSON-RPC result across
+    multiple streamed pages (the codex-review fix: never one buffered
+    string).
   - Item 2 (until_hours): `untilCutoffMs` edge cases (0 valid, negative/NaN →
     null); the three readers honor an until edge with parameterized SQL; an
     until-less call emits BYTE-IDENTICAL SQL to the pre-item-2 query; handler

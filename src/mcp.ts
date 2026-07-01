@@ -7,9 +7,9 @@ import { ArchiveError } from "./archive";
 import { UpstreamError } from "./client";
 import {
   ExportParamError,
-  collectArchiveCsv,
   exportArchive,
   parseExportResourceUri,
+  streamResourceReadResponse,
 } from "./export";
 import {
   ToolError,
@@ -737,25 +737,21 @@ export async function handleMcpRequest(
           `Resource not found: "${uri}". This server only serves archive-export resources minted by the export_archive tool (path /export/archive).`,
         );
       }
-      try {
-        // The SAME keyset-paginated read path as the HTTP route, buffered into
-        // one contents item (resources/read is a single JSON-RPC response).
-        // The URI carries the frozen window + max_id watermark, so the bytes
-        // match the metadata the tool returned.
-        const text = await collectArchiveCsv(env, exportParams);
-        return rpcResult(id, {
-          contents: [{ uri, mimeType: "text/csv", text }],
-        });
-      } catch (err) {
-        if (err instanceof ArchiveError || err instanceof ExportParamError) {
-          return rpcError(id, -32603, err.message);
-        }
+      // Fail fast (a proper JSON-RPC error) while nothing is on the wire yet;
+      // a D1 failure mid-stream can only surface as a broken stream.
+      if (!env.HISTORY_DB) {
         return rpcError(
           id,
           -32603,
-          "Internal error while reading the export resource.",
+          "The history archive (D1 binding HISTORY_DB) is not configured, so there is no export resource to read.",
         );
       }
+      // The SAME keyset-paginated read path as the HTTP route, STREAMED as
+      // the JSON-RPC response (envelope + JSON-escaped CSV pages) so memory
+      // stays bounded by one page regardless of export size. The URI carries
+      // the frozen window + max_id watermark, so the bytes match the metadata
+      // the tool returned.
+      return streamResourceReadResponse(env, exportParams, uri, id);
     }
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";

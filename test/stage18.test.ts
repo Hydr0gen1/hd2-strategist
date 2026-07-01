@@ -145,6 +145,10 @@ class FakeD1 {
         const id = b.shift() as number;
         out = out.filter((r) => r.major_order_id === id);
       }
+      if (sql.includes("objective_index = ?")) {
+        const oi = b.shift() as number;
+        out = out.filter((r) => r.objective_index === oi);
+      }
       const limit = b.shift() as number;
       out.sort(
         (x, y) => (y.recorded_at as number) - (x.recorded_at as number),
@@ -454,5 +458,20 @@ describe("get_major_order_archive outcomes read (item 10)", () => {
     })) as Record<string, any>;
     expect(out.outcomes).toHaveLength(1);
     expect(out.outcomes[0].major_order_id).toBe(99);
+  });
+
+  it("narrows outcomes by objective_index too — an objective-specific read never mixes in siblings", async () => {
+    const db = new FakeD1();
+    db.tables.mo_outcomes = [
+      { major_order_id: 111, objective_index: 0, recorded_at: NOW, target_reached: 1 },
+      { major_order_id: 111, objective_index: 1, recorded_at: NOW, target_reached: 0 },
+    ];
+    const out = (await getMajorOrderArchive(envWith(null, db), {
+      major_order_id: 111,
+      objective_index: 1,
+    })) as Record<string, any>;
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0].objective_index).toBe(1);
+    expect(out.outcomes[0].target_reached).toBe(false);
   });
 });

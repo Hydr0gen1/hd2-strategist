@@ -604,28 +604,72 @@ async function* csvChunks(
   }
 }
 
+/** JSON-escape a text fragment for embedding inside an already-open JSON
+ * string literal: JSON.stringify's escaping with the enclosing quotes
+ * stripped. JSON string escaping is per-character (no cross-chunk state), so
+ * escaping chunk-by-chunk concatenates into one valid escaped string. */
+function jsonStringFragment(text: string): string {
+  return JSON.stringify(text).slice(1, -1);
+}
+
 /**
- * Collect the whole CSV as ONE string — the MCP `resources/read` transport
- * (item 1: the resource_link handoff). An in-connector agent cannot fetch a
- * workers.dev URL over HTTP (egress-blocked), so the SAME keyset-paginated,
- * parameter-bound query path is exposed as an MCP resource: the bytes route
- * through the connector instead of the open internet. This buffers the file in
- * Worker memory (resources/read is a single JSON-RPC response, not a stream) —
- * fine for the small archive row shapes well past millions of rows; the HTTP
- * route remains the zero-buffer path for browser/CLI use. READ-ONLY, same as
- * the rest of the module.
+ * The MCP `resources/read` transport (item 1: the resource_link handoff),
+ * STREAMED. An in-connector agent cannot fetch a workers.dev URL over HTTP
+ * (egress-blocked), so the SAME keyset-paginated, parameter-bound query path
+ * is exposed as an MCP resource. The JSON-RPC result is one JSON object, but
+ * nothing says it must be BUILT in memory: this emits the response envelope
+ * (`{"jsonrpc":…,"result":{"contents":[{…,"text":"`), then each CSV page as a
+ * JSON-escaped string fragment, then the closing braces — over the same
+ * pull-driven ReadableStream discipline as streamArchiveCsv, so memory stays
+ * bounded by ONE page regardless of export size (never the whole archive
+ * concatenated, which a multi-million-row export would make hundreds of MB).
+ * The decoder runs in streaming mode so a multi-byte character split across
+ * page boundaries can never corrupt the escape. READ-ONLY, same as the rest
+ * of the module.
  */
-export async function collectArchiveCsv(
+export function streamResourceReadResponse(
   env: Env,
   params: ExportParams,
+  uri: string,
+  id: number | string | null,
   pageSize: number = PAGE_SIZE,
-): Promise<string> {
+): Response {
+  const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-  let out = "";
-  for await (const chunk of csvChunks(env, params, pageSize)) {
-    out += decoder.decode(chunk);
+  async function* jsonChunks(): AsyncGenerator<Uint8Array> {
+    yield encoder.encode(
+      `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":{"contents":[{` +
+        `"uri":${JSON.stringify(uri)},"mimeType":"text/csv","text":"`,
+    );
+    for await (const chunk of csvChunks(env, params, pageSize)) {
+      yield encoder.encode(
+        jsonStringFragment(decoder.decode(chunk, { stream: true })),
+      );
+    }
+    const tail = decoder.decode();
+    if (tail) yield encoder.encode(jsonStringFragment(tail));
+    yield encoder.encode(`"}]}}`);
   }
-  return out;
+  const iterator = jsonChunks()[Symbol.asyncIterator]();
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await iterator.next();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (err) {
+        // Mid-stream D1 failure: the envelope may already be on the wire, so
+        // the JSON-RPC status can't change — surface it to the reader.
+        controller.error(err);
+      }
+    },
+    async cancel() {
+      await iterator.return?.(undefined);
+    },
+  });
+  return new Response(stream, {
+    headers: { "content-type": "application/json" },
+  });
 }
 
 /** Build a streamed CSV Response driven by a backpressure-aware `pull()`: each
